@@ -72,6 +72,13 @@ MODELS = {
         "mode": 6, "think": 4, "variant": 1, "ticket": "lite",
         "desc": "Lightweight fast model",
     },
+    "gemini-3.5-flash-lite": {
+        # Explicit alias: clients (opencode configs) name the versioned id;
+        # without it resolve_model fell back to flash and every lite request
+        # silently ran on the wrong family.
+        "mode": 6, "think": 4, "variant": 1, "ticket": "lite",
+        "desc": "Alias for gemini-flash-lite (Gemini 3.5 Flash-Lite)",
+    },
 }
 
 

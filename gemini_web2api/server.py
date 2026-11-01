@@ -31,6 +31,7 @@ from .tools import (
     is_required_tool_choice,
     looks_like_missed_tool_call,
     looks_like_upstream_error,
+    looks_like_extension_refusal,
     pending_tool_request,
     SOURCE_REVIEW_OWED,
     is_read_retry_reason,
@@ -849,6 +850,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
         repeats = 0
         saw_call = False
         best_text, best_idx = "", -1
+        # Canned-error placeholders seen this turn: a deterministic refusal
+        # (expired ticket / extension-routed prompt) is retried at most twice;
+        # more attempts only burn quota on the same answer.
+        placeholder_hits = 0
         for attempt in range(attempts):
             if attempt > 0 and client_gone is not None and client_gone.is_set():
                 # The client hung up while an earlier attempt ran (a keep-alive
@@ -1006,8 +1011,31 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     "returned an empty response")
                 continue
             if looks_like_upstream_error(text):
+                placeholder_hits += 1
+                if placeholder_hits >= 2:
+                    log("Tool retry: upstream returned the same canned "
+                        "placeholder twice -- stopping early; if this "
+                        "persists, refresh CONFIG['model_tickets'] from a "
+                        "fresh browser capture and check the routing-mismatch "
+                        "log lines above")
+                    break
                 log(f"Tool retry (attempt {attempt + 1}/{attempts}): upstream "
                     "returned its canned error placeholder instead of a response")
+                continue
+            if (not required_tool and tools_active
+                    and looks_like_extension_refusal(text)):
+                # A verbose model can pad the settings-are-off refusal with
+                # prose, escaping the anchored placeholder regex; without this
+                # branch it would reach the client as a finished answer.
+                placeholder_hits += 1
+                if placeholder_hits >= 2:
+                    log("Tool retry: upstream returned the same extension "
+                        "refusal twice -- stopping early; refresh "
+                        "CONFIG['model_tickets'] if this persists")
+                    break
+                log(f"Tool retry (attempt {attempt + 1}/{attempts}): upstream "
+                    "returned a Workspace-extension refusal inside a longer "
+                    "reply")
                 continue
             if tools_active and dropped:
                 log(f"Tool retry (attempt {attempt + 1}/{attempts}): previous "

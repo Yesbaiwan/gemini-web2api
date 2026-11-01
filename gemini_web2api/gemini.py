@@ -576,6 +576,19 @@ def check_routing(raw: str, model_id: int, extra_fields: dict = None, ticket: st
             f"but upstream served {echo[0]!r} (family={fam} variant={var}); "
             f"the model ticket in CONFIG['model_tickets'] may be missing or "
             f"expired -- refresh it from a fresh browser capture")
+        if ticket is None:
+            try:
+                from .models import MODELS
+                wants_ticket = any(cfg.get("mode") == model_id
+                                   and cfg.get("ticket")
+                                   for cfg in MODELS.values())
+            except Exception:
+                wants_ticket = False
+            if wants_ticket:
+                log("Routing mismatch while NO ticket was sent for a model "
+                    "that defines one: the ticket key is missing from "
+                    "CONFIG['model_tickets'] entirely -- add/refresh it (the "
+                    "upstream serves the account default without it)")
 
 
 def _status_error(status) -> GeminiError:

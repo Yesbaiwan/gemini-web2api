@@ -1306,7 +1306,7 @@ _UPSTREAM_ERROR_RE = re.compile(
     r"could you try again\?*"
     r"|sorry, something went wrong\.?"
     r"|da co loi xay ra\.?"
-    r"|i can'?t use workspace because required [a-z ]+ settings are off\.?"
+    r"|i can'?t use [\w .'\-]+? because required [\w .'\-]+? (?:settings|permissions) are off\.?"
     r"(?:\s*turn on these settings to continue\.?)?)\s*$",
     re.IGNORECASE | re.DOTALL,
 )
@@ -1363,6 +1363,25 @@ def is_required_tool_choice(tool_choice) -> bool:
     if isinstance(tool_choice, dict):
         return bool(tool_choice.get("function") or tool_choice.get("name"))
     return False
+
+
+def looks_like_extension_refusal(text: str) -> bool:
+    """True for any length of Gemini's Workspace/Gmail extension refusal.
+
+    Verbose models pad the canned refusal ("I can't use Google Drive because
+    required Gmail settings are off...") with prose, which escapes the anchored
+    :data:`_UPSTREAM_ERROR_RE` and would be handed to the client as a finished
+    reply. Deliberately NOT folded into looks_like_upstream_error(): that one
+    also drives generic retries, and matching loose refusals there would retry
+    genuine answers like "you can't use that tool here".
+    """
+    if not text or len(text) > 800:
+        return False
+    folded = _fold_diacritics(text).lower()
+    return bool(re.search(
+        r"can'?t use [a-z][a-z .'\-]{0,40}? because required .{0,60}?"
+        r"(settings|permissions) are off",
+        folded))
 
 
 def looks_like_upstream_error(text: str) -> bool:
@@ -3011,7 +3030,37 @@ def _choose_reminder(messages, last_role) -> str:
 
 # A bare "workspace" (not part of a path, file name or identifier) is what the
 # upstream router reads as "use the Workspace extension".
-_WORKSPACE_WORD_RE = re.compile(r"(?<![\w\\/.\-])([Ww])orkspace(?![\w\\/\-]|\.\w)")
+# Extension trigger words: any of these appearing *as a bare word* (not in a
+# path, file name or identifier) can route the request to one of Gemini's
+# Workspace extensions, which an anonymous / no-Gmail session answers with the
+# canned refusal instead of doing the work. Iteration order matters:
+# "my drive" must be replaced before bare "drive".
+_EXTENSION_WORDS = {
+    "workspace": "project",
+    # Two-word form before bare "drive": "my drive" -> "the files" (leaving
+    # "my files" would read awkwardly next to real file lists).
+    "my drive": "the files",
+    "drive": "files",
+    "docs": "documents",
+    "slides": "presentations",
+    "calendar": "schedule",
+    "gmail": "email",
+}
+
+
+def _ext_word_re(word: str):
+    """Matcher for one bare extension word/phrase (paths/identifiers excluded).
+
+    Case-insensitive with a capture group over the whole phrase, so the
+    replacement can restore capitalisation ("My Drive" -> "The files").
+    """
+    escaped = re.escape(word)
+    return re.compile(rf"(?<![\w\\/.-])({escaped})(?![\w\\/@-]|\.\w)",
+                      re.IGNORECASE)
+
+
+# Dict insertion order is applied as-is -- "my drive" precedes "drive".
+_EXT_WORD_RES = [(w, _ext_word_re(w)) for w in _EXTENSION_WORDS]
 
 
 def defuse_extension_words(prompt: str) -> str:
@@ -3027,10 +3076,21 @@ def defuse_extension_words(prompt: str) -> str:
     from .config import CONFIG
     if not CONFIG.get("defuse_extension_words", True):
         return prompt
-    new, n = _WORKSPACE_WORD_RE.subn(
-        lambda m: "Project" if m.group(1) == "W" else "project", prompt)
-    if n:
+    total = 0
+    for word, ext_re in _EXT_WORD_RES:
+        repl = _EXTENSION_WORDS[word]
+
+        def _sub(m, r=repl):
+            # Preserve a leading capital ("Workspace" -> "Project",
+            # "My Drive" -> "The files"); lowercase otherwise.
+            return r.capitalize() if m.group(1)[0].isupper() else r
+
+        new, n = ext_re.subn(_sub, prompt)
+        if n:
+            prompt = new
+            total += n
+    if total:
         from .gemini import log
-        log(f"Prompt: rewrote {n} bare 'workspace' word(s) to 'project' "
+        log(f"Prompt: rewrote {total} extension-trigger word(s) "
             "(avoids the Workspace extension route)")
-    return new
+    return prompt
