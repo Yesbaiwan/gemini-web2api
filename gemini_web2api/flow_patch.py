@@ -55,8 +55,8 @@ _DEFAULTS = {
     # None = autodetect (package.json -> npm test, .py -> unittest, else skip tests)
     "flow_test_command": None,
     "flow_survey_pattern": "**/*.{py,js,jsx,mjs,cjs,ts,tsx,go,rs,java,kt,rb,php,cs,c,cc,cpp,h,hpp,swift}",
-    "flow_read_batch": 4,
-    "flow_max_review_files": 10,
+    "flow_read_batch": 6,
+    "flow_max_review_files": 40,
     "flow_max_retries": 1,
     "flow_review_include_tests": False,
     "flow_answer_directive": True,
@@ -243,17 +243,44 @@ _SURVEY_CMD = ('git ls-files 2>/dev/null || find . -type f -not -path '
                '"./.git/*" -not -path "*/node_modules/*" | head -300')
 
 
+_PATH_LINE_RE = re.compile(
+    r'^\s*(?:[-*]\s+)?((?:[A-Za-z]:)?[/\\]?(?:[^\s:*?"<>|/\\]+[/\\])*'
+    r'[^\s:*?"<>|/\\]+\.[A-Za-z0-9]{1,6})\s*$')
+_READ_FAIL_RE = re.compile(
+    r"^\s*(?:<?error|file not found|no such file|enoent|cannot (?:read|find|open)"
+    r"|failed|not found)", re.IGNORECASE)
+
+
+def _read_ok(e):
+    """Tool result của một lệnh read có thật sự chứa nội dung không."""
+    return bool(e["result"].strip()) and not _READ_FAIL_RE.match(e["result"])
+
+
 def _listing_files(ev):
+    """File paths từ kết quả survey/search. Giữ nguyên ổ đĩa (D:/...) và
+    đường dẫn tuyệt đối: cắt mất chúng làm mọi lệnh read sau đó 'not found'."""
     seen, out = set(), []
+
+    def add(f):
+        f = f.replace("\\", "/")
+        if f not in seen and f.lower() not in T._NON_FILE_NAMES:
+            seen.add(f)
+            out.append(f)
+
     for e in ev:
-        if e["kind"] in ("survey", "search") or (
+        if not (e["kind"] in ("survey", "search") or (
                 e["kind"] == "exec"
-                and _LIST_CMD_RE.search(_call_command(e["args"]))):
+                and _LIST_CMD_RE.search(_call_command(e["args"])))):
+            continue
+        matched = [m.group(1) for m in map(_PATH_LINE_RE.match,
+                                           e["result"].splitlines()) if m]
+        if matched:
+            for f in matched:
+                add(f)
+        else:  # grep-style "path:line: text" output
             body = e["result"].replace("\\", "/")
             for f in sorted(T._files_in(body), key=body.find):
-                if f not in seen and f.lower() not in T._NON_FILE_NAMES:
-                    seen.add(f)
-                    out.append(f)
+                add(f)
     return out
 
 
@@ -284,8 +311,13 @@ def _test_command(listing):
     if configured:
         return configured
     names = [f.replace("\\", "/").lower() for f in listing]
-    if any(n.endswith("package.json") for n in names):
+    if any(n.endswith("package.json") for n in names) or any(
+            n.endswith((".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx")) for n in names):
         return "npm test"
+    if any(n.endswith(".go") for n in names):
+        return "go test ./..."
+    if any(n.endswith(".rs") for n in names):
+        return "cargo test"
     if any(n.endswith(".py") for n in names):
         return "python -m unittest discover -s tests"
     return None
@@ -326,12 +358,23 @@ def _core_sources(files, include_tests, limit):
             cand.append(p)
     if not cand:
         return []
-    main = Counter(posixpath.dirname(p) for p in cand).most_common(1)[0][0]
-    core = [p for p in cand
-            if posixpath.dirname(p) == main
-            or posixpath.dirname(p).startswith(main + "/")]
-    ext = Counter(os.path.splitext(p)[1].lower() for p in core).most_common(1)[0][0]
-    return [p for p in core if p.lower().endswith(ext)][:limit]
+    exts = Counter(os.path.splitext(p)[1].lower() for p in cand)
+    top = exts.most_common(1)[0][1]
+    keep = {e for e, n in exts.items() if n * 10 >= top * 3}
+    core = [p for p in cand if os.path.splitext(p)[1].lower() in keep]
+    entry = {"index", "main", "app", "server", "cli", "__main__", "mod", "lib"}
+    low_dirs = {"scripts", "script", "utils", "util", "tools", "examples",
+                "example", "docs", "bench", "benchmarks", "migrations", "types"}
+
+    def key(item):
+        i, p = item
+        parts = p.lower().split("/")
+        base = posixpath.splitext(parts[-1])[0]
+        tier = 0 if base in entry else (2 if (set(parts[:-1]) & low_dirs
+                                              or base in low_dirs) else 1)
+        return (tier, i)
+
+    return [p for _i, p in sorted(enumerate(core), key=key)][:limit]
 
 
 _STOP = set(
@@ -523,24 +566,34 @@ def clarification_text(messages):
 # Planner
 # --------------------------------------------------------------------------
 
-def _answer_step(pattern, ev, total, index):
+def _answer_step(pattern, ev, total, index, skipped=None):
     if not ev or not _cfg("flow_answer_directive"):
         return None
     read = sorted({_call_path(e["args"]) for e in ev
-                   if e["kind"] == "read" and _call_path(e["args"])})
+                   if e["kind"] == "read" and _call_path(e["args"])
+                   and _read_ok(e)})
     if pattern != "CHANGE" and not read:
-        instr = ("NO file could be read or listed in this turn. Say that "
-                 "plainly and ask the user for the correct project path. Do "
-                 "NOT describe or evaluate any code: you have not seen any.")
+        instr = ("NO file was successfully read in this turn (every read "
+                 "failed or none was possible). Say that plainly and ask the "
+                 "user for the correct project path. Do NOT describe or "
+                 "evaluate any code: you have not seen any.")
     elif pattern == "CHANGE":
         instr = ("Evidence complete. If the last test run failed, fix the "
                  "cause with one more edit tool_call; otherwise reply in plain "
                  "text: what you changed and the test result. No other tool calls.")
     else:
-        instr = ("Evidence complete (read: " + (", ".join(read[:12]) or "none")
-                 + "). Answer NOW in plain text with NO tool_call block. Base "
-                 "every claim on those files and quote lines verbatim; if a "
-                 "fact is not in them, say so instead of guessing.")
+        instr = ("Evidence collected (successfully read: "
+                 + (", ".join(read[:30]) or "none") + "). Answer NOW in plain "
+                 "text with NO tool_call block. Base every claim on those "
+                 "files. Report format: each finding as `file:line -- verbatim "
+                 "quote -- why it is a bug`. If you found none, write exactly "
+                 "'no critical bug found in the files read' and list the files "
+                 "read. A passing test suite does not prove absence of bugs. "
+                 "Only claim a rule/contract is respected if you compared it "
+                 "to the code you read; never cite a document you did not read.")
+        if skipped:
+            instr += (" NOT read (say your coverage is PARTIAL and name them): "
+                      + ", ".join(skipped[:20]) + ".")
     return Step(pattern, "answer", index, total, (), instr)
 
 
@@ -608,6 +661,9 @@ def plan_for(messages, tm, ctx=None):
         unread = [f for f in core if not T._path_seen(f, read_set)]
         if unread and tm.first("read"):
             return read_step(unread[:batch], 3, 4)
+        skipped = [f for f in _core_sources(
+            listing, _cfg("flow_review_include_tests"), 10 ** 6)
+            if not T._path_seen(f, read_set)]
         if not read_set and tm.first("read"):
             # No recognised source files: read whatever the listing has
             # (README/AGENTS/config...) rather than answer from nothing.
@@ -615,7 +671,7 @@ def plan_for(messages, tm, ctx=None):
                 s in _IGNORE_SEG for s in f.replace("\\", "/").split("/")[:-1])]
             if fallback:
                 return read_step(fallback[:batch], 3, 4)
-        return _answer_step(p, ev, 4, 4)
+        return _answer_step(p, ev, 4, 4, skipped)
 
     if p == "FILE_REVIEW":
         files = [_resolve(f, listing) for f in named]
