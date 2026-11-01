@@ -60,6 +60,11 @@ DEFAULT_CONFIG = {
     # extra attempt only ever costs a call that was already failing, never one
     # that succeeded.
     "tool_retry_attempts": 1,
+    # Rewrite the bare word "workspace" to "project" in the prompt sent
+    # upstream. The word routes a request to Gemini's Workspace extension,
+    # which an anonymous / no-Gmail session answers with "I can't use
+    # Workspace because required Gmail settings are off".
+    "defuse_extension_words": True,
     # Upper bound for the assembled prompt (bytes) sent upstream. Agent
     # sessions (opencode/cursor) send tens of KB per file read; at 60000 a
     # single read of a 1000-line file filled the budget, the joiner kept only

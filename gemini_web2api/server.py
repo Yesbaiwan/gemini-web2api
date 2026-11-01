@@ -19,6 +19,8 @@ from .tools import (
     parse_google_function_calls,
     _canonical_args,
     _google_repeatable,
+    _google_pseudo_messages,
+    unverified_quotes,
     _repeatable_calls,
     build_response_format_instruction,
     strip_code_fence,
@@ -1026,6 +1028,21 @@ class GeminiHandler(BaseHTTPRequestHandler):
                                ". Call the read tool on each of them now, then "
                                "answer from what you actually read.")
                 continue
+            if (retry_on_miss and tools_active and (text or "").strip()
+                    and review_demanded(messages)):
+                bad_quotes = unverified_quotes(text, messages)
+                if bad_quotes:
+                    log(f"Tool retry (attempt {attempt + 1}/{attempts}): "
+                        f"{len(bad_quotes)} quoted snippet(s) not found in "
+                        "any tool result")
+                    nudge_extra = (" Some code you quoted does not appear in "
+                                   "any tool result: "
+                                   + " | ".join(q[:80] for q in bad_quotes[:3])
+                                   + ". Do not quote from memory: call the "
+                                   "read tool (or grep) on the relevant file "
+                                   "and quote only lines that really exist, "
+                                   "or drop the claim.")
+                    continue
             if retry_on_miss and owed:
                 log(f"Tool retry (attempt {attempt + 1}/{attempts}): {owed}")
                 continue
@@ -1754,6 +1771,12 @@ class GeminiHandler(BaseHTTPRequestHandler):
         retry_on_miss = bool(CONFIG.get("tool_retry_on_miss"))
         attempts = _tool_retry_attempts(required_tool, has_tools)
         grepeat = _google_repeatable(req.get("contents")) if has_tools else set()
+        g_owed = None
+        if has_tools:
+            try:
+                g_owed = pending_tool_request(_google_pseudo_messages(req))
+            except Exception as exc:
+                log(f"Google evidence check failed: {exc}")
         # Declared names + schemas for parity with the OpenAI path, plus the
         # mode=ANY allowlist: a call outside `allowedFunctionNames` is not a
         # usable call and must be retried, not returned.
@@ -1894,6 +1917,13 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     "a response")
                 continue
             if required_tool:
+                continue
+            if retry_on_miss and has_tools and g_owed:
+                log(f"Google tool retry (attempt {attempt + 1}/{attempts}): "
+                    f"{g_owed}")
+                grepeat_nudge = (" You have not gathered enough evidence yet ("
+                                 + g_owed + "). Call the read/search tools "
+                                 "now instead of answering from memory.")
                 continue
             if retry_on_miss and looks_like_missed_tool_call(raw):
                 log(f"Google tool retry (attempt {attempt + 1}/{attempts}): "

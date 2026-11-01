@@ -780,10 +780,12 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
         banner = task_pattern_banner(messages)
         if banner:
             parts.append(banner)
+        ledger = evidence_ledger(messages)
+        if ledger:
+            parts.append(ledger)
         # A turn that already ends in a tool result needs no push to act --
         # it needs permission to stop acting and answer.
-        parts.append(_TOOL_RESULT_REMINDER if last_role == "tool"
-                     else _TOOL_REMINDER)
+        parts.append(_choose_reminder(messages, last_role))
     first_user_pin = None
     for msg in messages or []:
         if isinstance(msg, dict) and msg.get("role") == "user":
@@ -791,8 +793,9 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
             if first_user_pin and first_user_pin.strip():
                 break
             first_user_pin = None
-    return _join_prompt_parts(parts, max_bytes, pinned_head=tool_block,
-                              pinned_first=first_user_pin), images
+    prompt = _join_prompt_parts(parts, max_bytes, pinned_head=tool_block,
+                                pinned_first=first_user_pin)
+    return defuse_extension_words(prompt), images
 
 
 # Keys that describe the call itself rather than its parameters. Models emit
@@ -1302,7 +1305,9 @@ _UPSTREAM_ERROR_RE = re.compile(
     r"^\s*(?:i encountered an error doing what you asked\.?\s*"
     r"could you try again\?*"
     r"|sorry, something went wrong\.?"
-    r"|da co loi xay ra\.?)\s*$",
+    r"|da co loi xay ra\.?"
+    r"|i can'?t use workspace because required [a-z ]+ settings are off\.?"
+    r"(?:\s*turn on these settings to continue\.?)?)\s*$",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -1726,6 +1731,10 @@ def _format_file_body(path, body: str) -> str:
     """
     label = path.strip() if isinstance(path, str) and path.strip() else "file"
     lines = body.split("\n")
+    if _already_numbered(lines):
+        # The client already numbered the lines: numbering again gives two
+        # competing line-number columns and edits anchor on the wrong one.
+        return f"--- Start {label} ---\n{body}\n--- End {label} ---"
     width = max(4, len(str(len(lines))))
     numbered = "\n".join(f"{i:>{width}} | {line}"
                          for i, line in enumerate(lines, 1))
@@ -1852,7 +1861,7 @@ def declared_unread(messages) -> list:
             continue
         for f in _files_in(_strip_code_spans(
                 _stringify_content(msg.get("content", "")))):
-            if f.lower() in _NON_FILE_NAMES or f.lower() in read_lower:
+            if f.lower() in _NON_FILE_NAMES or _path_seen(f, read_lower):
                 continue
             if f not in seen:
                 seen.append(f)
@@ -1870,7 +1879,7 @@ def fresh_declared_unread(text, messages) -> list:
     read_lower = files_read_in_turn(messages)
     seen = []
     for f in _files_in(_strip_code_spans(text)):
-        if f.lower() in _NON_FILE_NAMES or f.lower() in read_lower:
+        if f.lower() in _NON_FILE_NAMES or _path_seen(f, read_lower):
             continue
         if f not in seen:
             seen.append(f)
@@ -2247,8 +2256,8 @@ def unread_listed_core_files(messages) -> list:
     read_lower = files_read_in_turn(messages)
     called_lower = {f.lower() for f in _conversation_called_files(messages)}
     return sorted(f for f in core
-                  if f.lower() not in read_lower
-                  and f.lower() not in called_lower)
+                  if not _path_seen(f, read_lower)
+                  and not _path_seen(f, called_lower))
 
 
 def detect_task_pattern(messages):
@@ -2372,6 +2381,10 @@ def pending_tool_request(messages) -> str:
     if not last_user:
         return None
 
+    if len(_turn_tool_calls(messages, last_user_idx)) >= _MAX_TURN_CALLS:
+        # Safety valve: the gate must never trap an agent in an endless loop.
+        return None
+
     # Pasted logs and code name files the user never asked about; scan what
     # remains after blanking them, for both the file check and the demand
     # match below.
@@ -2429,7 +2442,7 @@ def pending_tool_request(messages) -> str:
     created = _created_files(scannable, folded)
     uncovered = sorted(
         f for f in _files_in(scannable)
-        if f.lower() not in called_lower and f.lower() not in _NON_FILE_NAMES
+        if not _path_seen(f, called_lower) and f.lower() not in _NON_FILE_NAMES
         and f.lower() not in created
     )
     if uncovered:
@@ -2698,7 +2711,7 @@ def google_contents_to_prompt(req: dict) -> tuple:
         if banner:
             parts.append(banner)
 
-    return "\n\n".join(p for p in parts if p), images
+    return defuse_extension_words("\n\n".join(p for p in parts if p)), images
 
 
 # A ``function_call`` marker with no fence around it. Models drop the
@@ -2846,3 +2859,178 @@ def parse_google_function_calls(text: str, allowed_names=None,
             function_calls.append(accepted)
             clean = ""
     return clean, function_calls
+
+
+# ---------------------------------------------------------------------------
+# evidence patch (evidence_patch.py)
+# Helpers that make a small model collect evidence before answering.
+# ---------------------------------------------------------------------------
+
+# After this many tool calls in one user turn the evidence gate stands down.
+_MAX_TURN_CALLS = 30
+
+
+def _path_seen(name, seen) -> bool:
+    """True when ``name`` matches a path in ``seen`` modulo directory prefix.
+
+    ``server.py`` in prose and ``/abs/pkg/server.py`` in a read call are the
+    same file. Exact string comparison reported the file as never read and
+    burned retries on a review that was already grounded.
+    """
+    n = str(name).replace("\\", "/").lower()
+    for s in seen or ():
+        t = str(s).replace("\\", "/").lower()
+        if n == t or n.endswith("/" + t) or t.endswith("/" + n):
+            return True
+    return False
+
+
+_NUMBERED_LINE_RE = re.compile(r"^\s*\d+\s*(?:\||:|\t|\u2192)")
+
+
+def _already_numbered(lines) -> bool:
+    """True when most non-empty lines already start with a line number."""
+    nonempty = [ln for ln in lines if ln.strip()]
+    if len(nonempty) < 4:
+        return False
+    hits = sum(1 for ln in nonempty if _NUMBERED_LINE_RE.match(ln))
+    return hits >= 3 and hits * 2 >= len(nonempty)
+
+
+def _norm_code(text) -> str:
+    """Lowercase, drop line-number prefixes, collapse whitespace."""
+    lines = [_NUMBERED_LINE_RE.sub("", ln, count=1)
+             for ln in str(text).split("\n")]
+    return re.sub(r"\s+", " ", " ".join(lines)).strip().lower()
+
+
+_SKIP_FENCE_LANGS = {"diff", "patch", "bash", "sh", "shell", "console",
+                     "zsh", "powershell", "tool_call", "function_call"}
+
+
+def _quoted_snippets(text) -> list:
+    """Code the answer presents as quotes: fenced lines and inline spans."""
+    out = []
+    for m in re.finditer(r"```([^\n]*)\n(.*?)```", text, re.DOTALL):
+        if m.group(1).strip().lower() in _SKIP_FENCE_LANGS:
+            continue
+        for ln in m.group(2).split("\n"):
+            s = ln.strip()
+            if len(s) >= 25:
+                out.append(s)
+    rest = re.sub(r"```.*?```", " ", text, flags=re.DOTALL)
+    for m in re.finditer(r"`([^`\n]{25,})`", rest):
+        out.append(m.group(1).strip())
+    seen, uniq = set(), []
+    for s in out:
+        if s not in seen:
+            seen.add(s)
+            uniq.append(s)
+    return uniq
+
+
+def unverified_quotes(text, messages) -> list:
+    """Quoted code in ``text`` that appears in no tool result / user message.
+
+    A small model that skimmed a file will happily "quote" lines that do not
+    exist. Fires only when the evidence is real (corpus long enough), the
+    answer quotes at least three snippets, and at least half of them are
+    absent -- so a suggested-fix block next to genuine quotes stays quiet.
+    Returns up to five offending snippets, else ``[]``.
+    """
+    if not isinstance(text, str) or not text:
+        return []
+    parts = []
+    for msg in messages or []:
+        if isinstance(msg, dict) and msg.get("role") in ("tool", "user"):
+            parts.append(_stringify_content(msg.get("content", "")))
+    corpus = _norm_code("\n".join(parts))
+    if len(corpus) < 200:
+        return []
+    snippets = _quoted_snippets(text)
+    if len(snippets) < 3:
+        return []
+    missing = []
+    for s in snippets:
+        segs = [g.strip() for g in re.split(r"\.\.\.|\u2026", _norm_code(s))]
+        segs = [g for g in segs if len(g) >= 12]
+        if segs and not all(g in corpus for g in segs):
+            missing.append(s)
+    if len(missing) >= 3 and len(missing) * 2 >= len(snippets):
+        return missing[:5]
+    return []
+
+
+def evidence_ledger(messages) -> str:
+    """One-line ledger of what was actually read this turn, else ``""``."""
+    if detect_task_pattern(messages) is None:
+        return ""
+    start = _last_user_index(messages)
+    if not _turn_tool_calls(messages, start):
+        return ""
+    read = sorted(files_read_in_turn(messages))
+    src_ext = (".py", ".js", ".ts", ".tsx", ".go", ".rs", ".java", ".c", ".cpp")
+    listed = [f for f in listed_turn_files(messages)
+              if f.lower() not in _NON_FILE_NAMES and not _path_seen(f, read)]
+    listed.sort(key=lambda f: 0 if f.lower().endswith(src_ext) else 1)
+    bits = []
+    if read:
+        bits.append("read: " + ", ".join(read[:12]))
+    if listed:
+        bits.append("listed but NOT read yet: " + ", ".join(listed[:12]))
+    bits.append("unit tests: " + ("ran" if _test_run_indices(messages)
+                                  else "not run yet"))
+    return ("[Evidence so far -- " + "; ".join(bits) +
+            ". Make claims only about files you have read.]")
+
+
+def _choose_reminder(messages, last_role) -> str:
+    """Final reminder of the prompt.
+
+    After a tool result the stock reminder says "if it is enough, answer
+    now" -- exactly what a small model does after one read of a vague review.
+    When the evidence gate says more is owed, say so instead.
+    """
+    if last_role != "tool":
+        return _TOOL_REMINDER
+    try:
+        owed = pending_tool_request(messages)
+    except Exception:
+        owed = None
+    if owed and detect_task_pattern(messages) is not None:
+        return ("\n\n[Reminder: the tool result above is in the conversation, "
+                "but the evidence is still incomplete -- " + owed + ". Call "
+                "the next tool now; do not answer yet and do not repeat a "
+                "call whose result is already present.]")
+    return _TOOL_RESULT_REMINDER
+
+
+# ---------------------------------------------------------------------------
+# workspace guard (workspace_guard_patch.py)
+# ---------------------------------------------------------------------------
+
+# A bare "workspace" (not part of a path, file name or identifier) is what the
+# upstream router reads as "use the Workspace extension".
+_WORKSPACE_WORD_RE = re.compile(r"(?<![\w\\/.\-])([Ww])orkspace(?![\w\\/\-]|\.\w)")
+
+
+def defuse_extension_words(prompt: str) -> str:
+    """Rewrite the bare word ``workspace`` to ``project`` in an outgoing prompt.
+
+    Paths (``D:\\workspace\\x``), file names (``workspace.json``) and
+    identifiers (``workspace_id``) are left alone, so tool arguments that
+    refer to real files keep working. Disabled by
+    ``CONFIG["defuse_extension_words"] = false``.
+    """
+    if not isinstance(prompt, str) or not prompt:
+        return prompt
+    from .config import CONFIG
+    if not CONFIG.get("defuse_extension_words", True):
+        return prompt
+    new, n = _WORKSPACE_WORD_RE.subn(
+        lambda m: "Project" if m.group(1) == "W" else "project", prompt)
+    if n:
+        from .gemini import log
+        log(f"Prompt: rewrote {n} bare 'workspace' word(s) to 'project' "
+            "(avoids the Workspace extension route)")
+    return new
