@@ -13,6 +13,7 @@ from .config import CONFIG
 from .models import MODELS, resolve_model, ticket_for
 from .gemini import generate, generate_stream, log, GeminiError, trace
 from .tools import (
+    looks_like_tool_call,
     messages_to_prompt,
     parse_tool_calls,
     google_contents_to_prompt,
@@ -62,9 +63,246 @@ ERR_API = "api_error"
 # Gap between SSE keep-alive comments while a buffered turn still works
 # upstream. Must stay well under every client's idle/chunk timeout (OpenCode
 # defaults to 300 s).
-SSE_PING_INTERVAL_SEC = 15
+SSE_PING_INTERVAL_SEC = 5
 
 _MISSING = object()
+
+
+def _complete_call_end(text: str):
+    """Char index just past the LAST closed, parseable tool-call block, else None.
+
+    Reuses the real parser machinery (_iter_tool_blocks + JSONDecoder.raw_decode
+    over the prefix), so early-exit fires exactly when the buffered text holds
+    calls that would actually be accepted -- not on any stray triple-backtick.
+    A payload still streaming fails raw_decode (or its closing fence has not
+    arrived) and only counts the blocks closed before it.
+    """
+    from .tools import _NOTHING, _ARGUMENT_KEYS, _FENCE_OPEN, _FENCE_CLOSE
+    dec = json.JSONDecoder(strict=False)
+    last_end = None
+    pos = 0
+    while True:
+        m = _FENCE_OPEN.search(text, pos)
+        if not m:
+            return last_end
+        j = m.end()
+        while j < len(text) and text[j] in " \t\r\n":
+            j += 1
+        kind = m.group(1)
+        try:
+            data, end = dec.raw_decode(text, j)
+        except ValueError:
+            # Payload not complete (or not JSON): a Python-style call could
+            # still close later -- stop scanning, keep earlier blocks.
+            return last_end
+        counted = False
+        if isinstance(data, dict) and data.get("name"):
+            if kind != "json" or any(k in data for k in _ARGUMENT_KEYS):
+                counted = True
+        elif data is _NOTHING and kind != "json":
+            # Declared tool-call fence whose body is not (yet) valid JSON:
+            # wait for its closing fence; parse_tool_calls may still recover it.
+            close = text.find("```", m.end())
+            if close == -1:
+                return last_end
+            counted = True
+            end = close
+        if counted:
+            c = _FENCE_CLOSE.match(text, end)
+            if not c:
+                return last_end      # closing fence still streaming
+            last_end = c.end()
+            pos = last_end
+        else:
+            pos = max(end, m.end())
+
+
+def _streamed_generate(call_prompt, model_id, think_mode, file_refs,
+                       extra, ticket, tools_active, attempt_no, on_delta=None):
+    """generate_stream() collapsed to one string, with [timing] + early exit.
+
+    Used by the tool-retry loops when CONFIG["tool_stream"] is on. Three jobs:
+      * log first-delta timing so operator and client can tell "upstream slow"
+        from "proxy hung";
+      * stop reading upstream as soon as a *complete, parseable* tool_call
+        fence has arrived (real parser, not a backtick heuristic);
+      * hand every delta to ``on_delta`` so the caller can keep the client's
+        connection warm (heartbeat/ping) during a long buffered turn.
+
+    The generator is consumed through a queue with a timeout: silence itself
+    becomes an observable event ("silent for Ns") instead of an unexplained
+    hang. GeneratorExit never reaches the wrapped generator because it is
+    always drained into the queue by the pump thread first.
+    """
+    import queue as _queue
+    q: "_queue.Queue" = _queue.Queue()
+
+    def _pump():
+        try:
+            for d in generate_stream(call_prompt, model_id, think_mode,
+                                     file_refs, extra, ticket):
+                q.put(d)
+        except BaseException as exc:      # re-raised in this thread below
+            q.put(exc)
+        q.put(None)
+
+    threading.Thread(target=_pump, daemon=True).start()
+    chunks = []
+    ttfb_done = False
+    silent_logged = False
+    last_activity = t0 = time.monotonic()
+    while True:
+        try:
+            item = q.get(timeout=20.0)
+        except _queue.Empty:
+            if not silent_logged:
+                silent_logged = True
+                log(f"[timing] tool attempt {attempt_no + 1}: upstream silent "
+                    f"for {time.monotonic() - last_activity:.0f}s mid-turn")
+            continue
+        if isinstance(item, BaseException):
+            raise item
+        if item is None:
+            break
+        silent_logged = False
+        last_activity = time.monotonic()
+        if not ttfb_done and item:
+            ttfb_done = True
+            log(f"[timing] tool attempt {attempt_no + 1}: first delta in "
+                f"{last_activity - t0:.1f}s")
+        chunks.append(item)
+        if on_delta is not None:
+            try:
+                on_delta(item)
+            except Exception as e:
+                log(f"tool attempt {attempt_no + 1}: delta sink failed: {e}")
+        if tools_active:
+            raw_so_far = "".join(chunks)
+            cut = _complete_call_end(raw_so_far)
+            if cut is not None and looks_like_tool_call(raw_so_far[:cut]):
+                log(f"[timing] tool attempt {attempt_no + 1}: complete "
+                    f"tool_call fence after {time.monotonic() - t0:.1f}s, "
+                    "early-exit read")
+                break
+    return "".join(chunks)
+
+
+def _complete_call_end(text: str):
+    """Char index just past the LAST closed, parseable tool-call block, else None.
+
+    Uses the same primitives as the real parser (_FENCE_OPEN/_FENCE_CLOSE +
+    JSONDecoder.raw_decode with strict=False), so early-exit fires exactly
+    when the buffered prefix already holds a call ``parse_tool_calls`` would
+    accept -- never on a stray triple-backtick. Conservative by design:
+    * a payload still streaming fails raw_decode -> wait for more deltas;
+    * a non-JSON body (Python-style ``read(path="x")``) is NOT counted --
+      AST recovery happens later in parse_tool_calls, so such turns simply
+      read to completion instead of risking a cut-off call;
+    * prose ```json examples are skipped and scanning continues -- the real
+      call may follow them.
+    """
+    from .tools import _ARGUMENT_KEYS, _FENCE_OPEN, _FENCE_CLOSE
+    dec = json.JSONDecoder(strict=False)
+    last_end = None
+    pos = 0
+    while True:
+        m = _FENCE_OPEN.search(text, pos)
+        if not m:
+            return last_end
+        j = m.end()
+        while j < len(text) and text[j] in " \t\r\n":
+            j += 1
+        kind = m.group(1)
+        try:
+            data, end = dec.raw_decode(text, j)
+        except ValueError:
+            # Body not (yet) valid JSON: keep any earlier closed block and
+            # wait for more deltas rather than cutting mid-payload.
+            return last_end
+        counted = False
+        if isinstance(data, dict) and data.get("name"):
+            if kind != "json" or any(k in data for k in _ARGUMENT_KEYS):
+                counted = True
+        if not counted:
+            # Prose example or non-call payload: skip it, keep scanning.
+            c = _FENCE_CLOSE.match(text, end)
+            pos = c.end() if c else max(end, m.end())
+            continue
+        c = _FENCE_CLOSE.match(text, end)
+        if not c:
+            return last_end          # closing fence still streaming
+        last_end = c.end()
+        pos = last_end
+
+
+def _streamed_generate(call_prompt, model_id, think_mode, file_refs,
+                       extra, ticket, tools_active, attempt_no, on_delta=None):
+    """generate_stream() collapsed to one string, with [timing] + early exit.
+
+    Used by the tool-retry loops when CONFIG["tool_stream"] is on. Three jobs:
+      * log first-delta timing so operator and client can tell "upstream slow"
+        from "proxy hung";
+      * stop reading upstream as soon as a *complete, parseable* tool_call
+        fence has arrived (real parser, not a backtick heuristic);
+      * hand every delta to ``on_delta`` so the caller can keep the client's
+        connection warm (heartbeat/ping) during a long buffered turn.
+
+    The generator is consumed through a queue with a timeout: silence itself
+    becomes an observable event ("silent for Ns") instead of an unexplained
+    hang. GeneratorExit never reaches the wrapped generator because it is
+    always drained into the queue by the pump thread first.
+    """
+    import queue as _queue
+    q: "_queue.Queue" = _queue.Queue()
+
+    def _pump():
+        try:
+            for d in generate_stream(call_prompt, model_id, think_mode,
+                                     file_refs, extra, ticket):
+                q.put(d)
+        except BaseException as exc:      # re-raised in this thread below
+            q.put(exc)
+        q.put(None)
+
+    threading.Thread(target=_pump, daemon=True).start()
+    chunks = []
+    ttfb_done = False
+    silent_logged = False
+    last_activity = t0 = time.monotonic()
+    while True:
+        try:
+            item = q.get(timeout=20.0)
+        except _queue.Empty:
+            if not silent_logged:
+                silent_logged = True
+                log(f"[timing] tool attempt {attempt_no + 1}: upstream silent "
+                    f"for {time.monotonic() - last_activity:.0f}s mid-turn")
+            continue
+        if isinstance(item, BaseException):
+            raise item
+        if item is None:
+            break
+        silent_logged = False
+        last_activity = time.monotonic()
+        if not ttfb_done and item:
+            ttfb_done = True
+            log(f"[timing] tool attempt {attempt_no + 1}: first delta in "
+                f"{last_activity - t0:.1f}s")
+        chunks.append(item)
+        if on_delta is not None:
+            try:
+                on_delta(item)
+            except Exception as e:
+                log(f"tool attempt {attempt_no + 1}: delta sink failed: {e}")
+        if tools_active:
+            raw_so_far = "".join(chunks)
+            cut = _complete_call_end(raw_so_far)
+            if cut is not None and looks_like_tool_call(raw_so_far[:cut]):
+                log(f"[timing] tool attempt {attempt_no + 1}: complete "
+                    f"tool_call fence after {time.monotonic() - t0:.1f}s, "
+                    "early-exit read")
+                break
+    return "".join(chunks)
 
 
 def _estimate_tokens(text: str) -> int:
@@ -945,10 +1183,26 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     repeat_nudge = ""
                 call_prompt = prompt + "\n\n" + nudge
             try:
-                raw = generate(call_prompt, model_id, think_mode, file_refs, extra, ticket)
+                if CONFIG.get("tool_stream"):
+                    # Buffered turn, live heartbeat: every upstream delta
+                    # emits an SSE comment on the already-open stream, so the
+                    # client sees per-part activity instead of 20-60 s of
+                    # silence between attempts. The sink is set by the endpoint
+                    # that opened the stream; absent -> old buffered behaviour.
+                    hb = getattr(self, "_chat_hb", None)
+                    sink = (hb.feed if (hb is not None
+                                        and CONFIG.get("tool_delta_forward", True))
+                            else None)
+                    raw = _streamed_generate(call_prompt, model_id, think_mode,
+                                             file_refs, extra, ticket,
+                                             tools_active, attempt,
+                                             on_delta=sink)
+                else:
+                    raw = generate(call_prompt, model_id, think_mode, file_refs, extra, ticket)
             except Exception as e:
                 if attempt + 1 < attempts:
                     log(f"Tool retry after upstream error: {e}")
+                    time.sleep(CONFIG["retry_delay_sec"])
                     continue
                 if best_text and not required_tool:
                     log(f"Tool retry: final attempt failed ({e}); returning "
@@ -993,7 +1247,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                             "asking the model to fill them in")
                         continue
                 break
-            if (text or "").strip() and not looks_like_upstream_error(text):
+            if (text or "").strip() and not looks_like_canned_failure(text):
                 # A usable answer worth keeping if a later attempt fails: a
                 # good first turn must not become a 503 because the retry
                 # produced the placeholder or raised.
@@ -1002,6 +1256,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 continue
             if attempt + 1 >= attempts:
                 break
+            time.sleep(CONFIG["retry_delay_sec"])
             if not (text or "").strip():
                 # An upstream that produced nothing (observed once as an empty
                 # body after a dropped connection) is never a usable answer:
@@ -1010,7 +1265,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 log(f"Tool retry (attempt {attempt + 1}/{attempts}): upstream "
                     "returned an empty response")
                 continue
-            if looks_like_upstream_error(text):
+            if looks_like_canned_failure(text):
                 placeholder_hits += 1
                 if placeholder_hits >= 2:
                     log("Tool retry: upstream returned the same canned "
@@ -1023,7 +1278,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     "returned its canned error placeholder instead of a response")
                 continue
             if (not required_tool and tools_active
-                    and looks_like_extension_refusal(text)):
+                    and looks_like_canned_failure(text)):
                 # A verbose model can pad the settings-are-off refusal with
                 # prose, escaping the anchored placeholder regex; without this
                 # branch it would reach the client as a finished answer.
@@ -1111,7 +1366,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         # The canned sentence is an upstream failure, not something the model
         # said. Handing it to the client as 200 says "answered" when it was not.
-        if not tool_calls and looks_like_upstream_error(text):
+        if not tool_calls and looks_like_canned_failure(text):
             if best_text and not required_tool:
                 log(f"Tool retry: final answer is the upstream placeholder; "
                     f"returning best text from attempt {best_idx + 1}")
@@ -1873,10 +2128,24 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     grepeat_nudge = ""
                 call_prompt = prompt + "\n\n" + nudge
             try:
-                raw = generate(call_prompt, model_id, think_mode, file_refs, extra, ticket)
+                if CONFIG.get("tool_stream"):
+                    # Same live-heartbeat contract as the OpenAI loop: deltas
+                    # reset/emit SSE pings through the sink the endpoint set up
+                    # (self._google_hb). Absent sink -> old buffered behaviour.
+                    ghb = getattr(self, "_google_hb", None)
+                    gsink = (ghb.feed if (ghb is not None
+                                          and CONFIG.get("tool_delta_forward", True))
+                             else None)
+                    raw = _streamed_generate(call_prompt, model_id, think_mode,
+                                             file_refs, extra, ticket,
+                                             has_tools, attempt,
+                                             on_delta=gsink)
+                else:
+                    raw = generate(call_prompt, model_id, think_mode, file_refs, extra, ticket)
             except Exception as e:
                 if attempt + 1 < attempts:
                     log(f"Google tool retry after upstream error: {e}")
+                    time.sleep(CONFIG["retry_delay_sec"])
                     continue
                 if best_text and not required_tool:
                     log(f"Google tool retry: final attempt failed ({e}); "
@@ -1931,7 +2200,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     text = clean_text or raw
                     break
                 break
-            if (raw or "").strip() and not looks_like_upstream_error(raw):
+            if (raw or "").strip() and not looks_like_canned_failure(raw):
                 best_text, best_idx = raw, attempt
             if attempt + 1 >= attempts:
                 break
@@ -1939,7 +2208,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 log(f"Google tool retry (attempt {attempt + 1}/{attempts}): "
                     "upstream returned an empty response")
                 continue
-            if looks_like_upstream_error(raw):
+            if looks_like_canned_failure(raw):
                 log(f"Google tool retry (attempt {attempt + 1}/{attempts}): "
                     "upstream returned its canned error placeholder instead of "
                     "a response")
@@ -1970,7 +2239,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         # The canned sentence is an upstream failure, not something the model
         # said. Returning it as a candidate tells the client "answered".
-        if looks_like_upstream_error(text):
+        if looks_like_canned_failure(text):
             if best_text and not required_tool:
                 log(f"Google tool retry: final answer is the upstream "
                     f"placeholder; returning best text from attempt {best_idx + 1}")
