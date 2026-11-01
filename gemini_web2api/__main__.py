@@ -106,6 +106,8 @@ def main():
 
     # Refresh the Gemini build label; stale labels make every request fail.
     _maybe_refresh_bl()
+    from . import flow_patch
+    flow_patch.install()
 
     port = CONFIG["port"]
     host = CONFIG["host"]
