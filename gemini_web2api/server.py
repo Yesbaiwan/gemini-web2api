@@ -33,6 +33,8 @@ from .tools import (
     looks_like_missed_tool_call,
     looks_like_upstream_error,
     looks_like_extension_refusal,
+    looks_like_canned_failure,
+    looks_like_canned_failure,
     pending_tool_request,
     SOURCE_REVIEW_OWED,
     is_read_retry_reason,
@@ -303,6 +305,106 @@ def _streamed_generate(call_prompt, model_id, think_mode, file_refs,
                     "early-exit read")
                 break
     return "".join(chunks)
+
+
+class _Heartbeat:
+    """Delta sink for a buffered tool turn: upstream activity == keep-alive.
+
+    ``feed(delta)`` is called by ``_streamed_generate`` for every streamed
+    chunk of a tool-retry attempt. It writes one SSE comment immediately --
+    clients see per-part activity instead of 20-60 s of silence -- and resets
+    the interval timer so idle pings only fire when nothing arrives. The gone
+    flag is shared with the caller: a failed write means nobody listens and
+    further upstream attempts must be skipped. Thread-safe via ``_lock``
+    because both the request thread (feed) and this thread (run) write.
+    """
+
+    def __init__(self, handler, stop_event, gone_event):
+        self._handler = handler
+        self._stop = stop_event
+        self._gone = gone_event
+        self._wake = threading.Event()
+        self._lock = threading.Lock()
+
+    def _write_ping(self):
+        with self._lock:
+            if self._stop.is_set():
+                return False
+            try:
+                self._handler._sse_write(b": ping\n\n")
+                return True
+            except (BrokenPipeError, ConnectionResetError):
+                self._gone.set()
+                return False
+            except Exception:
+                return False
+
+    def feed(self, delta=None):
+        if self._stop.is_set() or self._gone.is_set():
+            return
+        self._write_ping()
+        self._wake.set()          # restart the idle countdown
+
+    def run(self):
+        interval = SSE_PING_INTERVAL_SEC
+        while not self._stop.is_set():
+            if self._wake.wait(interval):
+                self._wake.clear()
+                continue          # real activity just happened: re-arm quietly
+            if self._stop.is_set():
+                return
+            if not self._write_ping():
+                return
+
+
+class _Heartbeat:
+    """Delta sink for a buffered tool turn: upstream activity == keep-alive.
+
+    ``feed(delta)`` is called by ``_streamed_generate`` for every streamed
+    chunk of a tool-retry attempt. It writes one SSE comment immediately --
+    clients see per-part activity instead of 20-60 s of silence -- and resets
+    the interval timer so idle pings only fire when nothing arrives. The gone
+    flag is shared with the caller: a failed write means nobody listens and
+    further upstream attempts must be skipped. Thread-safe via ``_lock``
+    because both the request thread (feed) and this thread (run) write.
+    """
+
+    def __init__(self, handler, stop_event, gone_event):
+        self._handler = handler
+        self._stop = stop_event
+        self._gone = gone_event
+        self._wake = threading.Event()
+        self._lock = threading.Lock()
+
+    def _write_ping(self):
+        with self._lock:
+            if self._stop.is_set():
+                return False
+            try:
+                self._handler._sse_write(b": ping\n\n")
+                return True
+            except (BrokenPipeError, ConnectionResetError):
+                self._gone.set()
+                return False
+            except Exception:
+                return False
+
+    def feed(self, delta=None):
+        if self._stop.is_set() or self._gone.is_set():
+            return
+        self._write_ping()
+        self._wake.set()          # restart the idle countdown
+
+    def run(self):
+        interval = SSE_PING_INTERVAL_SEC
+        while not self._stop.is_set():
+            if self._wake.wait(interval):
+                self._wake.clear()
+                continue          # real activity just happened: re-arm quietly
+            if self._stop.is_set():
+                return
+            if not self._write_ping():
+                return
 
 
 def _estimate_tokens(text: str) -> int:
@@ -694,20 +796,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         stop_ping = threading.Event()
 
-        def _ping():
-            while not stop_ping.wait(SSE_PING_INTERVAL_SEC):
-                try:
-                    self._sse_write(b": ping\n\n")
-                except (BrokenPipeError, ConnectionResetError):
-                    # Nobody is listening any more; the caller uses this to
-                    # stop burning upstream calls for an answer no one gets.
-                    client_gone.set()
-                    return
-                except Exception:
-                    return
-
-        threading.Thread(target=_ping, daemon=True).start()
-        return stop_ping.set, client_gone
+        hb = _Heartbeat(self, stop_ping, client_gone)
+        threading.Thread(target=hb.run, daemon=True).start()
+        return stop_ping.set, client_gone, hb
 
     def _sse_chunk(self, cid, model, delta, finish_reason, include_usage=False):
         # ``logprobs`` is required (nullable) on the choice of a chat chunk and
@@ -1465,7 +1556,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         # header timeout mid-generation (see _start_sse_with_keepalive).
         stop_ping, client_gone = None, None
         if stream:
-            stop_ping, client_gone = self._start_sse_with_keepalive()
+            stop_ping, client_gone, self._chat_hb = self._start_sse_with_keepalive()
             self._sse_chunk(cid, echo_model, {"role": "assistant", "content": ""},
                             None, include_usage)
         try:
@@ -1487,6 +1578,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         finally:
             if stop_ping is not None:
                 stop_ping()
+            self._chat_hb = None
 
         if rf_instruction and text:
             text = strip_code_fence(text)
@@ -1546,7 +1638,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         # minutes on a thinking model, and a client waiting for response
         # headers would abort before a single frame (see
         # _start_sse_with_keepalive).
-        stop_ping, _client_gone = self._start_sse_with_keepalive()
+        stop_ping, _client_gone, _late_hb = self._start_sse_with_keepalive()
         self._sse_chunk(cid, model, {"role": "assistant", "content": ""},
                         None, include_usage)
         try:
@@ -1815,7 +1907,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         # streaming client aborts on its own header timeout mid-generation.
         stop_ping, client_gone = None, None
         if want_stream:
-            stop_ping, client_gone = self._start_sse_with_keepalive()
+            stop_ping, client_gone, _hb = self._start_sse_with_keepalive()
             sequence_number = 0
 
             def emit(event_type, **fields):
@@ -2081,7 +2173,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
         # retries are gated on the client still listening.
         stop_ping, client_gone, sse_started = None, None, False
         if stream and has_tools:
-            stop_ping, client_gone = self._start_sse_with_keepalive()
+            stop_ping, client_gone, self._google_hb = \
+                self._start_sse_with_keepalive()
             sse_started = True
 
         def _google_stream_fail(exc):
@@ -2097,6 +2190,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             finally:
                 if stop_ping is not None:
                     stop_ping()
+                self._google_hb = None
 
         def _google_fail(status, message, gstatus):
             if sse_started:
@@ -2293,6 +2387,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             finally:
                 if stop_ping is not None:
                     stop_ping()
+                self._google_hb = None
         else:
             self.send_json(response_obj)
 
