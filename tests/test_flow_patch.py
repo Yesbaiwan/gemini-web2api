@@ -76,7 +76,7 @@ class TestSummary(unittest.TestCase):
         msgs += _call(0, "shell", {"command": "npm test"}, out)
         _f, tests = F._review_materials(msgs)
         self.assertEqual(F._test_summary(tests),
-                         ["tests 178", "pass 178", "fail 0", "duration_ms 62944.3"])
+                         ["tests 178", "pass 178", "fail 0"])
 
 
 if __name__ == "__main__":

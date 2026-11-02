@@ -69,6 +69,9 @@ _DEFAULTS = {
     "flow_chunk_bytes": 30000,
     "flow_chunk_files": 4,
     "flow_map_workers": 2,
+    # Model riêng cho bước map (tìm lỗi). None = dùng model của request.
+    # Vd "gemini-3.5-flash" (cần ticket 'flash' trong model_tickets).
+    "flow_map_model": None,
     # Opt-in: yêu cầu quá mơ hồ -> trả câu hỏi chọn pattern 1-4 cho client.
     "flow_ask_when_unclear": False,
 }
@@ -864,7 +867,9 @@ def _test_summary(tests):
         r"^Tests?:\s+\d+|^test result:", re.IGNORECASE)
     lines = [re.sub(r"^(?:\S\s+|#\s*)(?=[A-Za-z0-9])", "", ln.strip()) for ln in body.splitlines()
              if pat.search(ln.strip())]
-    return lines[-6:] or [body.strip()[-200:]]
+    keep = [ln for ln in lines
+            if not ln.lower().startswith(("duration", "suites"))]
+    return keep[:6] or [body.strip()[-200:]]
 
 
 def _map_reduce(messages, step, ctx, gen, client_gone=None):
@@ -903,8 +908,14 @@ def _map_reduce(messages, step, ctx, gen, client_gone=None):
         kept, d = _verify_findings(text, chunk)
         findings.extend(kept)
         dropped += d
-        if not kept and not d:
+        is_none = bool(re.fullmatch(r"\W*NONE\W*", (text or "").strip(),
+                                    re.IGNORECASE))
+        if is_none:
             clean += 1
+        elif not kept and not d:
+            # Văn xuôi / định dạng lạ: không xác minh được -> KHÔNG tính là sạch.
+            dropped += 1
+            leads.append(" ".join(text.split())[:220])
         if d:
             kept_set = set(kept)
             leads.extend(x[:220] for x in _split_findings(text)
@@ -964,6 +975,21 @@ def _map_reduce(messages, step, ctx, gen, client_gone=None):
 # Hook vào GeminiHandler._generate_with_tool_retry
 # --------------------------------------------------------------------------
 
+def _map_model(model_id, think_mode, extra, ticket):
+    """(model_id, think, extra, ticket) cho bước map; flow_map_model nếu có."""
+    name = _cfg("flow_map_model")
+    if not name:
+        return model_id, think_mode, extra, ticket
+    from .models import resolve_model, ticket_for
+    n, m_id, m_think, err, m_extra = resolve_model(
+        name, default=CONFIG["default_model"])
+    if err:
+        log(f"[flow] flow_map_model '{name}' invalid ({err}); using request model")
+        return model_id, think_mode, extra, ticket
+    log(f"[flow] map step uses model '{n}'")
+    return m_id, m_think, m_extra, ticket_for(n)
+
+
 def install():
     """Monkeypatch server.GeminiHandler. Idempotent."""
     from . import server
@@ -1009,10 +1035,12 @@ def install():
             if (_cfg("flow_mapreduce")
                     and step.pattern in ("GENERIC_REVIEW", "FILE_REVIEW")):
                 try:
+                    m_id, m_think, m_extra, m_ticket = _map_model(
+                        model_id, think_mode, extra, ticket)
                     report = _map_reduce(
                         messages, step, ctx,
-                        lambda p: generate(p, model_id, think_mode, None,
-                                           extra, ticket), client_gone)
+                        lambda p: generate(p, m_id, m_think, None,
+                                           m_extra, m_ticket), client_gone)
                 except Exception as e:
                     log(f"[flow] map-reduce failed, using single answer: {e}")
                     report = None
