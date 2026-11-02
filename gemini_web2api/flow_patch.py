@@ -42,7 +42,9 @@ from collections import Counter
 
 from . import tools as T
 from .config import CONFIG
-from .gemini import log
+from concurrent.futures import ThreadPoolExecutor
+
+from .gemini import log, generate
 
 __all__ = ["install", "plan_for", "tool_kind", "Step", "ToolMap"]
 
@@ -60,6 +62,13 @@ _DEFAULTS = {
     "flow_max_retries": 1,
     "flow_review_include_tests": False,
     "flow_answer_directive": True,
+    # Review lớn: chia nội dung đã đọc thành nhóm nhỏ, mỗi nhóm một lượt gọi
+    # model (chỉ để tìm lỗi), proxy kiểm chứng trích dẫn rồi tự gộp báo cáo.
+    "flow_mapreduce": True,
+    "flow_mapreduce_min_bytes": 30000,
+    "flow_chunk_bytes": 30000,
+    "flow_chunk_files": 4,
+    "flow_map_workers": 2,
     # Opt-in: yêu cầu quá mơ hồ -> trả câu hỏi chọn pattern 1-4 cho client.
     "flow_ask_when_unclear": False,
 }
@@ -594,7 +603,9 @@ def _answer_step(pattern, ev, total, index, skipped=None):
         if skipped:
             instr += (" NOT read (say your coverage is PARTIAL and name them): "
                       + ", ".join(skipped[:20]) + ".")
-    return Step(pattern, "answer", index, total, (), instr)
+    st = Step(pattern, "answer", index, total, (), instr)
+    st.skipped = list(skipped or [])
+    return st
 
 
 def _read_calls(tm, files):
@@ -750,6 +761,190 @@ def plan_for(messages, tm, ctx=None):
 
 
 # --------------------------------------------------------------------------
+# Map-reduce review: model yếu chỉ nhìn 1-4 file mỗi lượt
+# --------------------------------------------------------------------------
+
+def _review_materials(messages):
+    ev = _answered_calls(messages)
+    files, seen = [], set()
+    for e in ev:
+        if e["kind"] == "read" and _read_ok(e):
+            p = _call_path(e["args"])
+            if p and p not in seen:
+                seen.add(p)
+                files.append((p, e["result"]))
+    tests = [e for e in ev if e["kind"] == "exec"
+             and _is_test_cmd(_call_command(e["args"]))]
+    return files, tests
+
+
+def _make_chunks(files, max_bytes, max_files):
+    """Nhóm file theo thư mục; file quá lớn được cắt theo dòng."""
+    out, cur, size = [], [], 0
+    for p, body in sorted(files, key=lambda x: x[0]):
+        n = len(body.encode("utf-8", "ignore"))
+        if n > max_bytes:
+            if cur:
+                out.append(cur)
+                cur, size = [], 0
+            piece, psize, part = [], 0, 1
+            for ln in body.split("\n"):
+                piece.append(ln)
+                psize += len(ln.encode("utf-8", "ignore")) + 1
+                if psize >= max_bytes:
+                    out.append([(f"{p} (part {part})", "\n".join(piece))])
+                    piece, psize, part = [], 0, part + 1
+            if piece:
+                out.append([(f"{p} (part {part})", "\n".join(piece))])
+            continue
+        if cur and (size + n > max_bytes or len(cur) >= max_files):
+            out.append(cur)
+            cur, size = [], 0
+        cur.append((p, body))
+        size += n
+    if cur:
+        out.append(cur)
+    return out
+
+
+def _map_prompt(request, chunk):
+    parts = ["You are a meticulous code reviewer. User request: "
+             + request.strip()[:300] + "\n\n"
+             "Find CRITICAL bugs ONLY in the files below (crash, data loss or "
+             "corruption, security hole, race condition, wrong logic). Rules:\n"
+             "- Report only what is visible in the text below.\n"
+             "- One finding per line, exactly: - path:line -- `exact quoted code "
+             "line` -- why it is a bug\n"
+             "- The quote MUST be copied verbatim from the file (without the "
+             "line number).\n"
+             "- If you find nothing critical, output exactly: NONE\n"
+             "- No tool calls, no summary of what the code does, no praise.\n"]
+    for p, body in chunk:
+        parts.append(f"\n===== FILE: {p} =====\n{body}\n===== END {p} =====")
+    return T.defuse_extension_words("".join(parts))
+
+
+def _split_findings(text):
+    items, cur = [], None
+    for ln in (text or "").splitlines():
+        if re.match(r"^\s*(?:[-*\u2022]|\d+[.)])\s+\S", ln):
+            if cur:
+                items.append(cur)
+            cur = ln.strip()
+        elif cur and ln.strip():
+            cur += " " + ln.strip()
+    if cur:
+        items.append(cur)
+    return items
+
+
+def _verify_findings(text, chunk):
+    """(kept, dropped): chỉ giữ finding có trích dẫn nằm thật trong chunk."""
+    corpus = T._norm_code("\n".join(b for _p, b in chunk))
+    kept, dropped = [], 0
+    if re.fullmatch(r"\W*NONE\W*", (text or "").strip(), re.IGNORECASE):
+        return kept, dropped
+    for item in _split_findings(text):
+        snippets = re.findall(r"`([^`\n]{8,})`", item)
+        if snippets and all(T._norm_code(x) in corpus for x in snippets):
+            kept.append(item)
+        else:
+            dropped += 1
+    return kept, dropped
+
+
+def _test_summary(tests):
+    if not tests:
+        return []
+    body = tests[-1]["result"]
+    lines = [ln.strip() for ln in body.splitlines()
+             if re.search(r"(?:\b(?:tests?|pass(?:ed)?|fail(?:ed)?|cancelled|"
+                          r"skipped)\b\s+\d+|\d+\s+(?:passed|failed|tests?)\b|"
+                          r"^Ran \d+|^OK\b|^FAILED\b)", ln)]
+    return lines[-6:] or [body.strip()[-200:]]
+
+
+def _map_reduce(messages, step, ctx, gen, client_gone=None):
+    files, tests = _review_materials(messages)
+    total = sum(len(b.encode("utf-8", "ignore")) for _p, b in files)
+    if not files or total < int(_cfg("flow_mapreduce_min_bytes")):
+        return None
+    chunks = _make_chunks(files, int(_cfg("flow_chunk_bytes")),
+                          int(_cfg("flow_chunk_files")))
+    log(f"[flow] map-reduce review: {len(files)} files, {total} bytes, "
+        f"{len(chunks)} chunk(s)")
+
+    def work(chunk):
+        if client_gone is not None and client_gone.is_set():
+            return None, "client disconnected"
+        for attempt in range(2):
+            try:
+                text = gen(_map_prompt(ctx.request, chunk))
+                if text and not T.looks_like_canned_failure(text):
+                    return text, None
+            except Exception as e:
+                err = str(e)
+                log(f"[flow] map chunk attempt {attempt + 1} failed: {e}")
+        return None, "upstream failed"
+
+    workers = max(1, int(_cfg("flow_map_workers")))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        results = list(pool.map(work, chunks))
+
+    findings, dropped, failed = [], 0, []
+    for chunk, (text, err) in zip(chunks, results):
+        names = ", ".join(p for p, _b in chunk)
+        if text is None:
+            failed.append(names)
+            continue
+        kept, d = _verify_findings(text, chunk)
+        findings.extend(kept)
+        dropped += d
+    vi = bool(_VI_RE.search(ctx.last.lower()))
+    read = [p for p, _b in files]
+    skipped = list(getattr(step, "skipped", []) or [])
+    out = []
+    summary = _test_summary(tests)
+    if vi:
+        out.append(f"**Kết quả review** ({len(files)} file, {len(chunks)} nhóm, "
+                   "mỗi nhóm được soi riêng; trích dẫn đã đối chiếu với source)")
+        if summary:
+            out.append("Test: " + " | ".join(summary))
+        if findings:
+            out.append("**Phát hiện:**\n" + "\n".join(findings))
+        else:
+            out.append("Không tìm thấy critical bug nào có trích dẫn xác minh "
+                       "được trong các file đã đọc.")
+        if dropped:
+            out.append(f"({dropped} nhận định bị loại vì trích dẫn không khớp source.)")
+        out.append("File đã đọc: " + ", ".join(read))
+        if skipped or failed:
+            out.append("**Chưa review đầy đủ (coverage một phần):** "
+                       + ", ".join(skipped + failed))
+        out.append("Lưu ý: kết quả test pass không chứng minh không có bug; đây "
+                   "là review tự động bằng model nhỏ, nên kiểm tra lại các điểm quan trọng.")
+    else:
+        out.append(f"**Review result** ({len(files)} files, {len(chunks)} groups, "
+                   "each reviewed separately; quotes verified against the source)")
+        if summary:
+            out.append("Tests: " + " | ".join(summary))
+        if findings:
+            out.append("**Findings:**\n" + "\n".join(findings))
+        else:
+            out.append("No critical bug with a verifiable quote was found in the "
+                       "files read.")
+        if dropped:
+            out.append(f"({dropped} claim(s) dropped: quote not found in the source.)")
+        out.append("Files read: " + ", ".join(read))
+        if skipped or failed:
+            out.append("**Partial coverage, not fully reviewed:** "
+                       + ", ".join(skipped + failed))
+        out.append("Note: passing tests do not prove the absence of bugs; this is "
+                   "an automated small-model review, double-check important areas.")
+    return "\n\n".join(out)
+
+
+# --------------------------------------------------------------------------
 # Hook vào GeminiHandler._generate_with_tool_retry
 # --------------------------------------------------------------------------
 
@@ -795,6 +990,18 @@ def install():
             f"{step.name} mode={'drive' if step.drive and _cfg('flow_drive') else 'guide'}")
 
         if step.name == "answer":
+            if (_cfg("flow_mapreduce")
+                    and step.pattern in ("GENERIC_REVIEW", "FILE_REVIEW")):
+                try:
+                    report = _map_reduce(
+                        messages, step, ctx,
+                        lambda p: generate(p, model_id, think_mode, None,
+                                           extra, ticket), client_gone)
+                except Exception as e:
+                    log(f"[flow] map-reduce failed, using single answer: {e}")
+                    report = None
+                if report:
+                    return report, None
             return call(prompt + "\n\n" + step.directive())
         if step.drive and _cfg("flow_drive"):
             return "", step.calls
