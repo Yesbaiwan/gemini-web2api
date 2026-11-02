@@ -1961,6 +1961,14 @@ def listed_turn_files(messages) -> list:
     return seen
 
 
+def _strip_fences(text: str) -> str:
+    """Blank fenced code blocks (``` ... ```) but keep inline ``code`` spans."""
+    if not isinstance(text, str) or not text:
+        return ""
+    blanked = re.sub(r"```.*?```", " ", text, flags=re.DOTALL)
+    return re.sub(r"```.*$", " ", blanked, flags=re.DOTALL)
+
+
 def _strip_code_spans(text: str) -> str:
     """Remove fenced and inline code from ``text`` for demand/file scanning.
 
@@ -1972,10 +1980,21 @@ def _strip_code_spans(text: str) -> str:
     """
     if not isinstance(text, str) or not text:
         return ""
-    blanked = re.sub(r"```.*?```", " ", text, flags=re.DOTALL)
-    blanked = re.sub(r"```.*$", " ", blanked, flags=re.DOTALL)
-    blanked = re.sub(r"`[^`\n]+`", " ", blanked)
-    return blanked
+    blanked = _strip_fences(text)
+    return re.sub(r"`[^`\n]+`", " ", blanked)
+
+
+def _code_spans(text: str) -> list:
+    """Inline ``code`` spans of ``text`` with fences blanked first.
+
+    ``_strip_code_spans`` erases them, but an identifier the user wrapped in
+    backticks ("fix the ``retry_delay`` handling") IS the target of the
+    request -- losing it made every change that named its target in inline
+    code look like vague prose.
+    """
+    if not isinstance(text, str) or not text:
+        return []
+    return re.findall(r"`([^`\n]+)`", _strip_fences(text))
 
 
 def _files_in(*chunks) -> set:
@@ -2098,16 +2117,34 @@ _ACT_TOOL_RE = re.compile(
 )
 
 
-def _is_change_request(folded: str, scannable: str) -> bool:
-    """True when folded text asks for a code change (fix/implement/update)."""
+# An inline-code target is a change target only when it reads like code
+# (``retry_delay``, ``pkg/a.py``), not a whole sentence wrapped in backticks.
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_./-]*$")
+
+
+def _looks_like_identifier(text: str) -> bool:
+    return bool(_IDENT_RE.match((text or "").strip()))
+
+
+def _is_change_request(folded: str, scannable: str, raw: str = "") -> bool:
+    """True when folded text asks for a code change (fix/implement/update).
+
+    ``folded``/``scannable`` come from :func:`_strip_code_spans`, which erases
+    inline code, so ``raw`` (the untouched user text) is scanned separately:
+    "fix the ``retry_delay`` handling" names its target in backticks and is
+    a change request even though no prose noun or file token survives the
+    strip.
+    """
     if _CHANGE_ACT_RE.search(folded):
         return True
     if not _CHANGE_VERB_RE.search(folded):
         return False
     if _CHANGE_NOUN_RE.search(folded):
         return True
-    return any(f for f in _files_in(scannable)
-               if f.lower() not in _NON_FILE_NAMES)
+    if any(f for f in _files_in(scannable)
+           if f.lower() not in _NON_FILE_NAMES):
+        return True
+    return any(_looks_like_identifier(s) for s in _code_spans(raw))
 
 
 def _turn_act_calls(messages, start_idx) -> bool:
@@ -2221,7 +2258,7 @@ def implement_test_owed(messages):
     scannable = _strip_code_spans(last_user)
     folded = _fold_diacritics(scannable)
     folded = re.sub(r"\s+", " ", folded).strip()
-    if not _is_change_request(folded, scannable):
+    if not _is_change_request(folded, scannable, last_user):
         return None
     if _NO_TEST_RE.search(folded):
         return None
@@ -2259,7 +2296,7 @@ def change_demanded(messages) -> bool:
     scannable = _strip_code_spans(last_user)
     folded = _fold_diacritics(scannable)
     folded = re.sub(r"\s+", " ", folded).strip()
-    return _is_change_request(folded, scannable)
+    return _is_change_request(folded, scannable, last_user)
 
 
 # ─── Task-pattern gate ────────────────────────────────────────────────────
@@ -2332,7 +2369,7 @@ def detect_task_pattern(messages):
         return _TASK_PATTERN_FILE_REVIEW
     if is_generic:
         return _TASK_PATTERN_GENERIC_REVIEW
-    if _is_change_request(folded, scannable):
+    if _is_change_request(folded, scannable, last_user):
         return _TASK_PATTERN_CHANGE
     if _TOOL_DEMAND_RE.search(folded):
         return _TASK_PATTERN_TOOL_DEMAND
@@ -2468,7 +2505,7 @@ def pending_tool_request(messages) -> str:
     # snippets are leads, not evidence -- so the early "a call ends the
     # search" return must not swallow it.
     change_owed = (
-        _is_change_request(folded, scannable)
+        _is_change_request(folded, scannable, last_user)
         and not _turn_act_calls(messages, last_user_idx)
         and not files_read_in_turn(messages)
         and not called_lower

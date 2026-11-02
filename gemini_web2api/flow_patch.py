@@ -32,6 +32,7 @@ config.json (đều tuỳ chọn, xem _DEFAULTS bên dưới). Tắt nhanh:
     {"flow_enabled": false}
 Chưa phủ: endpoint Google native (/v1beta) vì có vòng retry riêng.
 """
+import difflib
 import functools
 import json
 import os
@@ -61,6 +62,9 @@ _DEFAULTS = {
     "flow_max_review_files": 40,
     "flow_max_retries": 1,
     "flow_review_include_tests": False,
+    # CHANGE: max edit/write calls per turn before the proxy stops the
+    # edit-test loop and makes the model report honestly.
+    "flow_max_acts": 6,
     "flow_answer_directive": True,
     # Review lớn: chia nội dung đã đọc thành nhóm nhỏ, mỗi nhóm một lượt gọi
     # model (chỉ để tìm lỗi), proxy kiểm chứng trích dẫn rồi tự gộp báo cáo.
@@ -434,6 +438,115 @@ def _resolve(name, listing):
 # Step
 # --------------------------------------------------------------------------
 
+# ---- flow_fix: act gating, test-command detection, grep ranking ----------
+_ACT_FAIL_RE = re.compile(
+    r"(?:^\s*<?error|\bfailed\b|old_?string.{0,40}not found|"
+    r"could not find|cannot find|not found in|multiple matches|"
+    r"found \d+ matches|must be different|no changes)", re.IGNORECASE)
+_OLD_KEYS = ("oldString", "old_string", "oldText", "old_text", "old_str")
+_NEW_KEYS = ("newString", "new_string", "newText", "new_text", "new_str")
+_LINENO_RE = re.compile(r"^\s*\d+(?:: ?|\s*\| ?|\t|\u2192)")
+
+
+def _act_ok(e):
+    # An edit/write whose result reports a failure must not count as done.
+    return not _ACT_FAIL_RE.search((e.get("result") or "")[:400])
+
+
+def _failed_act_hint(ev):
+    for e in reversed(ev):
+        if e["kind"] == "act":
+            if _act_ok(e):
+                return ""
+            msg = " ".join((e.get("result") or "").split())[:300]
+            return (" Your previous edit FAILED with: " + msg +
+                    " -- re-copy the exact text from the file you read.")
+    return ""
+
+
+def _grep_hits(ev, files):
+    # {file in `files`: number of grep hits} from this turn's search results.
+    counts = {}
+    for e in ev:
+        if e["kind"] != "search":
+            continue
+        body = e["result"].replace("\\", "/")
+        for hf in T._files_in(body):
+            counts[hf] = counts.get(hf, 0) + body.count(hf)
+    hits = {}
+    for f in files:
+        n = sum(c for hf, c in counts.items() if T._path_seen(hf, [f]))
+        if n:
+            hits[f] = n
+    return hits
+
+
+def _strip_linenos(text):
+    # All-or-nothing: only strip when EVERY non-empty line carries a prefix.
+    lines = text.split("\n")
+    nonempty = [ln for ln in lines if ln.strip()]
+    if nonempty and all(_LINENO_RE.match(ln) for ln in nonempty):
+        return "\n".join(_LINENO_RE.sub("", ln, count=1) for ln in lines)
+    return text
+
+
+def _clean_file_text(text):
+    lines = text.replace("\r\n", "\n").split("\n")
+    if T._already_numbered(lines):
+        lines = [_LINENO_RE.sub("", ln, count=1) for ln in lines]
+    return "\n".join(lines)
+
+
+def _gate_act_calls(calls, messages):
+    # Check edit calls against the file text the model actually read.
+    # Returns (calls, problems). Line-number prefixes copied into
+    # oldString/newString are stripped silently; a genuine mismatch is
+    # reported (with the closest real line) so the caller can retry.
+    texts = {}
+    for e in _answered_calls(messages):
+        if e["kind"] == "read" and _read_ok(e):
+            p = _call_path(e["args"])
+            if p:
+                texts[p] = _clean_file_text(e["result"])
+    problems, out = [], []
+    for tc in calls:
+        fn = tc.get("function") or {}
+        if tool_kind(fn.get("name")) != "act":
+            out.append(tc)
+            continue
+        args = T._tool_arguments_dict(fn)
+        path = _call_path(args)
+        okey = next((k for k in _OLD_KEYS
+                     if isinstance(args.get(k), str) and args[k]), None)
+        src_text = next((t for p, t in texts.items()
+                         if path and T._path_seen(path, [p])), None)
+        if not (okey and src_text is not None):
+            out.append(tc)           # write/new file/unread file: nothing to check
+            continue
+        old = args[okey].replace("\r\n", "\n")
+        hay = src_text.replace("\r\n", "\n")
+        if old in hay or old.strip("\n") in hay:
+            out.append(tc)
+            continue
+        stripped = _strip_linenos(old)
+        if stripped != old and (stripped in hay or stripped.strip("\n") in hay):
+            args[okey] = stripped
+            for nk in _NEW_KEYS:
+                if isinstance(args.get(nk), str):
+                    args[nk] = _strip_linenos(args[nk])
+            log(f"[flow] edit gate: stripped line-number prefixes in {path}")
+            out.append({**tc, "function": {
+                **fn, "arguments": json.dumps(args, ensure_ascii=False)}})
+            continue
+        first = next((ln.strip() for ln in old.split("\n") if ln.strip()), "")
+        cands = [ln.strip() for ln in hay.split("\n") if ln.strip()]
+        near = difflib.get_close_matches(first, cands, n=1, cutoff=0.6)
+        problems.append(f"{path}: oldString does not appear in the file as read"
+                        + (f" (closest real line: {near[0]!r})" if near else ""))
+        out.append(tc)
+    return out, problems
+
+
 class Step:
     def __init__(self, pattern, name, index, total, kinds, instruction,
                  calls=None, drive=False, tool_names=()):
@@ -578,7 +691,7 @@ def clarification_text(messages):
 # Planner
 # --------------------------------------------------------------------------
 
-def _answer_step(pattern, ev, total, index, skipped=None):
+def _answer_step(pattern, ev, total, index, skipped=None, final=False):
     if not ev or not _cfg("flow_answer_directive"):
         return None
     read = sorted({_call_path(e["args"]) for e in ev
@@ -589,6 +702,10 @@ def _answer_step(pattern, ev, total, index, skipped=None):
                  "failed or none was possible). Say that plainly and ask the "
                  "user for the correct project path. Do NOT describe or "
                  "evaluate any code: you have not seen any.")
+    elif pattern == "CHANGE" and final:
+        instr = ("Edit budget exhausted. Do NOT call any tool. Reply in plain "
+                 "text: what was changed, whether the tests passed, and exactly "
+                 "what still fails. Do not claim success you have not seen.")
     elif pattern == "CHANGE":
         instr = ("Evidence complete. If the last test run failed, fix the "
                  "cause with one more edit tool_call; otherwise reply in plain "
@@ -630,6 +747,8 @@ def plan_for(messages, tm, ctx=None):
     named = [f for f in T._files_in(ctx.scannable)
              if f.lower() not in T._NON_FILE_NAMES
              and f.lower() not in T._created_files(ctx.scannable, ctx.folded)]
+    test_cmd = _test_command(listing + named + [
+        p for p in (_call_path(e["args"]) for e in ev) if p])
 
     def survey_step(index, total):
         retry = _survey_count(ev) >= 1  # first listing came back empty
@@ -705,20 +824,37 @@ def plan_for(messages, tm, ctx=None):
             if unread and tm.first("read"):
                 return read_step(unread[:batch], 2, 5)
         elif not read_set and tm.first("read"):
+            kws = _keywords(ctx.request)
+            if (kws and tm.first("search")
+                    and not any(e["kind"] == "search" for e in ev)):
+                scall = tm.make_call("search", pattern="(?i)" + "|".join(
+                    re.escape(k) for k in kws[:3]))
+                if scall:
+                    skinds = {"survey", "search", "exec"}
+                    return Step(p, "search", 2, 5, skinds,
+                                "Locate the code to change with grep first.",
+                                [scall], True, tm.names(skinds))
             core = _core_sources(listing, False, 200)
-            ranked = _rank(core, _keywords(ctx.request))[:2]
+            ranked = _rank(core, kws, _grep_hits(ev, core))[:2]
             if ranked:
                 return read_step(ranked, 2, 5)
             return read_step(core[:2], 2, 5, drive=False) if core else Step(
                 p, "read", 2, 5, {"read"},
                 "Read the file(s) you are going to change.", None, False,
                 tm.names({"read"}))
-        if not any(e["kind"] == "act" for e in ev) and tm.first("act"):
+        acts = [e for e in ev if e["kind"] == "act"]
+        if len(acts) >= int(_cfg("flow_max_acts")) and (
+                not _act_ok(acts[-1]) or _tests_ran_after_act(ev)):
+            return _answer_step(p, ev, 5, 5, final=True)
+        if tm.first("act") and (not any(_act_ok(e) for e in acts)
+                                or (acts and not _act_ok(acts[-1]))):
             return Step(p, "act", 3, 5, {"act"},
                         "Make the change now with ONE edit/write tool_call per "
-                        "file, copying old text exactly from the file you read.",
+                        "file, copying old text exactly from the file you read "
+                        "(no line-number prefixes)." + _failed_act_hint(ev),
                         None, False, tm.names({"act"}))
-        edited_src = any(e["kind"] == "act" and (_call_path(e["args"]) or "")
+        edited_src = any(e["kind"] == "act" and _act_ok(e)
+                         and (_call_path(e["args"]) or "")
                          .lower().endswith(_SRC_EXT) for e in ev)
         if (edited_src and tm.first("exec") and not _tests_ran_after_act(ev)
                 and not T._NO_TEST_RE.search(ctx.folded)):
@@ -1064,6 +1200,16 @@ def install():
             last = (text, calls)
             ok = [tc for tc in (calls or [])
                   if tool_kind((tc.get("function") or {}).get("name")) in step.kinds]
+            if ok and step.name == "act":
+                ok, problems = _gate_act_calls(ok, messages)
+                if problems:
+                    log("[flow] edit gate: " + " | ".join(problems))
+                    if attempt < max(0, int(_cfg("flow_max_retries"))):
+                        nudge = (" Your edit was rejected before sending: "
+                                 + " | ".join(problems) + " Copy oldString "
+                                 "EXACTLY from the file you read, without "
+                                 "line-number prefixes.")
+                        continue
             if ok:
                 return "", ok
             bad = ", ".join((tc.get("function") or {}).get("name", "?")
