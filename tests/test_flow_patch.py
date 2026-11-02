@@ -68,5 +68,16 @@ class Materials(unittest.TestCase):
         self.assertEqual([p for p, _ in files], ["a.py"])
 
 
+class TestSummary(unittest.TestCase):
+    def test_only_summary_lines(self):
+        out = ("  \u2714 retry sau rename fail 1 l\u1ea7n -> ok (65ms)\n"
+               "\u2139 tests 178\n\u2139 pass 178\n\u2139 fail 0\n\u2139 duration_ms 62944.3\n")
+        msgs = [{"role": "user", "content": "review source"}]
+        msgs += _call(0, "shell", {"command": "npm test"}, out)
+        _f, tests = F._review_materials(msgs)
+        self.assertEqual(F._test_summary(tests),
+                         ["tests 178", "pass 178", "fail 0", "duration_ms 62944.3"])
+
+
 if __name__ == "__main__":
     unittest.main()

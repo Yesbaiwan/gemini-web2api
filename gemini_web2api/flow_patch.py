@@ -857,10 +857,13 @@ def _test_summary(tests):
     if not tests:
         return []
     body = tests[-1]["result"]
-    lines = [ln.strip() for ln in body.splitlines()
-             if re.search(r"(?:\b(?:tests?|pass(?:ed)?|fail(?:ed)?|cancelled|"
-                          r"skipped)\b\s+\d+|\d+\s+(?:passed|failed|tests?)\b|"
-                          r"^Ran \d+|^OK\b|^FAILED\b)", ln)]
+    pat = re.compile(
+        r"^(?:\S\s+|#\s*)?(?:tests?|suites?|pass(?:ed)?|fail(?:ed)?|cancelled|skipped|"
+        r"todo|duration_ms)\s*[:=]?\s*\d+|^Ran \d+|^OK\b|^FAILED\b|"
+        r"^(?:\S\s+)?\d+\s+(?:passed|failed|passing|failing)\b|"
+        r"^Tests?:\s+\d+|^test result:", re.IGNORECASE)
+    lines = [re.sub(r"^(?:\S\s+|#\s*)(?=[A-Za-z0-9])", "", ln.strip()) for ln in body.splitlines()
+             if pat.search(ln.strip())]
     return lines[-6:] or [body.strip()[-200:]]
 
 
@@ -891,7 +894,7 @@ def _map_reduce(messages, step, ctx, gen, client_gone=None):
     with ThreadPoolExecutor(max_workers=workers) as pool:
         results = list(pool.map(work, chunks))
 
-    findings, dropped, failed = [], 0, []
+    findings, dropped, failed, leads, clean = [], 0, [], [], 0
     for chunk, (text, err) in zip(chunks, results):
         names = ", ".join(p for p, _b in chunk)
         if text is None:
@@ -900,6 +903,12 @@ def _map_reduce(messages, step, ctx, gen, client_gone=None):
         kept, d = _verify_findings(text, chunk)
         findings.extend(kept)
         dropped += d
+        if not kept and not d:
+            clean += 1
+        if d:
+            kept_set = set(kept)
+            leads.extend(x[:220] for x in _split_findings(text)
+                         if x not in kept_set)
     vi = bool(_VI_RE.search(ctx.last.lower()))
     read = [p for p, _b in files]
     skipped = list(getattr(step, "skipped", []) or [])
@@ -916,7 +925,11 @@ def _map_reduce(messages, step, ctx, gen, client_gone=None):
             out.append("Không tìm thấy critical bug nào có trích dẫn xác minh "
                        "được trong các file đã đọc.")
         if dropped:
-            out.append(f"({dropped} nhận định bị loại vì trích dẫn không khớp source.)")
+            out.append(f"({dropped} nhận định bị loại vì trích dẫn không khớp source; "
+                       "chỉ là nghi vấn chưa xác minh, cần tự kiểm tra:)\n"
+                       + "\n".join(leads[:3]))
+        out.append(f"{clean}/{len(chunks)} nhóm model trả về 'không có lỗi'; đó là ý kiến "
+                   "của model nhỏ, không phải bằng chứng.")
         out.append("File đã đọc: " + ", ".join(read))
         if skipped or failed:
             out.append("**Chưa review đầy đủ (coverage một phần):** "
@@ -934,7 +947,10 @@ def _map_reduce(messages, step, ctx, gen, client_gone=None):
             out.append("No critical bug with a verifiable quote was found in the "
                        "files read.")
         if dropped:
-            out.append(f"({dropped} claim(s) dropped: quote not found in the source.)")
+            out.append(f"({dropped} claim(s) dropped, quote not found in the source; "
+                       "unverified leads, check manually:)\n" + "\n".join(leads[:3]))
+        out.append(f"{clean}/{len(chunks)} groups returned 'no bug'; that is a small "
+                   "model's opinion, not evidence.")
         out.append("Files read: " + ", ".join(read))
         if skipped or failed:
             out.append("**Partial coverage, not fully reviewed:** "
