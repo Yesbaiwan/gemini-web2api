@@ -791,9 +791,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             elif path in ("/", "/health"):
                 self.send_json({"status": "ok", "version": __version__,
                                 "models": list(MODELS.keys())})
-            elif path == "/v1/health":
-                self.send_json({"status": "ok", "version": "1.1.1",
-                                "models": list(MODELS.keys())})
+
             else:
                 self.send_api_error(404, f"not found: {path}", ERR_INVALID_REQUEST)
         except (BrokenPipeError, ConnectionResetError):
