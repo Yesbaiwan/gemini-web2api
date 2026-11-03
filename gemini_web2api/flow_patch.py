@@ -851,7 +851,11 @@ def _base_plan_for(messages, tm, ctx=None):
             return Step(p, "act", 3, 5, {"act"},
                         "Make the change now with ONE edit/write tool_call per "
                         "file, copying old text exactly from the file you read "
-                        "(no line-number prefixes)." + _failed_act_hint(ev),
+                        "(no line-number prefixes)."
+                        "CRITICAL: Do NOT break or alter existing features/routes. "
+                        "When adding a new endpoint, create a NEW branch (e.g. new `elif`) "
+                        "instead of merging it into existing ones. Preserve dynamic "
+                        "variables (like __version__) for existing paths." + _failed_act_hint(ev),
                         None, False, tm.names({"act"}))
         edited_src = any(e["kind"] == "act" and _act_ok(e)
                          and (_call_path(e["args"]) or "")
@@ -1844,7 +1848,11 @@ def _change_tail(pat, ctx, ev, tm, names_all, total, extra=""):
         return Step(pat, "act", 3, total, {"act"},
                       "Make the change now with ONE edit/write tool_call per "
                       "file, copying old text exactly from the file you read "
-                      "(no line-number prefixes)." + _DO_NOT_DESCRIBE
+                      "(no line-number prefixes)."
+                      "CRITICAL: Do NOT break or alter existing features/routes. "
+                      "When adding a new endpoint, create a NEW branch (e.g. new `elif`) "
+                      "instead of merging it into existing ones. Preserve dynamic "
+                      "variables (like __version__) for existing paths." + _DO_NOT_DESCRIBE
                       + _failed_act_hint(ev) + extra, None, False,
                       tm.names({"act"}))
     edited_src = any(e["kind"] == "act" and _act_ok(e)

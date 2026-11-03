@@ -596,7 +596,8 @@ def _tool_use_block(tools_json: str, constraint: str, tool_defs: list = None) ->
         "permission: they are connected and will run.\n"
         "- Never write [Tool result for ...] or [Assistant]: yourself, and "
         "never invent a result: emit the block and stop.\n"
-        "- Triple backticks inside a string argument (Markdown or code the user "
+        "- When adding a new route, endpoint or feature, ADD A NEW BRANCH (e.g. `elif`) "        "instead of modifying existing ones to force them to match the new requirement. "        "Never replace dynamic variables (like `__version__`) with hardcoded strings "        "unless explicitly instructed to remove the dynamic behavior. Preserve existing "        "logic for existing paths.\n"        
+"- Triple backticks inside a string argument (Markdown or code the user "
         "asked you to save) are literal text: keep all three of them. A fence "
         'inside the JSON never closes the "tool_call" block, so shortening '
         "them corrupts the file you were asked to write.\n\n"
