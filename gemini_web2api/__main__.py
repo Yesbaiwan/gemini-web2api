@@ -108,8 +108,6 @@ def main():
     _maybe_refresh_bl()
     from . import flow_patch
     flow_patch.install()
-    from . import fix_patch
-    fix_patch.install()
 
     port = CONFIG["port"]
     host = CONFIG["host"]
