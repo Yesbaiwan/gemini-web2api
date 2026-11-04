@@ -74,8 +74,42 @@ class RepeatGuardTests(unittest.TestCase):
             _tool_msg("c2", "ok", name="edit"),
         ]
         # The pytest result predates a mutating edit: state changed, so a
-        # re-run with identical args is new work, not a loop.
-        self.assertEqual(_repeatable_calls(messages), set())
+        # re-run with identical args is new work, not a loop. The edit that
+        # just applied stays repeat-guarded: emitting the exact same edit
+        # again is a wasted round-trip (its oldString no longer matches).
+        done = _repeatable_calls(messages)
+        self.assertNotIn(("bash", '{"command": "pytest -q"}'), done)
+        self.assertIn(("edit", '{"path": "a.py"}'), done)
+
+    def test_test_run_does_not_clear_evidence(self):
+        # A pytest run is verification, not an edit: it must not wipe the
+        # earlier read from the repeat guard.
+        messages = [
+            {"role": "user", "content": "fix a.py"},
+            {"role": "assistant", "content": "",
+             "tool_calls": [_tc("c1", "read", '{"path": "a.py"}')]},
+            _tool_msg("c1", "old", name="read"),
+            {"role": "assistant", "content": "",
+             "tool_calls": [_tc("c2", "bash",
+                                '{"command": "python -m unittest discover"}')]},
+            _tool_msg("c2", "OK", name="bash"),
+        ]
+        self.assertIn(("read", '{"path": "a.py"}'),
+                      _repeatable_calls(messages))
+
+    def test_non_test_bash_still_clears_evidence(self):
+        messages = [
+            {"role": "user", "content": "fix a.py"},
+            {"role": "assistant", "content": "",
+             "tool_calls": [_tc("c1", "read", '{"path": "a.py"}')]},
+            _tool_msg("c1", "old", name="read"),
+            {"role": "assistant", "content": "",
+             "tool_calls": [_tc("c2", "bash", '{"command": "rm b.py"}')]},
+            _tool_msg("c2", "ok", name="bash"),
+        ]
+        done = _repeatable_calls(messages)
+        self.assertNotIn(("read", '{"path": "a.py"}'), done)
+        self.assertIn(("bash", '{"command": "rm b.py"}'), done)
 
     def test_reread_after_edit_is_not_repeatable(self):
         messages = [
@@ -87,7 +121,11 @@ class RepeatGuardTests(unittest.TestCase):
              "tool_calls": [_tc("c2", "edit", '{"path": "a.py"}')]},
             _tool_msg("c2", "ok", name="edit"),
         ]
-        self.assertEqual(_repeatable_calls(messages), set())
+        # The read predates the edit -- re-reading is new work, so it is
+        # dropped. The edit itself stays guarded.
+        done = _repeatable_calls(messages)
+        self.assertNotIn(("read", '{"path": "a.py"}'), done)
+        self.assertIn(("edit", '{"path": "a.py"}'), done)
 
     def test_pure_read_loop_stays_repeatable(self):
         messages = [
@@ -110,7 +148,11 @@ class RepeatGuardTests(unittest.TestCase):
             {"parts": [{"functionResponse": {"name": "edit",
                                               "response": {"ok": 1}}}]},
         ]
-        self.assertEqual(_google_repeatable(contents), set())
+        # The read is stale (state changed); the edit that just applied
+        # stays guarded so re-emitting the exact same call is a loop.
+        done = _google_repeatable(contents)
+        self.assertNotIn(("read", '{"path": "a.py"}'), done)
+        self.assertIn(("edit", '{"path": "a.py"}'), done)
 
 
 class EvidenceCountingTests(unittest.TestCase):
@@ -344,6 +386,9 @@ class RequiredToolContractTests(unittest.TestCase):
     @mock.patch("gemini_web2api.server.generate")
     def test_required_duplicate_falls_back_to_prose(self, generate):
         CONFIG["tool_retry_attempts"] = 0
+        # Opt into the soft fallback: with the default (fail-closed) config a
+        # duplicate loop under tool_choice:required raises GeminiError.
+        CONFIG["required_tool_fail_on_duplicate"] = False
         history = [
             {"role": "user", "content": "read a.py"},
             {"role": "assistant", "content": "", "tool_calls": [{

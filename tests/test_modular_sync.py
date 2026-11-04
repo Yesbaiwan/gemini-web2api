@@ -3450,6 +3450,10 @@ class ToolRetryLoopGuardTests(unittest.TestCase):
     @mock.patch("gemini_web2api.server.generate")
     def test_duplicate_call_forced_to_text_under_required(self, generate):
         CONFIG["tool_retry_attempts"] = 0
+        # Soft fallback ("a loop is worse than one prose turn") only applies
+        # when required_tool_fail_on_duplicate is off; the default (on) makes
+        # a duplicate loop under tool_choice:required raise instead.
+        CONFIG["required_tool_fail_on_duplicate"] = False
         history = [
             {"role": "user", "content": "read a.py"},
             {"role": "assistant", "content": "",
