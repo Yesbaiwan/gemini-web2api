@@ -386,6 +386,9 @@ class RequiredToolContractTests(unittest.TestCase):
     @mock.patch("gemini_web2api.server.generate")
     def test_required_duplicate_falls_back_to_prose(self, generate):
         CONFIG["tool_retry_attempts"] = 0
+        # Opt into the soft fallback: with the default (fail-closed) config a
+        # duplicate loop under tool_choice:required raises GeminiError.
+        CONFIG["required_tool_fail_on_duplicate"] = False
         history = [
             {"role": "user", "content": "read a.py"},
             {"role": "assistant", "content": "", "tool_calls": [{
