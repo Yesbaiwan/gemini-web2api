@@ -1523,6 +1523,27 @@ def _canonical_args(arguments) -> str:
         return str(arguments)
 
 
+def _is_mutating_call(name, arguments) -> bool:
+    """True when a completed tool call changed the world earlier results describe.
+
+    ``edit``/``write``/``apply_patch``-style names always mutate. Command
+    runners (``bash``/``shell``/``exec``/``run``) are verification when their
+    arguments hold a test command -- pytest/unittest/npm test output does not
+    change files, so a green re-run must not wipe the edit's repeat-guard
+    entry. Any other command (rm, sed -i, git commit, ...) still counts as
+    mutating.
+    """
+    if not isinstance(name, str) or not _MUTATING_TOOL_RE.search(name):
+        return False
+    if isinstance(arguments, dict):
+        blob = json.dumps(arguments, ensure_ascii=False)
+    elif isinstance(arguments, str):
+        blob = arguments
+    else:
+        blob = ""
+    return not (blob and _TEST_CMD_RE.search(blob))
+
+
 def _repeatable_calls(messages) -> set:
     """``{(name, canonical_args)}`` this conversation already has results for.
 
@@ -1531,10 +1552,12 @@ def _repeatable_calls(messages) -> set:
     recognise a model that keeps emitting a call it already got the answer
     to, instead of executing the same call again.
 
-    A mutating tool (edit/write/bash/...) changes the world the earlier
+    A mutating tool (edit/write/...) changes the world the earlier
     results described: after one completes, every earlier entry is dropped.
     Re-running the same ``pytest`` or re-reading a just-edited file is then
-    progress, not a loop.
+    progress, not a loop. The mutating call itself stays in the set:
+    re-emitting the exact edit that already applied is a wasted round-trip
+    (its oldString no longer matches), while re-reads/re-runs are new work.
     """
     calls_by_id = {}
     for msg in messages or []:
@@ -1547,7 +1570,8 @@ def _repeatable_calls(messages) -> set:
             tcid = tc.get("id")
             if tcid and isinstance(fn, dict):
                 calls_by_id[tcid] = (fn.get("name"),
-                                     _canonical_args(fn.get("arguments")))
+                                     _canonical_args(fn.get("arguments")),
+                                     fn.get("arguments"))
     done = set()
     for msg in messages or []:
         if not isinstance(msg, dict):
@@ -1559,10 +1583,15 @@ def _repeatable_calls(messages) -> set:
         tcid = msg.get("tool_call_id", "")
         key = calls_by_id.get(tcid)
         name = key[0] if key else (msg.get("name") or "")
+        raw_args = key[2] if key else ""
         if key is not None:
-            done.add(key)
-        if isinstance(name, str) and _MUTATING_TOOL_RE.search(name):
+            done.add(key[:2])
+        if _is_mutating_call(name, raw_args):
             done.clear()
+            # Keep the just-applied mutating call: repeating the exact same
+            # edit is a loop, re-reading or re-testing after it is not.
+            if key is not None:
+                done.add(key[:2])
     return done
 
 
@@ -1587,20 +1616,22 @@ def _google_repeatable(contents) -> set:
             if isinstance(part.get("functionCall"), dict):
                 fc = part["functionCall"]
                 pending.append((fc.get("name"),
-                                _canonical_args(fc.get("args"))))
+                                _canonical_args(fc.get("args")),
+                                fc.get("args")))
             elif isinstance(part.get("functionResponse"), dict):
                 fr = part["functionResponse"]
-                idx = next((i for i, (pending_name, _a) in enumerate(pending)
+                idx = next((i for i, (pending_name, _a, _r) in enumerate(pending)
                             if pending_name == fr.get("name")), None)
                 if idx is None and pending:
                     idx = 0
                 if idx is not None:
                     key = pending.pop(idx)
-                    done.add(key)
-                    if isinstance(key[0], str) and _MUTATING_TOOL_RE.search(key[0]):
+                    done.add(key[:2])
+                    if _is_mutating_call(key[0], key[2]):
                         done.clear()
                         # Keep the mutating call itself out: re-emitting the
                         # exact edit is a loop, re-reading after it is not.
+                        done.add(key[:2])
     return done
 
 
@@ -2186,10 +2217,20 @@ _NO_TEST_RE = re.compile(
 )
 
 
-def _edit_indices(messages) -> list:
-    """Indices of assistant messages that edit a source file, in order."""
+def _edit_indices(messages, start_idx=None) -> list:
+    """Indices of assistant messages that edit a source file, in order.
+
+    ``start_idx`` scopes the scan to evidence after that message index (the
+    current request's user turn): an edit from an earlier request must not
+    mark a new change request as implemented. ``None`` keeps the old
+    whole-conversation behaviour (default -1 = everything after).
+    """
+    if start_idx is None:
+        start_idx = -1
     out = []
     for i, msg in enumerate(messages or []):
+        if i <= start_idx:
+            continue
         if not isinstance(msg, dict) or msg.get("role") != "assistant":
             continue
         for tc in msg.get("tool_calls") or []:
@@ -2208,12 +2249,16 @@ def _edit_indices(messages) -> list:
     return out
 
 
-def _test_run_indices(messages) -> list:
+def _test_run_indices(messages, start_idx=None) -> list:
     """Indices of answered test-runner calls, in order.
 
     A call without a paired tool result proves nothing ran, so unanswered
-    calls never count -- same rule as files_read_in_turn.
+    calls never count -- same rule as files_read_in_turn. ``start_idx``
+    scopes the scan to evidence after that message index (the current
+    request's user turn); ``None`` keeps the whole-conversation behaviour.
     """
+    if start_idx is None:
+        start_idx = -1
     answered = set()
     for msg in messages or []:
         if (isinstance(msg, dict) and msg.get("role") == "tool"
@@ -2221,6 +2266,8 @@ def _test_run_indices(messages) -> list:
             answered.add(msg["tool_call_id"])
     out = []
     for i, msg in enumerate(messages or []):
+        if i <= start_idx:
+            continue
         if not isinstance(msg, dict) or msg.get("role") != "assistant":
             continue
         for tc in msg.get("tool_calls") or []:
@@ -2248,7 +2295,9 @@ def implement_test_owed(messages):
     Fires only on the full shape: the user asked for a code change, a
     source file was edited, and no test command ran after the last edit
     (a stale pre-edit run does not count). Silent when the user opted out
-    ("do not run tests") or when the edit touched no source file.
+    ("do not run tests") or when the edit touched no source file. The
+    evidence scan starts at the latest user message: an edit/test from an
+    earlier request must not excuse the current one.
     """
     last_user = None
     for msg in messages or []:
@@ -2263,10 +2312,11 @@ def implement_test_owed(messages):
         return None
     if _NO_TEST_RE.search(folded):
         return None
-    edits = _edit_indices(messages)
+    last_user_idx = _last_user_index(messages)
+    edits = _edit_indices(messages, start_idx=last_user_idx)
     if not edits:
         return None
-    runs = _test_run_indices(messages)
+    runs = _test_run_indices(messages, start_idx=last_user_idx)
     if any(r > edits[-1] for r in runs):
         return None
     return ("change implemented but unit tests never ran: run the unit tests "
@@ -2538,7 +2588,7 @@ def pending_tool_request(messages) -> str:
     review_test_owed = (
         is_generic_source_review
         and turn_has_call
-        and not _test_run_indices(messages)
+        and not _test_run_indices(messages, start_idx=last_user_idx)
     )
     if turn_has_call and (reads >= required_reads or not source_review) \
             and not change_owed and not implement_test_owed(messages) \
@@ -3088,7 +3138,7 @@ def evidence_ledger(messages) -> str:
         bits.append("read: " + ", ".join(read[:12]))
     if listed:
         bits.append("listed but NOT read yet: " + ", ".join(listed[:12]))
-    bits.append("unit tests: " + ("ran" if _test_run_indices(messages)
+    bits.append("unit tests: " + ("ran" if _test_run_indices(messages, start_idx=start)
                                   else "not run yet"))
     return ("[Evidence so far -- " + "; ".join(bits) +
             ". Make claims only about files you have read.]")

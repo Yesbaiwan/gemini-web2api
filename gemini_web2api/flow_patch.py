@@ -3962,6 +3962,9 @@ _FF5_READFAIL_RE = re.compile(
     r"(?i)^\s*(?:error|cannot\s+(?:read|open|find)|no\s+such\s+file|file\s+not\s+found|"
     r"enoent|the\s+system\s+cannot|failed\s+to\s+read|does\s+not\s+exist|permission\s+denied)")
 _FF5_TRUNC_RE = re.compile(r"(?i)(?:truncated|output\s+(?:was\s+)?cut|more\s+lines|\.\.\.\s*\[?\d+\s+(?:more|lines))")
+_FF5_EXEC_FAIL_RE = re.compile(
+    r"(?im)^(?:fatal:|error:|exception:|traceback \(most recent call last\)|"
+    r"command not found|no such file)")
 
 
 def _ff5_cmd_readonly(cmd):
@@ -3994,9 +3997,20 @@ def _ff5_status(e):
         if not res.strip():
             return "unknown"
         return "success" if _act_ok(e) else "failed"
-    if re.search(r"Exited with code [1-9]", res):
-        return "failed"
-    return "success" if res.strip() else "unknown"
+    if k == "exec":
+        if not res.strip():
+            return "unknown"
+        outcome = test_outcome(res)
+        if outcome in ("fail", "broken"):
+            return "failed"
+        if outcome == "pass":
+            return "success"
+        if re.search(r"Exited with code [1-9]\b", res, re.I):
+            return "failed"
+        if _FF5_EXEC_FAIL_RE.search(res):
+            return "failed"
+        return "success"
+    return "unknown"
 
 
 def _ff5_status_detail(e):
