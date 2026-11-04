@@ -3789,13 +3789,20 @@ def _ff5_allowed_steps(pattern, fix=False):
     return [s for s in steps if s not in ("edit", "diff", "verify")]
 
 
+def _ff5_pat(value):
+    """Normalise a pattern label; every SPEC consumer compares the same form."""
+    return str(value or "").strip().upper()
+
+
 def _ff5_spec_edit(pattern, fix=False):
-    spec = _FF5_SPEC.get(pattern or "", {})
-    return bool(spec.get("edit", True) or (pattern == "DEBUG" and fix))
+    # Fail closed: an unknown/empty pattern grants NO edit rights.
+    spec = _FF5_SPEC.get(_ff5_pat(pattern), {})
+    return bool(spec.get("edit", False) or (_ff5_pat(pattern) == "DEBUG" and fix))
 
 
 def _ff5_spec_run(pattern):
-    return _FF5_SPEC.get(pattern or "", {}).get("run", "any")
+    # Fail closed: an unknown/empty pattern is read-only, never "any".
+    return _FF5_SPEC.get(_ff5_pat(pattern), {}).get("run", "readonly")
 
 # --------------------------------------------------------------------------
 # Proposal 1: intent is separate from permission. The verb "fix" never grants
@@ -3877,16 +3884,19 @@ def _ff5_permissions(messages, pattern=None, fix=False):
 
 
 def _ff5_scope(ctx, messages):
-    """Files this request may write, or None when there is no named/read scope.
+    """Files this request may write. ``None`` = undecided, do not tighten;
+    ``[]`` = an empty but known scope, i.e. NO write is allowed (fail closed).
 
     Policy: a request that names files is limited to them. A request that names
     none (a plain "fix the bug") is limited to files actually read this turn.
-    CREATE additionally allows its target file, and the proxy's own temporary
-    merge helper is always allowed. REVERT/TOOL_DEMAND are unrestricted because
-    their writes are derived from the conversation itself.
+    CREATE with neither a named file nor a resolved target gets ``[]`` -- an
+    unnamed "create a script" must ask for a filename, never write freely.
+    The proxy's own temporary merge helper is always allowed. REVERT/
+    TOOL_DEMAND are unrestricted because their writes are derived from the
+    conversation itself.
     """
-    pattern = getattr(ctx, "pattern", None)
-    if pattern in (None, "REVERT", "TOOL_DEMAND"):
+    pattern = _ff5_pat(getattr(ctx, "pattern", None))
+    if pattern in ("", "REVERT", "TOOL_DEMAND"):
         return None
     named = [f for f in (_named_files(ctx) if ctx is not None else []) if f]
     if pattern == "CREATE":
@@ -3894,7 +3904,7 @@ def _ff5_scope(ctx, messages):
         target = getattr(ctx, "target", "") or ""
         if target:
             allowed.append(target)
-        return allowed or None
+        return allowed          # [] = no write target yet: fail closed
     if pattern in ("CHANGE", "DEBUG"):
         if named:
             return named
@@ -3905,19 +3915,22 @@ def _ff5_scope(ctx, messages):
 
 
 def _ff5_in_scope(path, scope):
-    if not scope:
-        return False
+    # The merge helper is proxy-managed: allowed before the empty-scope check.
     if _base(path) == _MERGE_SCRIPT:
         return True
+    if not scope:
+        return False
     return any(T._path_seen(path, [x]) for x in scope)
 
 
 def _ff5_scope_problems(calls, messages, perm):
     scope = getattr(perm, "scope", None) if perm is not None else None
-    if not scope:
+    # None = the scope could not be determined: do not tighten. An explicit
+    # [] IS a restriction: every act call is out of scope (merge helper aside).
+    if scope is None:
         return []
     problems = []
-    shown = ", ".join(scope[:6])
+    shown = ", ".join(scope[:6]) or "(no write target)"
     for tc in calls or []:
         fn = (tc or {}).get("function") or {}
         if tool_kind(fn.get("name")) != "act":
