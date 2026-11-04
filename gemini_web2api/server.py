@@ -993,6 +993,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         repeat_nudge = ""
         repeats = 0
         saw_call = False
+        dup_fallback = False
         best_text, best_idx = "", -1
         # Canned-error placeholders seen this turn: a deterministic refusal
         # (expired ticket / extension-routed prompt) is retried at most twice;
@@ -1140,6 +1141,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                         "left): a loop is worse than one prose turn, "
                         "returning the plain-text answer instead")
                     tool_calls = None
+                    dup_fallback = True
                     break
                 missing = missing_required_params(tool_calls, tool_required)
                 if missing:
@@ -1295,14 +1297,19 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 log(f"Tool retry: final answer is empty; returning best text "
                     f"from attempt {best_idx + 1}")
                 return best_text, None
-        if required_tool and not tool_calls and not saw_call:
+        if required_tool and not tool_calls:
             # `tool_choice: required` is a contract: prose with no call ever
             # emitted is not a result. Raise so the endpoint reports 503
-            # instead of a 200 that silently ends an agent turn. (A duplicate
-            # loop that fell back to prose keeps its fallback: a loop is
-            # worse than one prose turn.)
-            raise GeminiError("model did not emit the required tool call; "
-                              "please retry")
+            # instead of a 200 that silently ends an agent turn. A duplicate
+            # loop that fell back to prose breaks the contract too -- it
+            # raises as well while `required_tool_fail_on_duplicate` is on
+            # (the default); set that config to False to keep the old soft
+            # behaviour ("a loop is worse than one prose turn").
+            if dup_fallback and not CONFIG.get("required_tool_fail_on_duplicate", True):
+                pass
+            elif not saw_call or dup_fallback:
+                raise GeminiError("model did not emit a usable required tool "
+                                  "call; please retry")
         return text, tool_calls
 
     # ─── /v1/chat/completions ─────────────────────────────────────────────────

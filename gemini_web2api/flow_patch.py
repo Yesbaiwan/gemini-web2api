@@ -4677,6 +4677,30 @@ def _ff5_last_user_text(messages):
     return T._stringify_content(messages[idx].get("content", ""))
 
 
+def _ff5_user_explicit_command(messages):
+    """The command the newest user message asked to run, verbatim, else "".
+
+    Only a RUN_COMMAND / RUN_TESTS classification whose extracted command is
+    literally present in the user's own text counts as explicit permission.
+    A substring match alone is not: "Đừng chạy `git reset --hard`, chỉ giải
+    thích thôi" mentions the destructive command precisely so it must NOT run
+    -- the old substring check treated any mention as consent (fail-open).
+    """
+    try:
+        ctx = _analyze(messages)
+    except Exception:
+        return ""
+    if getattr(ctx, "pattern", None) not in ("RUN_COMMAND", "RUN_TESTS"):
+        return ""
+    cmd = str(getattr(ctx, "cmd", "") or "").strip()
+    if not cmd:
+        return ""
+    low_user = re.sub(r"\s+", " ", _ff5_last_user_text(messages)).lower()
+    if cmd.lower() in low_user:
+        return cmd
+    return ""
+
+
 def _ff5_noedit_text(text):
     if not isinstance(text, str) or not text:
         return False
@@ -5608,7 +5632,7 @@ def _ff5_postfilter(result, messages, perm=None, last=True, tm=None, ctx=None):
                            retry=True)
         m = _FF5_DESTRUCTIVE_RE.search(cmd)
         if (m and _c5("flow5_block_destructive")
-                and m.group(0).strip().lower() not in low_user):
+                and cmd.strip() != _ff5_user_explicit_command(messages)):
             log("[fix5] blocked a destructive command: " + cmd[:200])
             return blocked("Mình đã chặn lệnh `%s`: nó xoá/ghi đè MỌI thay đổi chưa commit trong repo, không "
                            "chỉ thay đổi của session này. Hãy tự chạy nếu bạn thật sự muốn." % cmd[:200],
