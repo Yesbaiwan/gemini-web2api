@@ -2696,18 +2696,17 @@ def _google_tool_choice_instruction(req: dict) -> str:
 def _google_pseudo_messages(req: dict) -> list:
     """Google contents as OpenAI-style messages for evidence helpers.
 
-    Pairing is positional: the n-th functionCall gets id ``g{n}`` and the
-    n-th functionResponse answers it. Good enough for read-counting and
-    pattern detection -- never used for routing.
+    # fix7: tool results stay in order (right after the content that carries
+    # them). Pairing: a functionResponse answers the oldest unanswered call of
+    # the same name, else the oldest unanswered call.
     """
     messages = []
-    call_idx = resp_idx = 0
-    ids = []
-    pending_responses = []
+    call_idx = 0
+    orphan = 0
+    pending = []  # [(id, name)] unanswered, oldest first
     for content in req.get("contents", []):
         role = content.get("role", "user")
-        texts = []
-        calls = []
+        texts, calls, results = [], [], []
         for p in content.get("parts", []):
             if p.get("text"):
                 texts.append(p["text"])
@@ -2715,13 +2714,13 @@ def _google_pseudo_messages(req: dict) -> list:
                 fc = p["functionCall"]
                 cid = f"g{call_idx}"
                 call_idx += 1
-                ids.append(cid)
+                pending.append((cid, fc.get("name", "")))
                 calls.append({"id": cid, "type": "function", "function": {
                     "name": fc.get("name", ""),
                     "arguments": json.dumps(fc.get("args", {}),
                                             ensure_ascii=False)}})
             elif p.get("functionResponse"):
-                pending_responses.append(p["functionResponse"])
+                results.append(p["functionResponse"])
         text = "\n".join(t for t in texts if t)
         if role == "model":
             msg = {"role": "assistant", "content": text}
@@ -2734,13 +2733,18 @@ def _google_pseudo_messages(req: dict) -> list:
             if calls:
                 messages.append({"role": "assistant", "content": "",
                                  "tool_calls": calls})
-    for fr in pending_responses:
-        cid = ids[resp_idx] if resp_idx < len(ids) else f"g{resp_idx}"
-        resp_idx += 1
-        messages.append({"role": "tool", "tool_call_id": cid,
-                         "name": fr.get("name", ""),
-                         "content": json.dumps(fr.get("response", {}),
-                                               ensure_ascii=False)})
+        for fr in results:
+            idx = next((i for i, (_c, n) in enumerate(pending)
+                        if n == fr.get("name")), 0 if pending else None)
+            if idx is None:
+                cid = f"g_orphan{orphan}"
+                orphan += 1
+            else:
+                cid = pending.pop(idx)[0]
+            messages.append({"role": "tool", "tool_call_id": cid,
+                             "name": fr.get("name", ""),
+                             "content": json.dumps(fr.get("response", {}),
+                                                   ensure_ascii=False)})
     return messages
 
 

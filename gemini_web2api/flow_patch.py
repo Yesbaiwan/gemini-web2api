@@ -2702,8 +2702,13 @@ def _listing_files(ev):
             for f in sorted(T._files_in(body), key=body.find):
                 add(f)
     low = [f.lower() for f in out]
+    # fix7: only drop a TRUNCATED twin (drive-less copy of a D:/... path); a
+    # genuine relative file such as server.py next to pkg/server.py must stay.
+    drive = re.compile(r"^[a-z]:/")
     return [f for f, l in zip(out, low)
-            if not any(o != l and o.endswith("/" + l) for o in low)]
+            if not (not drive.match(l) and "/" in l
+                    and any(drive.match(o) and o.endswith("/" + l)
+                            for o in low))]
 
 
 # --------------------------------------------------------------------------
