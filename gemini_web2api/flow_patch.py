@@ -4503,7 +4503,7 @@ def _map_reduce(messages, step, ctx, gen, client_gone=None):
     try:
         findings = _ff5_cross_module(messages)
         if findings:
-            report += ("\n\n**Cross-module checks (static):**\n"
+            report += ("\n\n**Cross-module checks (static, top-level only):**\n"
                        + "\n".join("- " + f for f in findings[:20]))
         report += "\n\n_" + _FF5_CROSS_NOTE + "_"
     except Exception as e:
@@ -4573,31 +4573,18 @@ def _ff5_install_banner():
 
 def _ff5_spec_banner(messages):
     try:
-        last = ""
-        for msg in messages or []:
-            if isinstance(msg, dict) and msg.get("role") == "user":
-                last = T._stringify_content(msg.get("content", ""))
-        if not last:
+        # Banner, planner and validator share ONE source of truth: the full
+        # analysis (sticky context, permissions, create/merge, debug-fix),
+        # not a bare detect_task_pattern + ad-hoc _Ctx fallback.
+        ctx = _analyze(messages)
+        if ctx is None or not getattr(ctx, "pattern", None):
             return _ff5_prev_banner(messages)
-        from . import server as _srv
-        pattern = T.detect_task_pattern(messages)
-        fix = False
-        if not pattern:
-            tmp = _Ctx()
-            tmp.last, tmp.request = last, last
-            tmp.scannable = T._strip_code_spans(last)
-            tmp.folded = re.sub(r"\s+", " ",
-                                T._fold_diacritics(tmp.scannable)).strip()
-            tmp.pattern = None
-            try:
-                det = _ff5_detect(tmp)
-            except Exception:
-                det = None
-            if det:
-                pattern, fix = det, bool(getattr(tmp, "fix", False))
+        pattern = _ff5_pat(ctx.pattern)
+        fix = bool(getattr(ctx, "fix", False))
+        perm = getattr(ctx, "perm", None) or \
+            _ff5_permissions(messages, pattern, fix)
         if pattern not in _FF5_SPEC:
             return _ff5_prev_banner(messages)
-        perm = _ff5_permissions(messages, pattern, fix)
         # Same downgrade the planner performs: a CHANGE/CREATE request without
         # write permission is guidance only, so the banner must not announce an
         # edit stage the validator will reject.
