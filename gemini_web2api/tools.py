@@ -2377,7 +2377,7 @@ def detect_task_pattern(messages):
     return None
 
 
-def task_pattern_banner(messages) -> str:
+def _task_pattern_banner_legacy(messages) -> str:
     """Mandatory-flow banner for the detected task pattern, else ``""``."""
     pattern = detect_task_pattern(messages)
     if pattern == _TASK_PATTERN_GENERIC_REVIEW:
@@ -2426,6 +2426,25 @@ def task_pattern_banner(messages) -> str:
             "no prose, before or after.]"
         )
     return ""
+
+
+# One definition of the flow feeds the banner, the planner and the validator.
+# ``flow_patch`` installs this hook; when it is absent the legacy banner above
+# remains the single implementation, so importing tools alone is unchanged.
+_TASK_BANNER_HOOK = None
+
+
+def task_pattern_banner(messages) -> str:
+    """Banner for the detected task pattern, or ``""`` when no flow applies."""
+    hook = globals().get("_TASK_BANNER_HOOK")
+    if hook is not None:
+        try:
+            text = hook(messages)
+            if text is not None:
+                return text
+        except Exception:
+            pass
+    return _task_pattern_banner_legacy(messages)
 
 
 def pending_tool_request(messages) -> str:

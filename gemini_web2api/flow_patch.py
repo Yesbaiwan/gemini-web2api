@@ -132,6 +132,8 @@ _PATH_KEYS = ["filePath", "file_path", "path", "file", "filename", "file_name",
               "target_file", "target"]
 _PATTERN_KEYS = ["pattern", "query", "glob", "regex", "search"]
 _CMD_KEYS = ["command", "cmd", "script"]
+_OFFSET_KEYS = ["offset", "start_line", "startLine", "line_offset", "start"]
+_LIMIT_KEYS = ["limit", "count", "max_lines", "maxLines", "num_lines", "end_line"]
 
 
 def _pick(props, keys):
@@ -161,6 +163,126 @@ class ToolMap:
         for k in sorted(kinds):
             out.extend(self.by_kind.get(k, []))
         return out
+
+    # ------------------------------------------------------------------
+    # Adapter (proposal 3): the client decides the schema; the proxy decides
+    # the call. Model output is normalised to the client's real parameter
+    # names, unknown keys are dropped and required parameters are checked
+    # BEFORE the call reaches the client.
+    # ------------------------------------------------------------------
+
+    def adapt(self, call):
+        """``(call, problems)`` -- normalise one tool_call to this client's schema."""
+        if not isinstance(call, dict):
+            return call, ["tool call is not an object"]
+        fn = call.get("function") or {}
+        name = fn.get("name") or ""
+        args = T._tool_arguments_dict(fn)
+        if not isinstance(args, dict):
+            return call, [f"{name or '?'}: arguments are not a JSON object"]
+        props = self.schemas.get(name)
+        props = set(props) if props else set()
+        required = set(self.required.get(name, ()) or ())
+        out = {}
+        problems = []
+
+        def pick_value(keys):
+            for k in keys:
+                v = args.get(k)
+                if isinstance(v, str) and v.strip():
+                    return v
+                if isinstance(v, int) and not isinstance(v, bool):
+                    return v
+            return None
+
+        def put(keys, value, fallback):
+            if value is None:
+                return
+            target = _pick(props, keys)
+            if target is None and not props:
+                # No schema: keep the key the model actually used rather than
+                # renaming it to a canonical name the client may not accept.
+                target = next((k for k in keys if k in args), fallback)
+            if target:
+                out[target] = value
+
+        kind = tool_kind(name)
+        path = pick_value(_PATH_KEYS)
+        command = pick_value(_CMD_KEYS)
+        pattern = pick_value(_PATTERN_KEYS)
+        old = pick_value(_OLD_KEYS)
+        new = pick_value(_NEW_KEYS)
+        content = pick_value(_CONTENT_KEYS)
+        offset = pick_value(_OFFSET_KEYS)
+        limit = pick_value(_LIMIT_KEYS)
+        description = pick_value(["description"])
+
+        if kind == "read":
+            put(_PATH_KEYS, path, "filePath")
+            put(_OFFSET_KEYS, offset, "offset")
+            put(_LIMIT_KEYS, limit, "limit")
+            if not path:
+                problems.append(f"{name}: missing required parameter for the file path")
+        elif kind in ("survey", "search"):
+            put(_PATTERN_KEYS, pattern, "pattern")
+            put(_PATH_KEYS, path, "path")
+            if not pattern and not path:
+                problems.append(f"{name}: missing required parameter pattern/path")
+        elif kind == "exec":
+            put(_CMD_KEYS, command, "command")
+            put(["description"], description, "description")
+            if not command:
+                problems.append(f"{name}: missing required parameter for the command")
+        elif kind == "act":
+            put(_PATH_KEYS, path, "filePath")
+            edit_like = bool(set(_tokens(name)) & {
+                "edit", "write", "patch", "replace", "insert", "append",
+                "apply", "save", "editor"})
+            # An edit uses old/new; a write uses content. Keep whichever the
+            # client schema declares, and never mix both shapes silently. A
+            # move/rename/delete/mkdir call is not an edit of file contents.
+            if edit_like and old is not None:
+                put(_OLD_KEYS, old, "oldString")
+                put(_NEW_KEYS, new, "newString")
+            elif edit_like:
+                put(_CONTENT_KEYS, content, "content")
+            if edit_like:
+                if not path:
+                    problems.append(f"{name}: missing required parameter for the file path")
+                if old is None and content is None:
+                    problems.append(
+                        f"{name}: the edit has neither the text to replace "
+                        "(oldString) nor the new file content (content)")
+
+        # Preserve declared parameters the model already used correctly
+        # (timeout, workdir, ...). Unknown keys are dropped when the schema is
+        # known: the client would reject them anyway.
+        for k, v in args.items():
+            if props and k not in props:
+                continue
+            if k in out:
+                continue
+            if any(k in group for group in
+                   (_PATH_KEYS, _CMD_KEYS, _PATTERN_KEYS, _OLD_KEYS,
+                    _NEW_KEYS, _CONTENT_KEYS, _OFFSET_KEYS, _LIMIT_KEYS)):
+                continue
+            out[k] = v
+
+        for req in sorted(required):
+            if req in out:
+                continue
+            if str(req).lower() == "description":
+                out[req] = description or "Run"
+                continue
+            problems.append(f"{name}: missing required parameter '{req}'")
+
+        if not out and kind != "other":
+            problems.append(f"{name}: no usable arguments after adapting")
+
+        new_args = json.dumps(out, ensure_ascii=False)
+        if new_args == (fn.get("arguments") or "") and not problems:
+            return call, problems
+        return {**call, "function": {**fn, "arguments": new_args}}, problems
 
     def make_call(self, kind, path=None, pattern=None, command=None,
                   description=None):
@@ -1169,6 +1291,10 @@ def install():
             return call(prompt)
         if step is None:
             return call(prompt)
+        if getattr(step, "local_text", None) is not None:
+            # A deterministic refusal/stop from a transition guard: return it
+            # verbatim instead of asking the model again.
+            return step.local_text, None
         log(f"[flow] pattern={step.pattern} step {step.index}/{step.total} "
             f"{step.name} mode={'drive' if step.drive and _cfg('flow_drive') else 'guide'}")
 
@@ -3332,8 +3458,9 @@ _FF4_MAX_CONT = 8
 
 
 def _ff4_off(args):
+    key = _pick(args or {}, _OFFSET_KEYS)
     try:
-        return int(args.get("offset"))
+        return int((args or {}).get(key)) if key else 0
     except (TypeError, ValueError):
         return 0
 
@@ -3341,7 +3468,7 @@ def _ff4_off(args):
 def _ff4_offset_key(tm):
     name = tm.first("read")
     props = (tm.schemas.get(name) if name else None) or set()
-    return _pick(props, ["offset"])
+    return _pick(props, _OFFSET_KEYS)
 
 
 def _ff4_truncations(ev):
@@ -3552,9 +3679,15 @@ def install():
 # ==== flowfix5:begin (generated by flow_fix5_patch.py -- re-run to refresh, --revert to remove) ====
 import hashlib as _ff5_hashlib
 import threading as _ff5_threading
+import time as _ff5_time
+import ast as _ff5_ast
 
 _ff5_prev_analyze = _analyze
 _ff5_prev_install = install
+_ff5_prev_plan_for = plan_for
+_ff5_prev_map_reduce = _map_reduce
+_ff5_prev_banner = getattr(T, "_task_pattern_banner_legacy",
+                           T.task_pattern_banner)
 
 _FF5_DEFAULTS = {
     "flow5_enabled": True,
@@ -3574,6 +3707,15 @@ _FF5_DEFAULTS = {
     "flow5_sticky": True,
     # PLAN pattern ("write a plan ...") is read-only.
     "flow5_plan": True,
+    # Completion of the handoff (fix6): one context block per guided step,
+    # scope-aware writes, a universal evidence gate and a real diff stage.
+    "flow6_context": True,
+    "flow6_metrics": True,
+    "flow6_diff_step": True,
+    "flow6_scope_guard": True,
+    "flow6_universal_guard": True,
+    "flow6_cross_module": True,
+    "flow6_banner": True,
 }
 
 
@@ -3581,53 +3723,74 @@ def _c5(key):
     return CONFIG.get(key, _FF5_DEFAULTS[key])
 
 
-# One table drives the classifier catalog, the prompt banner and the
-# permission checks, so they cannot disagree (proposal 6). `edit` = may write
-# files; `run` = "any" shell command, or "readonly" (listing, git status/diff/
-# log, test runners).
+# One table drives the classifier catalog, the prompt banner, the step engine
+# and the permission checks, so they cannot disagree (proposals 2 + 6).
+# `edit` = may write files; `run` = "any" shell command, "readonly" (listing,
+# git status/diff/log, test runners) or "none"; `steps` = canonical shared
+# pipeline from which the planner, banner and validator are generated.
 _FF5_SPEC = {
     "GENERIC_REVIEW": {"desc": "review / audit the whole project or its source code for bugs",
-                       "steps": "survey files -> run the unit tests -> read ALL core source files -> answer with verbatim quotes",
+                       "steps": ("discover", "analyze", "verify", "read", "answer"),
                        "edit": False, "run": "readonly"},
     "FILE_REVIEW": {"desc": "",  # not offered to the classifier: the repo's own detector owns it
-                    "steps": "read every named file -> answer only about what you read, with verbatim quotes",
+                    "steps": ("read", "analyze", "answer"),
                     "edit": False, "run": "readonly"},
     "CHANGE": {"desc": "modify, fix or implement something in EXISTING code",
-               "steps": "survey -> read the target -> edit -> read the diff -> run the unit tests -> answer",
+               "steps": ("discover", "read", "edit", "diff", "verify", "answer"),
                "edit": True, "run": "any"},
     "CREATE": {"desc": "create a new file, script or module (or merge several files into one)",
-               "steps": "survey -> read conventions -> write the file -> verify -> answer",
+               "steps": ("discover", "read", "edit", "verify", "answer"),
                "edit": True, "run": "any"},
     "EXPLAIN": {"desc": "explain how code works, where something lives, or how to do something (guidance only, no edits)",
-                "steps": "find the code -> read it -> explain",
+                "steps": ("discover", "read", "answer"),
                 "edit": False, "run": "readonly"},
     "DEBUG": {"desc": "investigate a failing test, an error message or a crash",
-              "steps": "reproduce or read the pasted log -> read what the failure points at -> conclude (edit only if the user asked for a fix)",
+              "steps": ("discover", "read", "reproduce", "analyze", "answer"),
               "edit": False, "run": "readonly"},
     "DIFF_REVIEW": {"desc": "review the current uncommitted git changes",
-                    "steps": "git status -> git diff -> read the changed files -> review the diff only",
+                    "steps": ("diff", "read", "analyze", "answer"),
                     "edit": False, "run": "readonly"},
     "PLAN": {"desc": "write an implementation plan for a feature or change (no edits)",
-             "steps": "survey -> read project docs/conventions -> read the relevant code -> write the plan",
+             "steps": ("discover", "read", "analyze", "answer"),
              "edit": False, "run": "readonly"},
     "REVERT": {"desc": "undo / revert the changes made earlier in this conversation",
-               "steps": "git status -> undo only the files this session changed -> verify",
+               "steps": ("diff", "edit", "verify", "answer"),
                "edit": True, "run": "any"},
     "RUN_TESTS": {"desc": "run the unit tests and report the result",
-                  "steps": "detect the test command -> run it -> report",
+                  "steps": ("verify", "answer"),
                   "edit": False, "run": "readonly"},
     "RUN_COMMAND": {"desc": "run one specific shell command that the user wrote",
-                    "steps": "run exactly that command -> report its output",
+                    "steps": ("verify", "answer"),
                     "edit": False, "run": "any"},
     "GIT_INFO": {"desc": "show git status / log / diff / branch information",
-                 "steps": "run the git command -> report",
+                 "steps": ("diff", "answer"),
                  "edit": False, "run": "readonly"},
-    "TOOL_DEMAND": {"desc": "", "steps": "call the tool the user asked for -> report",
+    "TOOL_DEMAND": {"desc": "", "steps": ("edit", "answer"),
                     "edit": True, "run": "any"},
 }
 _FF5_CATALOG = {k: v["desc"] for k, v in _FF5_SPEC.items() if v.get("desc")}
 # Patterns planned entirely by this block (deterministic, no upstream call).
 _FF5_OWN = ("REVERT", "RUN_TESTS", "RUN_COMMAND", "GIT_INFO")
+
+# `DEBUG` only gets the edit stage when the user actually asked for a fix.
+# The helper is used by the planner, banner and validator alike.
+def _ff5_allowed_steps(pattern, fix=False):
+    spec = _FF5_SPEC.get(pattern or "", {})
+    steps = list(spec.get("steps", ()))
+    if pattern == "DEBUG" and fix and "edit" not in steps:
+        steps = steps[:-1] + ["edit", "diff", "verify", "answer"]
+    if pattern != "DEBUG" or fix:
+        return steps
+    return [s for s in steps if s not in ("edit", "diff", "verify")]
+
+
+def _ff5_spec_edit(pattern, fix=False):
+    spec = _FF5_SPEC.get(pattern or "", {})
+    return bool(spec.get("edit", True) or (pattern == "DEBUG" and fix))
+
+
+def _ff5_spec_run(pattern):
+    return _FF5_SPEC.get(pattern or "", {}).get("run", "any")
 
 # --------------------------------------------------------------------------
 # Proposal 1: intent is separate from permission. The verb "fix" never grants
@@ -3653,9 +3816,11 @@ def _ff5_fold(text):
 
 
 class _Ff5Perm:
-    def __init__(self, edit, run, reason, restricted):
+    def __init__(self, edit, run, reason, restricted, scope=None):
         self.edit, self.run = edit, run
         self.reason, self.restricted = reason, restricted
+        # None = no restriction; otherwise the paths this request may write.
+        self.scope = scope
 
     def __repr__(self):
         return "Perm(edit=%s, run=%s, %s)" % (self.edit, self.run, self.reason)
@@ -3666,7 +3831,9 @@ def _ff5_permissions(messages, pattern=None, fix=False):
 
     Sticky: a "do not edit / do not run" from ANY earlier user turn stays in
     force until a later turn grants it back. Guidance questions ("how can I
-    fix ...?") withhold write access for that turn only.
+    fix ...?") withhold write access for that turn only. ``run`` is three
+    levels: any / readonly / none -- "do not run commands" now really means
+    no command at all, not merely read-only commands.
     """
     texts = [T._stringify_content(m.get("content", "")) for m in messages or []
              if isinstance(m, dict) and m.get("role") == "user"]
@@ -3690,13 +3857,72 @@ def _ff5_permissions(messages, pattern=None, fix=False):
         guidance = bool(_FF5_HOWTO_RE.search(f)) and not _FF5_GRANT_RE.search(f)
         if guidance:
             why.append("guidance question")
-    spec = _FF5_SPEC.get(pattern or "", {})
-    spec_edit = bool(spec.get("edit", True) or (pattern == "DEBUG" and fix))
-    spec_run = spec.get("run", "any")
+    spec_edit = _ff5_spec_edit(pattern, fix)
+    spec_run = _ff5_spec_run(pattern)
     can_edit = bool(spec_edit and edit_ok and not guidance)
-    run = "any" if (spec_run == "any" and run_ok and not (guidance and pattern == "EXPLAIN")) else "readonly"
+    if not run_ok:
+        run = "none"
+    elif spec_run == "any" and not (guidance and pattern == "EXPLAIN"):
+        run = "any"
+    else:
+        run = "readonly"
     restricted = (can_edit != spec_edit) or (run != spec_run)
-    return _Ff5Perm(can_edit, run, "; ".join(why) or "default", restricted)
+    return _Ff5Perm(can_edit, run, "; ".join(why) or "default", restricted,
+                    scope=None)
+
+
+def _ff5_scope(ctx, messages):
+    """Files this request may write, or None when there is no named/read scope.
+
+    Policy: a request that names files is limited to them. A request that names
+    none (a plain "fix the bug") is limited to files actually read this turn.
+    CREATE additionally allows its target file, and the proxy's own temporary
+    merge helper is always allowed. REVERT/TOOL_DEMAND are unrestricted because
+    their writes are derived from the conversation itself.
+    """
+    pattern = getattr(ctx, "pattern", None)
+    if pattern in (None, "REVERT", "TOOL_DEMAND"):
+        return None
+    named = [f for f in (_named_files(ctx) if ctx is not None else []) if f]
+    if pattern == "CREATE":
+        allowed = list(named)
+        target = getattr(ctx, "target", "") or ""
+        if target:
+            allowed.append(target)
+        return allowed or None
+    if pattern in ("CHANGE", "DEBUG"):
+        if named:
+            return named
+        reads = [_call_path(e["args"]) for e in _answered_calls(messages)
+                 if e["kind"] == "read" and _read_ok(e) and _call_path(e["args"])]
+        return reads or None
+    return []          # this pattern must not write at all
+
+
+def _ff5_in_scope(path, scope):
+    if not scope:
+        return False
+    if _base(path) == _MERGE_SCRIPT:
+        return True
+    return any(T._path_seen(path, [x]) for x in scope)
+
+
+def _ff5_scope_problems(calls, messages, perm):
+    scope = getattr(perm, "scope", None) if perm is not None else None
+    if not scope:
+        return []
+    problems = []
+    shown = ", ".join(scope[:6])
+    for tc in calls or []:
+        fn = (tc or {}).get("function") or {}
+        if tool_kind(fn.get("name")) != "act":
+            continue
+        path = _call_path(T._tool_arguments_dict(fn))
+        if path and not _ff5_in_scope(path, scope):
+            problems.append(
+                f"{path}: outside this request's write scope ({shown}). "
+                "Only edit the files the user named or the files read in this turn.")
+    return problems
 
 
 def _ff5_edit_forbidden(messages):
@@ -3731,7 +3957,12 @@ def _ff5_cmd_readonly(cmd):
 
 
 def _ff5_status(e):
-    """success | partial | failed | unknown -- only success/partial unlock the next step."""
+    """success | partial | failed | unknown -- only success/partial unlock the next step.
+
+    ``unknown`` is evidence that exists but proves nothing (an empty read).
+    Such a read is retried once by :func:`_ff5_evidence_gate`, then the proxy
+    stops instead of letting the model guess.
+    """
     res = (e.get("result") or "")
     k = e.get("kind")
     if k == "read":
@@ -3742,10 +3973,625 @@ def _ff5_status(e):
         trunc = globals().get("_FF4_TRUNC_RE") or _FF5_TRUNC_RE
         return "partial" if trunc.search(res[-400:]) else "success"
     if k == "act":
+        if not res.strip():
+            return "unknown"
         return "success" if _act_ok(e) else "failed"
     if re.search(r"Exited with code [1-9]", res):
         return "failed"
     return "success" if res.strip() else "unknown"
+
+
+def _ff5_status_detail(e):
+    """A short, specific reason for a failed/unknown call (used in nudges)."""
+    res = " ".join((e.get("result") or "").split())
+    path = _call_path(e.get("args") or {}) or "?"
+    low = res.lower()
+    if e.get("kind") == "read":
+        if not res.strip():
+            return f"{path}: the read tool returned no content"
+        return f"{path}: read failed -- {res[:180]}"
+    if e.get("kind") == "act":
+        if not res.strip():
+            return f"{path}: the edit tool returned no result, so the write is unverified"
+        if "oldstring" in low or "old_string" in low or "old text" in low:
+            return (f"{path}: oldString does not match the file you read -- copy the "
+                    f"exact text, without line-number prefixes ({res[:160]})")
+        if re.search(r"not found|no such file|does not exist", low):
+            return f"{path}: wrong path or missing file -- {res[:160]}"
+        if re.search(r"missing|required|parameter|argument", low):
+            return f"{path}: a required parameter is missing -- {res[:160]}"
+        return f"{path}: edit failed -- {res[:180]}"
+    return f"{path}: command failed -- {res[:180]}"
+
+
+# --------------------------------------------------------------------------
+# Proposal 3: ToolMap adapter -- proxy-side parameter normalisation
+# --------------------------------------------------------------------------
+
+def _ff5_adapt_calls(calls, tm):
+    """Normalise every call to the client's schema; return (calls, problems)."""
+    out, problems = [], []
+    for tc in calls or []:
+        try:
+            fixed, probs = tm.adapt(tc)
+        except Exception as e:
+            fixed, probs = tc, [f"could not adapt the tool call: {e}"]
+        out.append(fixed)
+        problems.extend(probs)
+    return out, problems
+
+
+# --------------------------------------------------------------------------
+# Proposal 5: universal evidence gate. A step only advances on success or a
+# completed continuation; failed/unknown reads never unlock an edit, and a
+# truncated read is continued by the proxy before anything else happens.
+# --------------------------------------------------------------------------
+
+def _ff5_read_events(messages):
+    return [e for e in _answered_calls(messages) if e["kind"] == "read"]
+
+
+def _ff5_same_path(a, b):
+    return bool(a and b and T._path_seen(a, [b]))
+
+
+def _ff5_retry_call(e):
+    fn = e.get("name") or "read"
+    args = dict(e.get("args") or {})
+    return {"id": "call_" + uuid.uuid4().hex[:8], "type": "function",
+            "function": {"name": fn,
+                         "arguments": json.dumps(args, ensure_ascii=False)}}
+
+
+def _ff5_local_step(ctx, text):
+    """A planner step that must be returned verbatim, without another model call."""
+    st = Step(getattr(ctx, "pattern", None) or "ANSWER", "answer", 1, 1, (), text)
+    st.local_text = text
+    st.skipped = []
+    return st
+
+
+def _ff5_evidence_gate(ctx, messages, tm):
+    """``(step, stop_text)``. A read/continuation step wins; ``stop_text`` is a
+    deterministic refusal that must not fall through to an edit or an answer."""
+    if ctx is None or not getattr(ctx, "pattern", None):
+        return None, None
+    ev = _answered_calls(messages)
+    reads = [e for e in ev if e["kind"] == "read"]
+    if not reads:
+        return None, None
+    pattern = ctx.pattern
+    perm = getattr(ctx, "perm", None)
+    edit_expected = bool(getattr(perm, "edit", False)
+                         and _ff5_spec_edit(pattern, getattr(ctx, "fix", False)))
+
+    # 1. truncated output: continue at the offset the tool asked for, before
+    #    editing or answering. For a pattern that may edit this is mandatory.
+    okey = _ff4_offset_key(tm) if "_ff4_offset_key" in globals() else None
+    conts = _ff4_continuations(ev, okey) if okey else []
+    if conts:
+        names = ", ".join(sorted({p for p, _c in conts}))
+        return Step(pattern, "read", 1, 1, {"read"},
+                    "A previous read was cut off (output truncated). Read the "
+                    "rest before doing anything else: " + names + ".",
+                    [c for _p, c in conts], True, tm.names({"read"})), None
+
+    # 2. "partial" without an offset parameter: the proxy cannot continue it.
+    #    Never let that partial text justify a write.
+    partial = [e for e in reads if _ff5_status(e) == "partial"]
+    if partial and edit_expected:
+        detail = "; ".join(_ff5_status_detail(e) for e in partial[:3])
+        if _ff5_vi(ctx):
+            return None, ("Một lần đọc đã bị cắt và công cụ đọc không hỗ trợ "
+                          "offset nên mình KHÔNG sửa gì (" + detail + "). Hãy "
+                          "đọc lại file với giới hạn lớn hơn rồi yêu cầu lại.")
+        return None, ("A read was truncated and the read tool exposes no offset "
+                      "parameter, so I made NO edit (" + detail + "). Re-read the "
+                      "file with a larger limit and ask again.")
+
+    # 3. unknown (empty) read: retry once, then stop rather than guess.
+    pending_unknown, exhausted = [], []
+    for i, e in enumerate(reads):
+        if _ff5_status(e) != "unknown":
+            continue
+        path = _call_path(e["args"])
+        same = [x for x in reads if _ff5_same_path(path, _call_path(x["args"]))]
+        if any(_ff5_status(x) in ("success", "partial") for x in same):
+            continue
+        # A path has one retry. Two (or more) empty reads mean the retry also
+        # returned nothing: stop instead of looping forever.
+        if sum(1 for x in same if _ff5_status(x) == "unknown") >= 2:
+            if not any(_ff5_same_path(path, _call_path(x["args"]))
+                       for x in exhausted):
+                exhausted.append(e)
+        elif not any(_ff5_same_path(path, _call_path(x["args"]))
+                     for x in pending_unknown):
+            pending_unknown.append(e)
+    if pending_unknown:
+        detail = "; ".join(_ff5_status_detail(e) for e in pending_unknown[:3])
+        return Step(pattern, "read", 1, 1, {"read"},
+                    "The read tool returned no content. Read the file again "
+                    "before continuing (" + detail + ").",
+                    [_ff5_retry_call(e) for e in pending_unknown], True,
+                    tm.names({"read"})), None
+    if exhausted and not any(_ff5_status(e) in ("success", "partial") for e in reads):
+        detail = "; ".join(_ff5_status_detail(e) for e in exhausted[:3])
+        if _ff5_vi(ctx):
+            return None, ("Công cụ đọc trả về nội dung rỗng nhiều lần nên mình dừng "
+                          "thay vì đoán (" + detail + "). Hãy kiểm tra đường dẫn.")
+        return None, ("The read tool returned no content repeatedly, so I stopped "
+                      "instead of guessing (" + detail + "). Check the path.")
+
+    # 4. failed reads never unlock an edit; if nothing was read successfully,
+    #    they do not unlock an answer either.
+    failed = [e for e in reads if _ff5_status(e) == "failed"]
+    good = [e for e in reads if _ff5_status(e) in ("success", "partial")]
+    if edit_expected and failed:
+        guard = _ff5_read_guard(ctx, messages)
+        if guard:
+            return None, guard
+    if failed and not good and pattern not in ("CREATE", "TOOL_DEMAND"):
+        detail = "; ".join(_ff5_status_detail(e) for e in failed[:3])
+        if _ff5_vi(ctx):
+            return None, ("Không đọc được file cần thiết nên mình không thể trả lời "
+                          "dựa trên nội dung chưa thấy (" + detail + "). Hãy kiểm "
+                          "tra đường dẫn rồi yêu cầu lại.")
+        return None, ("I could not read the required file, so I will not answer "
+                      "from unseen content (" + detail + "). Check the path and "
+                      "ask again.")
+    return None, None
+
+
+# --------------------------------------------------------------------------
+# Proposal 2: shared stages. The rich discover/read builders above stay the
+# primitives; this table names the stage each step belongs to and inserts the
+# missing "read the diff" stage before verify/answer.
+# --------------------------------------------------------------------------
+
+_FF5_STAGE_NAME = {
+    "survey": "discover", "search": "discover", "read": "read",
+    "act": "edit", "merge": "edit", "diff": "diff", "git": "diff",
+    "tests": "verify", "verify": "verify", "answer": "answer",
+}
+
+
+def _ff5_stage(step):
+    return _FF5_STAGE_NAME.get(getattr(step, "name", ""), "analyze")
+
+
+def _ff5_diff_step(ctx, step, messages, tm):
+    if not _c5("flow6_diff_step") or step is None:
+        return None
+    pattern = getattr(ctx, "pattern", None)
+    if pattern not in ("CHANGE", "DEBUG") or (pattern == "DEBUG" and not ctx.fix):
+        return None
+    if step.name not in ("answer", "tests", "verify"):
+        return None
+    if not tm.first("exec"):
+        return None
+    ev = _answered_calls(messages)
+    acts = [e for e in ev if e["kind"] == "act" and _act_ok(e)
+            and _call_path(e["args"])]
+    if not acts:
+        return None
+    last = max(i for i, e in enumerate(ev) if e["kind"] == "act")
+    if any(e["kind"] == "exec"
+           and re.search(r"\bgit\b[^\n]*\bdiff\b", _call_command(e["args"]))
+           for e in ev[last + 1:]):
+        return None
+    paths = sorted({_call_path(e["args"]) for e in acts
+                    if _base(_call_path(e["args"])) != _MERGE_SCRIPT})
+    if not paths:
+        return None
+    quoted = " ".join('"%s"' % p.replace('"', "") for p in paths[:12])
+    call = tm.make_call("exec", command="git --no-pager diff -- " + quoted,
+                        description="Read the diff of the change")
+    if not call:
+        return None
+    return Step(pattern, "diff", getattr(step, "index", 1),
+                getattr(step, "total", 1), {"exec"},
+                "Read the diff now. Check that only the intended lines changed; "
+                "if the change is wrong, fix it with one edit call, otherwise "
+                "continue to verification.", [call], True, tm.names({"exec"}))
+
+
+def _ff5_context_suffix(ctx, step, perm, messages):
+    """The smallest context a weak model needs for this one step (proposal 4)."""
+    spec = _FF5_SPEC.get(getattr(ctx, "pattern", None) or "", {})
+    goal = " ".join((getattr(ctx, "last", "") or "").split())[:180]
+    ev = _answered_calls(messages)
+    good = sorted({_call_path(e["args"]) for e in ev
+                   if e["kind"] == "read" and _ff5_status(e) in ("success", "partial")
+                   and _call_path(e["args"])})
+    bad = sorted({_call_path(e["args"]) for e in ev
+                  if e["kind"] == "read" and _ff5_status(e) == "failed"
+                  and _call_path(e["args"])})
+    bits = ["goal=" + (goal or "(none)"),
+            "intent=" + (getattr(ctx, "pattern", None) or "?"),
+            "edit=" + ("allowed" if getattr(perm, "edit", False) else "forbidden"),
+            "commands=" + str(getattr(perm, "run", "readonly")),
+            "next=" + getattr(step, "stage", _ff5_stage(step))]
+    if good:
+        bits.append("read=" + ", ".join(good[:6]))
+    if bad:
+        bits.append("failed_reads=" + ", ".join(bad[:4]))
+    if _FF5_SPEC.get(ctx.pattern or "", {}).get("steps"):
+        bits.append("pipeline=" + " -> ".join(_ff5_allowed_steps(
+            ctx.pattern, getattr(ctx, "fix", False))))
+    text = "[Context] " + " | ".join(bits)
+    return text[:900]
+
+
+def _ff5_after_plan(step, messages, tm, ctx=None):
+    """Final transition guard shared by every pattern (proposal 5 + 2 + 6)."""
+    if ctx is None:
+        try:
+            ctx = _analyze(messages)
+        except Exception:
+            ctx = None
+    if not (ctx is not None and getattr(ctx, "pattern", None)):
+        return step
+    perm = getattr(ctx, "perm", None)
+    if perm is None:
+        try:
+            perm = _ff5_permissions(messages, ctx.pattern, getattr(ctx, "fix", False))
+            perm.scope = _ff5_scope(ctx, messages)
+        except Exception:
+            perm = None
+    if _c5("flow6_universal_guard"):
+        gate, stop = _ff5_evidence_gate(ctx, messages, tm)
+        if stop is not None:
+            log("[fix6] evidence gate stopped the transition: " + stop[:160])
+            return _ff5_local_step(ctx, stop)
+        if gate is not None:
+            step = gate
+    if step is not None and _c5("flow6_diff_step"):
+        diff = _ff5_diff_step(ctx, step, messages, tm)
+        if diff is not None:
+            step = diff
+    if step is not None:
+        step.stage = _ff5_stage(step)
+        # Validator generated from the same SPEC as the planner/banner.
+        if step.name in ("act", "merge") and perm is not None and not perm.edit:
+            msg = ("Bạn không cho phép sửa file nên mình không thực hiện chỉnh sửa nào."
+                   if _ff5_vi(ctx) else
+                   "Edits are not allowed here, so I made no edit.")
+            return _ff5_local_step(ctx, msg)
+        if step.name in ("tests", "verify", "diff", "git") and perm is not None \
+                and perm.run == "none":
+            msg = ("Bạn không cho phép chạy lệnh nên mình không chạy bước này."
+                   if _ff5_vi(ctx) else
+                   "Running commands is not allowed here, so this step was skipped.")
+            return _ff5_local_step(ctx, msg)
+        if _c5("flow6_context") and not getattr(step, "drive", False):
+            suffix = _ff5_context_suffix(ctx, step, perm, messages)
+            if suffix and suffix not in (step.instruction or ""):
+                step.instruction = (step.instruction or "") + "\n" + suffix
+    return step
+
+
+def _ff5_plan_after(step, messages, tm, ctx=None):
+    try:
+        return _ff5_after_plan(step, messages, tm, ctx)
+    except Exception as e:
+        log(f"[fix6] transition guard error: {e}")
+        return step
+
+
+def plan_for(messages, tm, ctx=None):
+    """Final planner: every pattern passes the universal transition guard."""
+    step = _ff5_prev_plan_for(messages, tm, ctx)
+    return _ff5_plan_after(step, messages, tm, ctx)
+
+
+# --------------------------------------------------------------------------
+# Proposal 4 / metrics: tiny counters so the real-model measurement (flash-lite)
+# has a place to land without changing behaviour when disabled.
+# --------------------------------------------------------------------------
+
+_FF5_METRICS = {}
+
+
+def _ff5_metric(key, n=1):
+    if not _c5("flow6_metrics"):
+        return
+    _FF5_METRICS[key] = _FF5_METRICS.get(key, 0) + n
+
+
+# --------------------------------------------------------------------------
+# Cross-module pass (supplement): check the files read this turn against each
+# other. This validates structure only (names, attributes, arity); the quote
+# verifier likewise confirms the *position* of a quote, never the conclusion
+# drawn from it.
+# --------------------------------------------------------------------------
+
+_FF5_CROSS_NOTE = (
+    "Static cross-module checks confirm names/arity only; they do not confirm "
+    "that a finding or conclusion is correct.")
+
+
+def _ff5_trunc_re():
+    return globals().get("_FF4_TRUNC_RE") or _FF5_TRUNC_RE
+
+
+def _ff5_py_defs(tree):
+    """Top-level definitions of one module: name -> facts used by the pass."""
+    out = {}
+    for node in getattr(tree, "body", ()):
+        if isinstance(node, (_ff5_ast.FunctionDef, _ff5_ast.AsyncFunctionDef)):
+            args = node.args
+            total = len(getattr(args, "posonlyargs", ())) + len(args.args)
+            required = max(0, total - len(args.defaults))
+            out[node.name] = {
+                "kind": "function", "required": required, "total": total,
+                "vararg": args.vararg is not None,
+                "line": getattr(node, "lineno", 0),
+            }
+        elif isinstance(node, _ff5_ast.ClassDef):
+            out[node.name] = {"kind": "class", "required": 0, "total": 0,
+                              "vararg": True, "line": getattr(node, "lineno", 0)}
+    return out
+
+
+def _ff5_py_modules(messages):
+    """{stem: [module]} for every Python file read successfully this turn."""
+    mods = {}
+    for e in _answered_calls(messages):
+        if e["kind"] != "read" or not _read_ok(e):
+            continue
+        path = _call_path(e["args"])
+        if not path or not path.lower().endswith(".py"):
+            continue
+        text = _ff5_trunc_re().sub("", e["result"] or "").rstrip()
+        try:
+            tree = _ff5_ast.parse(_clean_file_text(text))
+        except (SyntaxError, ValueError):
+            continue
+        stem = _base(path)[:-3]
+        mods.setdefault(stem, []).append({
+            "path": path, "tree": tree, "defs": _ff5_py_defs(tree)})
+    return mods
+
+
+def _ff5_py_target(mods, dotted):
+    stem = (dotted or "").split(".")[-1].lower()
+    cands = mods.get(stem) or []
+    if not cands:
+        return None
+    want = (dotted or "").replace(".", "/").lower()
+    for m in cands:
+        p = m["path"].replace("\\", "/").lower()
+        if p.endswith("/" + want + ".py") or p == want + ".py":
+            return m
+    return cands[0]
+
+
+def _ff5_arg_problem(node, info):
+    if info.get("kind") != "function":
+        return ""
+    given = len(node.args)
+    if any(isinstance(a, _ff5_ast.Starred) for a in node.args):
+        return ""
+    required, total = info.get("required", 0), info.get("total", 0)
+    if given < required:
+        return ("expects at least %d positional argument(s) but got %d"
+                % (required, given))
+    if given > total and not info.get("vararg"):
+        return ("expects at most %d positional argument(s) but got %d"
+                % (total, given))
+    return ""
+
+
+def _ff5_cross_module(messages):
+    """Static findings between the Python files read in this turn."""
+    if not _c5("flow6_cross_module"):
+        return []
+    mods = _ff5_py_modules(messages)
+    if len(mods) < 2 and not any(len(v) > 1 for v in mods.values()):
+        return []
+    out, seen = [], set()
+
+    def add(text):
+        if text not in seen:
+            seen.add(text)
+            out.append(text)
+
+    for items in mods.values():
+        for m in items:
+            path = m["path"]
+            defs = m["defs"]
+            imported, imported_mods = {}, {}
+            for node in _ff5_ast.walk(m["tree"]):
+                if isinstance(node, _ff5_ast.ImportFrom):
+                    if not node.module:
+                        continue
+                    target = _ff5_py_target(mods, node.module)
+                    if target is None:
+                        continue
+                    for alias in node.names:
+                        if alias.name == "*":
+                            continue
+                        if alias.name not in target["defs"]:
+                            add("%s:%s: imports %r from %r, but %s does not "
+                                "define it" % (path, getattr(node, "lineno", "?"),
+                                               alias.name, node.module,
+                                               target["path"]))
+                            continue
+                        imported[alias.asname or alias.name] = (
+                            target, alias.name)
+                elif isinstance(node, _ff5_ast.Import):
+                    for alias in node.names:
+                        base = alias.name.split(".")[0]
+                        target = _ff5_py_target(mods, alias.name) \
+                            or _ff5_py_target(mods, base)
+                        if target is not None:
+                            imported_mods[alias.asname or base] = target
+
+            for node in _ff5_ast.walk(m["tree"]):
+                if not isinstance(node, _ff5_ast.Call):
+                    continue
+                fn = node.func
+                if isinstance(fn, _ff5_ast.Name) and fn.id in imported:
+                    target, name = imported[fn.id]
+                    info = target["defs"].get(name)
+                    if info:
+                        problem = _ff5_arg_problem(node, info)
+                        if problem:
+                            add("%s:%s: %s() %s (defined in %s)" % (
+                                path, getattr(node, "lineno", "?"), name,
+                                problem, target["path"]))
+                elif (isinstance(fn, _ff5_ast.Attribute)
+                      and isinstance(fn.value, _ff5_ast.Name)
+                      and fn.value.id in imported_mods):
+                    target = imported_mods[fn.value.id]
+                    info = target["defs"].get(fn.attr)
+                    if info is None:
+                        add("%s:%s: %s.%s is not defined in %s" % (
+                            path, getattr(node, "lineno", "?"), fn.value.id,
+                            fn.attr, target["path"]))
+                    else:
+                        problem = _ff5_arg_problem(node, info)
+                        if problem:
+                            add("%s:%s: %s.%s() %s (defined in %s)" % (
+                                path, getattr(node, "lineno", "?"),
+                                fn.value.id, fn.attr, problem, target["path"]))
+    return out
+
+
+# --------------------------------------------------------------------------
+# Own-pattern results (REVERT / RUN_TESTS / RUN_COMMAND / GIT_INFO): adapt the
+# proxy-generated call to the client schema and enforce the same permissions.
+# --------------------------------------------------------------------------
+
+def _map_reduce(messages, step, ctx, gen, client_gone=None):
+    """Final map-reduce: append the cross-module pass to every review report."""
+    report = _ff5_prev_map_reduce(messages, step, ctx, gen, client_gone)
+    if not report or not _c5("flow6_cross_module"):
+        return report
+    try:
+        findings = _ff5_cross_module(messages)
+        if findings:
+            report += ("\n\n**Cross-module checks (static):**\n"
+                       + "\n".join("- " + f for f in findings[:20]))
+        report += "\n\n_" + _FF5_CROSS_NOTE + "_"
+    except Exception as e:
+        log(f"[fix6] cross-module pass error: {e}")
+    return report
+
+
+def _ff5_own_result(step, ctx, messages, tm, perm):
+    if step is None:
+        return None
+    if step.text is not None:
+        return step.text, None
+    calls = list(step.calls or [])
+    if not calls:
+        return None
+    calls, probs = _ff5_adapt_calls(calls, tm)
+    if probs:
+        text = ("Không tạo được lời gọi công cụ hợp lệ: " + "; ".join(probs[:3])
+                if _ff5_vi(ctx) else
+                "Could not build a valid tool call: " + "; ".join(probs[:3]))
+        return text, None
+    if perm is not None:
+        kinds = [tool_kind((tc.get("function") or {}).get("name")) for tc in calls]
+        if not perm.edit and "act" in kinds:
+            return _ff5_say(
+                ctx, "Bạn không cho phép sửa file nên mình không thực hiện chỉnh sửa nào.",
+                "Edits are not allowed here, so I made no edit.").text, None
+        if perm.run == "none" and "exec" in kinds:
+            return _ff5_say(
+                ctx, "Bạn không cho phép chạy lệnh nên mình không chạy bước này.",
+                "Running commands is not allowed here, so this step was skipped."
+            ).text, None
+        if perm.run == "readonly" and "exec" in kinds:
+            for tc in calls:
+                fn = tc.get("function") or {}
+                if tool_kind(fn.get("name")) != "exec":
+                    continue
+                cmd = _call_command(T._tool_arguments_dict(fn))
+                if not _ff5_cmd_readonly(cmd):
+                    return _ff5_say(
+                        ctx, "Yêu cầu này chỉ cho phép lệnh chỉ-đọc nên mình không chạy `%s`."
+                             % cmd[:160],
+                        "Only read-only commands are allowed here, so I did not run `%s`."
+                        % cmd[:160]).text, None
+        scope = _ff5_scope_problems(calls, messages, perm)
+        if scope:
+            body = "\n".join("- " + x for x in scope[:5])
+            return _ff5_say(
+                ctx, "Mình không ghi ra ngoài phạm vi được phép:\n" + body,
+                "I did not write outside the allowed scope:\n" + body).text, None
+    return "", calls
+
+
+def _ff5_install_banner():
+    """Banner, planner and validator now share the same SPEC (proposal 6)."""
+    if not _c5("flow6_banner"):
+        return
+    if getattr(T, "_TASK_BANNER_HOOK", None) is not None:
+        return
+    T._TASK_BANNER_HOOK = _ff5_spec_banner
+
+
+
+# --------------------------------------------------------------------------
+# Proposal 6: one banner generated from the same SPEC as the planner.
+# --------------------------------------------------------------------------
+
+def _ff5_spec_banner(messages):
+    try:
+        last = ""
+        for msg in messages or []:
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                last = T._stringify_content(msg.get("content", ""))
+        if not last:
+            return _ff5_prev_banner(messages)
+        from . import server as _srv
+        pattern = T.detect_task_pattern(messages)
+        fix = False
+        if not pattern:
+            tmp = _Ctx()
+            tmp.last, tmp.request = last, last
+            tmp.scannable = T._strip_code_spans(last)
+            tmp.folded = re.sub(r"\s+", " ",
+                                T._fold_diacritics(tmp.scannable)).strip()
+            tmp.pattern = None
+            try:
+                det = _ff5_detect(tmp)
+            except Exception:
+                det = None
+            if det:
+                pattern, fix = det, bool(getattr(tmp, "fix", False))
+        if pattern not in _FF5_SPEC:
+            return _ff5_prev_banner(messages)
+        perm = _ff5_permissions(messages, pattern, fix)
+        # Same downgrade the planner performs: a CHANGE/CREATE request without
+        # write permission is guidance only, so the banner must not announce an
+        # edit stage the validator will reject.
+        if pattern in ("CHANGE", "CREATE") and not perm.edit:
+            pattern = "EXPLAIN"
+            fix = False
+            perm = _ff5_permissions(messages, pattern, fix)
+        steps = _ff5_allowed_steps(pattern, fix)
+        if not perm.edit:
+            steps = [s for s in steps if s not in ("edit", "diff")]
+        if perm.run == "none":
+            steps = [s for s in steps if s != "verify"]
+        limits = []
+        if not perm.edit:
+            limits.append("no file edits")
+        if perm.run == "none":
+            limits.append("no commands")
+        elif perm.run == "readonly":
+            limits.append("read-only commands")
+        tail = (" Limits: " + ", ".join(limits) + ".") if limits else ""
+        return ("[Task pattern: %s. Mandatory flow: %s.%s]"
+                % (pattern, " -> ".join(steps), tail))
+    except Exception as e:
+        log(f"[fix6] banner error, using the previous banner: {e}")
+        return _ff5_prev_banner(messages)
+
 
 _FF5_REVERT_RE = re.compile(
     r"\b(?:revert|undo|rollback|roll\s+back|hoan\s+tac|khoi\s+phuc|huy|quay\s+lai|tra\s+ve)\b"
@@ -4070,6 +4916,7 @@ def _analyze(messages):
                 setattr(ctx, k, v)
         if _clarified(messages, ctx.idx):
             ctx.perm = _ff5_permissions(messages, ctx.pattern, ctx.fix)
+            ctx.perm.scope = _ff5_scope(ctx, messages)
             return ctx
         det = _ff5_detect(ctx)
         if det:
@@ -4099,10 +4946,12 @@ def _analyze(messages):
         ctx.no_edit = not perm.edit
         ctx.intent = (ctx.pattern or "").lower()
         ctx.scope = _named_files(ctx)
+        perm.scope = _ff5_scope(ctx, messages)
     except Exception as e:
         log(f"[fix5] analyze error: {e}")
     if not hasattr(ctx, "perm"):
         ctx.perm = _Ff5Perm(True, "any", "default", False)
+        ctx.perm.scope = None
     return ctx
 
 
@@ -4522,7 +5371,7 @@ def _verify_findings(text, chunk):
 # post-filter on whatever the planner/model produced
 # --------------------------------------------------------------------------
 
-def _ff5_postfilter(result, messages, perm=None, last=True):
+def _ff5_postfilter(result, messages, perm=None, last=True, tm=None):
     """Returns (result, nudge). ``nudge`` is a corrective instruction naming the
     SPECIFIC problem when a guard rejected the output and a retry is still
     allowed (last=False); on the last attempt the guard blocks instead
@@ -4543,6 +5392,35 @@ def _ff5_postfilter(result, messages, perm=None, last=True):
         msg = vi_text if vi else en_text
         return (((text + "\n\n") if text else "") + msg, None), None
 
+    # 0. adapt every call to the schema the client actually declared (proposal 3)
+    if tm is not None:
+        calls, probs = _ff5_adapt_calls(calls, tm)
+        if probs:
+            body = "\n".join("- " + x for x in probs[:5])
+            log("[fix6] tool calls did not match the client schema: " + " | ".join(probs))
+            return blocked(
+                "Mình chưa gửi lời gọi công cụ vì nó không khớp schema của client "
+                "(chưa có gì được thực thi):\n" + body,
+                "I did not send the tool call because it does not match the "
+                "client's schema (nothing ran):\n" + body,
+                "Your tool call does not match the tool schema. Fix exactly these "
+                "problems and call it again:\n" + body, retry=True)
+
+    # 0b. scope: writes are limited to the files the user named/read (proposal 1)
+    if _c5("flow6_scope_guard"):
+        scope = _ff5_scope_problems(calls, messages, perm)
+        if scope:
+            body = "\n".join("- " + x for x in scope[:5])
+            log("[fix6] out-of-scope write(s): " + " | ".join(scope))
+            return blocked(
+                "Mình chưa ghi vì (các) file đó nằm ngoài phạm vi yêu cầu này "
+                "(chưa có gì được ghi):\n" + body,
+                "I did not write because those files are outside this request's "
+                "scope (nothing was written):\n" + body,
+                "Your edit targets a file outside this request. Edit only the "
+                "files the user named or the files read in this turn:\n" + body,
+                retry=True)
+
     # 1. intent vs permission: the user (or a guidance question) forbade edits
     if _c5("flow5_respect_no_edit") and not perm.edit:
         kept = [tc for tc in calls
@@ -4554,9 +5432,24 @@ def _ff5_postfilter(result, messages, perm=None, last=True):
                                "Edits are not allowed here (%s), so I made no edit." % perm.reason)[0], None
             calls = kept
 
-    # 2. command policy: read-only mode, wide destructive commands, PowerShell syntax
+    # 2. command policy: three permission levels, wide destructive commands,
+    #    PowerShell syntax.
     low_user = last_user.lower()
     win = _c5("flow5_ps_fix") and _ff5_is_windows(messages)
+    if perm.run == "none":
+        kept = [tc for tc in calls
+                if tool_kind((tc.get("function") or {}).get("name")) != "exec"]
+        if len(kept) != len(calls):
+            log("[fix6] dropped command(s): the user forbade running any command")
+            if not kept:
+                return blocked(
+                    "Bạn không cho phép chạy lệnh nên mình không chạy gì cả (%s)."
+                    % perm.reason,
+                    "Running commands is not allowed here (%s), so I ran nothing."
+                    % perm.reason,
+                    "Do not run any command. Answer from the files you already "
+                    "read, or say what information you still need.", retry=True)
+            calls = kept
     new = []
     for tc in calls:
         fn = tc.get("function") or {}
@@ -4569,8 +5462,7 @@ def _ff5_postfilter(result, messages, perm=None, last=True):
             new.append(tc)
             continue
         cmd = args[ckey]
-        if perm.run == "readonly" and not _ff5_cmd_readonly(cmd) \
-                and _c5("flow5_respect_no_edit") and perm.restricted:
+        if perm.run == "readonly" and not _ff5_cmd_readonly(cmd):
             log("[fix5] blocked a non read-only command in read-only mode: " + cmd[:200])
             return blocked("Mình chặn lệnh `%s` vì yêu cầu này chỉ cho phép lệnh chỉ-đọc (%s)." % (cmd[:200], perm.reason),
                            "I blocked `%s`: only read-only commands are allowed here (%s)." % (cmd[:200], perm.reason),
@@ -4662,6 +5554,7 @@ def install():
         CONFIG.setdefault(k, v)
     from . import server
     _ff5_wrap_change(server)
+    _ff5_install_banner()
     cls = server.GeminiHandler
     cur = cls._generate_with_tool_retry
     if getattr(cur, "_flow5_patched", False):
@@ -4681,7 +5574,7 @@ def install():
         if not (_c5("flow5_enabled") and tools_active and messages and allowed_names):
             return call()
         _ff5_tls.model = (model_id, think_mode, extra, ticket)
-        perm = None
+        tm, perm = None, None
         try:
             last = messages[-1] if isinstance(messages[-1], dict) else {}
             if not required_tool and last.get("role") in ("user", "tool"):
@@ -4698,19 +5591,21 @@ def install():
                         if step is not None:
                             log(f"[fix5] pattern={ctx.pattern} step={step.name} "
                                 f"({'local answer' if step.text is not None else 'drive'})")
-                            if step.text is not None:
-                                return step.text, None
-                            if step.calls:
-                                return "", step.calls
+                            _ff5_metric("own_" + step.name)
+                            final = _ff5_own_result(step, ctx, messages, tm, perm)
+                            if final is not None:
+                                return final
         except Exception as e:
             log(f"[fix5] planner error, falling back: {e}")
         result = call()
         try:
             retries = max(0, int(_c5("flow5_guard_retries")))
             for attempt in range(retries + 1):
-                final, nudge = _ff5_postfilter(result, messages, perm, last=(attempt >= retries))
+                final, nudge = _ff5_postfilter(
+                    result, messages, perm, last=(attempt >= retries), tm=tm)
                 if nudge is None:
                     return final
+                _ff5_metric("guard_retries")
                 log(f"[fix5] guard rejected the output, re-asking (attempt {attempt + 1}): {nudge[:160]}")
                 result = cur(self, prompt + "\n\n[SYSTEM NOTE] " + nudge, model_id, think_mode, file_refs,
                              extra, tools_active, allowed_names, tool_schemas, required_tool,

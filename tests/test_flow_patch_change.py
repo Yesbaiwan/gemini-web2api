@@ -39,6 +39,13 @@ class TestsAfterNamedFile(unittest.TestCase):
         msgs = _base() + _call(1, "edit", {"filePath": "server.py"},
                                "Edit applied successfully.")
         step = F.plan_for(msgs, _tm())
+        # Proposal 2: the diff stage sits between the edit and verification.
+        self.assertEqual(step.name, "diff")
+        cmd = json.loads(step.calls[0]["function"]["arguments"])["command"]
+        self.assertIn("git", cmd)
+        self.assertIn("diff", cmd)
+        msgs += _call(2, "bash", {"command": cmd}, "diff --git a/server.py b/server.py")
+        step = F.plan_for(msgs, _tm())
         self.assertEqual(step.name, "tests")
         cmd = json.loads(step.calls[0]["function"]["arguments"])["command"]
         self.assertIn("unittest", cmd)
