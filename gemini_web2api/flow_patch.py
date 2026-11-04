@@ -5389,7 +5389,111 @@ def _verify_findings(text, chunk):
 # post-filter on whatever the planner/model produced
 # --------------------------------------------------------------------------
 
-def _ff5_postfilter(result, messages, perm=None, last=True, tm=None):
+def _ff5_successful_read_paths(messages):
+    """Paths of every read that actually produced content (success/partial).
+
+    ``failed`` and ``unknown`` (empty) reads are excluded: they prove nothing,
+    so they must never unlock an edit -- the same rule :func:`_ff5_read_guard`
+    applies to failed reads, extended to the case where NO read happened at
+    all.
+    """
+    out = []
+    for e in _answered_calls(messages):
+        if e.get("kind") != "read":
+            continue
+        if _ff5_status(e) not in ("success", "partial"):
+            continue
+        p = _call_path(e.get("args") or {})
+        if p:
+            out.append(p)
+    return out
+
+
+def _ff5_act_needs_read_problems(calls, messages, ctx):
+    """Read-before-edit: an act on an existing file needs a successful read.
+
+    Only enforced for real code-change intent (CHANGE, or DEBUG with fix=True)
+    -- exactly the scope of :func:`_ff5_read_guard`, which however only fires
+    when a read *failed*; this closes the fail-open hole where the model emits
+    an edit without ever reading the file.
+    """
+    pattern = getattr(ctx, "pattern", None)
+    fix = bool(getattr(ctx, "fix", False))
+
+    # Chỉ ép read-before-edit với intent sửa code thật sự
+    if pattern not in ("CHANGE", "DEBUG"):
+        return []
+    if pattern == "DEBUG" and not fix:
+        return []
+
+    good_reads = _ff5_successful_read_paths(messages)
+    problems = []
+
+    for tc in calls or []:
+        fn = (tc or {}).get("function") or {}
+        if tool_kind(fn.get("name")) != "act":
+            continue
+
+        args = T._tool_arguments_dict(fn)
+        path = _call_path(args)
+        if not path:
+            continue
+
+        # Helper merge script là ngoại lệ do proxy tự quản lý
+        if _base(path) == _MERGE_SCRIPT:
+            continue
+
+        if not any(T._path_seen(path, [p]) for p in good_reads):
+            problems.append(
+                f"{path}: cannot edit/write before a successful read of this file"
+            )
+
+    return problems
+
+
+def _ff5_has_fresh_evidence_after_last_act(messages, path):
+    """True when re-editing ``path`` is grounded in post-edit evidence.
+
+    After the last act on the file, either a successful/partial read of it or
+    a fresh ``git diff`` must exist; otherwise the model would be writing from
+    a copy that its own earlier edit already invalidated. No act yet -> True
+    (the ordinary first-edit gates apply).
+    """
+    ev = _answered_calls(messages)
+    last_act = -1
+
+    for i, e in enumerate(ev):
+        if e.get("kind") != "act":
+            continue
+        if not _act_ok(e):
+            continue          # a failed edit left the file untouched
+        p = _call_path(e.get("args") or {})
+        if p and T._path_seen(path, [p]):
+            last_act = i
+
+    if last_act < 0:
+        return True
+
+    for i, e in enumerate(ev):
+        if i <= last_act:
+            continue
+
+        kind = e.get("kind")
+        if kind == "read":
+            p = _call_path(e.get("args") or {})
+            if (p and T._path_seen(path, [p])
+                    and _ff5_status(e) in ("success", "partial")):
+                return True
+
+        if kind == "exec":
+            cmd = _call_command(e.get("args") or {})
+            if re.search(r"\bgit\s+(?:--no-pager\s+)?diff\b", cmd):
+                return True
+
+    return False
+
+
+def _ff5_postfilter(result, messages, perm=None, last=True, tm=None, ctx=None):
     """Returns (result, nudge). ``nudge`` is a corrective instruction naming the
     SPECIFIC problem when a guard rejected the output and a retry is still
     allowed (last=False); on the last attempt the guard blocks instead
@@ -5409,6 +5513,21 @@ def _ff5_postfilter(result, messages, perm=None, last=True, tm=None):
             return None, nudge
         msg = vi_text if vi else en_text
         return (((text + "\n\n") if text else "") + msg, None), None
+
+    # 0a. read-before-edit: no act may target a file never successfully read
+    # (fail-open hole: _ff5_read_guard only fires when a read FAILED, and the
+    # evidence gate returns early when there is no read at all).
+    if ctx is not None and _c5("flow5_fail_closed_edits"):
+        read_probs = _ff5_act_needs_read_problems(calls, messages, ctx)
+        if read_probs:
+            body = "\n".join("- " + x for x in read_probs[:5])
+            log("[fix5] edit without a successful read: " + " | ".join(read_probs))
+            return blocked(
+                "Mình chưa sửa vì file chưa được đọc thành công:\n" + body,
+                "I did not edit because the target file was not successfully "
+                "read:\n" + body,
+                "Read the target file successfully before editing it:\n" + body,
+                retry=True)
 
     # 0. adapt every call to the schema the client actually declared (proposal 3)
     if tm is not None:
@@ -5518,7 +5637,15 @@ def _ff5_postfilter(result, messages, perm=None, last=True, tm=None):
                 continue
             p = _call_path(T._tool_arguments_dict(fn))
             if p and any(T._path_seen(p, [x]) for x in touched):
-                new.append(tc)     # earlier edit this turn: the read copy is stale
+                # Earlier edit this turn: the read copy is stale. It may not
+                # simply write again from that copy -- a fresh read of the
+                # file or a fresh git diff after the last act is required.
+                if _ff5_has_fresh_evidence_after_last_act(messages, p):
+                    new.append(tc)
+                    continue
+                probs.append(
+                    f"{p}: file was already edited; re-read it or show a fresh "
+                    "diff before another edit")
                 continue
             fixed, pr = _gate_act_calls([tc], messages)
             if pr:
@@ -5592,7 +5719,7 @@ def install():
         if not (_c5("flow5_enabled") and tools_active and messages and allowed_names):
             return call()
         _ff5_tls.model = (model_id, think_mode, extra, ticket)
-        tm, perm = None, None
+        tm, perm, ctx = None, None, None
         try:
             last = messages[-1] if isinstance(messages[-1], dict) else {}
             if not required_tool and last.get("role") in ("user", "tool"):
@@ -5620,7 +5747,8 @@ def install():
             retries = max(0, int(_c5("flow5_guard_retries")))
             for attempt in range(retries + 1):
                 final, nudge = _ff5_postfilter(
-                    result, messages, perm, last=(attempt >= retries), tm=tm)
+                    result, messages, perm, last=(attempt >= retries), tm=tm,
+                    ctx=ctx)
                 if nudge is None:
                     return final
                 _ff5_metric("guard_retries")
