@@ -4542,7 +4542,11 @@ def _ff5_after_plan(step, messages, tm, ctx=None):
                    if _ff5_vi(ctx) else
                    "Running commands is not allowed here, so this step was skipped.")
             return _ff5_local_step(ctx, msg)
-        if _c5("flow6_context") and not getattr(step, "drive", False):
+        # Finding 15: when the lean prompt is on, build_step_prompt already
+        # carries goal/permissions/evidence -- injecting the [Context] suffix
+        # here would double it up inside step.directive().
+        if _c5("flow6_context") and not getattr(step, "drive", False) \
+                and not _c5("flow6_lean_prompt"):
             suffix = _ff5_context_suffix(ctx, step, perm, messages)
             if suffix and suffix not in (step.instruction or ""):
                 step.instruction = (step.instruction or "") + "\n" + suffix
