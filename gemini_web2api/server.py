@@ -1143,15 +1143,26 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     break
                 missing = missing_required_params(tool_calls, tool_required)
                 if missing:
+                    msg = ("model emitted invalid tool call; missing required "
+                           "parameter(s): " + ", ".join(missing))
                     # Always logged: even when no attempt is left this is the
                     # only place that shows the model wrote a call the client
                     # cannot run.
-                    log(f"tool_call missing required parameter(s): "
-                        f"{', '.join(missing)}")
+                    log(msg)
                     if attempt + 1 < attempts:
                         log(f"Tool retry (attempt {attempt + 1}/{attempts}): "
                             "asking the model to fill them in")
+                        nudge_extra = (
+                            f" The previous tool call was missing required "
+                            f"parameter(s): {', '.join(missing)}. Include "
+                            "every required parameter.")
                         continue
+                    # Retries exhausted and the call is still unrunnable:
+                    # handing it to the client as a valid tool call costs a
+                    # round-trip and the model never learns which field was
+                    # absent. Fail closed -- the endpoint maps this to an
+                    # error status instead of pretending the call is fine.
+                    raise GeminiError(msg)
                 break
             if (text or "").strip() and not looks_like_canned_failure(text):
                 # A usable answer worth keeping if a later attempt fails: a
