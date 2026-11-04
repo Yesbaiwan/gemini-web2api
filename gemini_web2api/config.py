@@ -66,6 +66,13 @@ DEFAULT_CONFIG = {
     # extra attempt only ever costs a call that was already failing, never one
     # that succeeded.
     "tool_retry_attempts": 1,
+    # When tool_choice is "required" and the model keeps re-emitting a tool
+    # call whose result is already in the conversation (a duplicate loop),
+    # True fails the request closed (GeminiError -> error status) instead of
+    # silently returning prose: "required" is a contract, prose ends an agent
+    # turn without a call. Set False for the old soft behaviour (a loop is
+    # worse than one prose turn -- fall back to the plain-text answer).
+    "required_tool_fail_on_duplicate": True,
     # Rewrite the bare word "workspace" to "project" in the prompt sent
     # upstream. The word routes a request to Gemini's Workspace extension,
     # which an anonymous / no-Gmail session answers with "I can't use
