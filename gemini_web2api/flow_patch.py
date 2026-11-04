@@ -1298,6 +1298,21 @@ def install():
         log(f"[flow] pattern={step.pattern} step {step.index}/{step.total} "
             f"{step.name} mode={'drive' if step.drive and _cfg('flow_drive') else 'guide'}")
 
+        # Finding 15: for guided steps, replace the full chat history with a
+        # minimal per-step prompt (goal + permissions + selected evidence).
+        # build_step_prompt returns None whenever the lean path does not apply
+        # -> every call below falls back to the original `prompt` verbatim.
+        lean = (_c5("flow6_lean_prompt") and ctx is not None
+                and getattr(ctx, "pattern", None) in _FF5_SPEC
+                and not getattr(step, "drive", False))
+        step_prompt = build_step_prompt(ctx, step, messages, tm) if lean else None
+        if step_prompt is not None:
+            defs = _ff5_allowed_tool_defs(step, tm)
+            if defs:
+                step_prompt += "\n".join(defs) + "\n"
+            _ff5_metric("lean_prompt_used")
+            _ff5_metric("lean_saved_chars", max(0, len(prompt) - len(step_prompt)))
+
         if step.name == "answer":
             if (_cfg("flow_mapreduce")
                     and step.pattern in ("GENERIC_REVIEW", "FILE_REVIEW")):
@@ -1313,14 +1328,15 @@ def install():
                     report = None
                 if report:
                     return report, None
-            return call(prompt + "\n\n" + step.directive())
+            return call((step_prompt or prompt) + "\n\n" + step.directive())
         if step.drive and _cfg("flow_drive"):
             return "", step.calls
 
         nudge, last = "", None
         for attempt in range(1 + max(0, int(_cfg("flow_max_retries")))):
             try:
-                text, calls = call(prompt + "\n\n" + step.directive() + nudge, True)
+                text, calls = call((step_prompt or prompt) + "\n\n"
+                                   + step.directive() + nudge, True)
             except Exception as e:
                 log(f"[flow] guide attempt {attempt + 1} failed: {e}")
                 if step.calls:
@@ -3715,6 +3731,9 @@ _FF5_DEFAULTS = {
     # Completion of the handoff (fix6): one context block per guided step,
     # scope-aware writes, a universal evidence gate and a real diff stage.
     "flow6_context": True,
+    # Replace the full chat history with a minimal per-step prompt for guided
+    # steps (finding 15). Off by default until measured against flash-lite.
+    "flow6_lean_prompt": False,
     "flow6_metrics": True,
     "flow6_diff_step": True,
     "flow6_scope_guard": True,
@@ -4252,6 +4271,234 @@ def _ff5_context_suffix(ctx, step, perm, messages):
             ctx.pattern, getattr(ctx, "fix", False))))
     text = "[Context] " + " | ".join(bits)
     return text[:900]
+
+
+# --------------------------------------------------------------------------
+# Finding 15: a "just enough" prompt for weak models. For guided steps the
+# full chat history is replaced by goal + permissions + stage-selected
+# evidence + the step's own directive (with the allowed tools' schemas).
+# Everything is fail-open: any problem -> None -> the caller keeps using the
+# original full prompt.
+# --------------------------------------------------------------------------
+
+_FF5_LEAN_CAPS = {"discover": 4, "read": 6, "edit": 4, "diff": 900,
+                  "verify": 1200, "answer": 6, "analyze": 6}
+
+
+def _ff5_lean_line(text, cap):
+    """One flattened evidence line, hard-capped with an explicit marker."""
+    t = " ".join(str(text or "").split())
+    if len(t) <= cap:
+        return t
+    return t[:cap].rstrip() + " …[truncated]"
+
+
+def _ff5_exec_findings(ev):
+    """Exec results after the last successful edit: verified one-line findings."""
+    try:
+        last_act = max(i for i, e in enumerate(ev) if e["kind"] == "act") + 1
+    except ValueError:
+        last_act = 0
+    out = []
+    for e in ev[last_act:]:
+        if e.get("kind") != "exec" or _ff5_status(e) != "success":
+            continue
+        res = e.get("result") or ""
+        lines = [ln.strip()[:140] for ln in res.splitlines()
+                 if ln.strip() and not re.match(r"^[\s|+\-=_`~#*]*$", ln.strip())]
+        for ln in lines[:2]:
+            item = _ff5_lean_line(ln, 140)
+            if item and item not in out:
+                out.append(item)
+        if len(out) >= 3:
+            break
+    return out[:3]
+
+
+def select_evidence_for_step(stage, messages, *, budget=2400):
+    """Trả về list[str]: các mẩu evidence đã cắt gọn, ưu tiên theo độ mới."""
+    out = []
+    try:
+        ev = _answered_calls(messages)
+        seen_paths, seen_bad = set(), set()
+
+        def add(line):
+            if line and line not in out and sum(map(len, out)) + len(line) <= budget:
+                out.append(line)
+
+        def path_of(e):
+            return _call_path(e.get("args") or {})
+
+        def hits(result):
+            body = (result or "").replace("\\", "/")
+            fs = sorted(T._files_in(body), key=body.find)
+            return [f for f in fs
+                    if f.lower() not in T._NON_FILE_NAMES][:5]
+
+        if stage == "discover":
+            n = 0
+            for e in reversed(ev):
+                if e["kind"] not in ("survey", "search", "exec"):
+                    continue
+                cmd = " ".join(_call_command(e["args"]).split())[:120]
+                n += 1
+                add(f"search: [{e['kind']}] {cmd} -> "
+                    f"{len(hits(e['result']))} hit(s)")
+                if n >= _FF5_LEAN_CAPS["discover"]:
+                    break
+        elif stage == "read":
+            for e in reversed(ev):
+                p = path_of(e)
+                if e["kind"] == "read" and p:
+                    st = _ff5_status(e)
+                    low = p.lower()
+                    if st in ("success", "partial") and low not in seen_paths:
+                        seen_paths.add(low)
+                        add(f"read: {p}")
+                    elif st == "failed" and low not in seen_bad:
+                        seen_bad.add(low)
+                        add(f"failed_read: {p} (do not read it again)")
+                elif e["kind"] in ("survey", "search"):
+                    for f in hits(e["result"]):
+                        if len(seen_paths) + len(out) >= _FF5_LEAN_CAPS["read"]:
+                            break
+                        add(f"unread candidate: {f}")
+                if sum(map(len, out)) > budget * 0.7:
+                    break
+        elif stage == "edit":
+            for e in reversed(ev):
+                p = path_of(e)
+                if e["kind"] in ("read", "act") and p \
+                        and p.lower() not in seen_paths:
+                    seen_paths.add(p.lower())
+                    add(f"target: {p}")
+                elif e["kind"] == "act" and _ff5_status(e) == "failed":
+                    add("edit_failed: "
+                        + _ff5_lean_line(_ff5_status_detail(e), 220))
+                if len(out) >= _FF5_LEAN_CAPS["edit"]:
+                    break
+        elif stage == "diff":
+            for e in reversed(ev):
+                if e["kind"] != "exec":
+                    continue
+                if not re.search(r"\bgit\b[^\n]*\bdiff\b", _call_command(e["args"])):
+                    continue
+                if _ff5_status(e) != "success":
+                    continue
+                add(f"diff: {_ff5_lean_line(e['result'], _FF5_LEAN_CAPS['diff'])}")
+                break
+        else:  # verify / answer / analyze share the tail rules
+            if stage == "verify":
+                for e in reversed(ev):
+                    if e["kind"] != "exec":
+                        continue
+                    if not (_is_test_cmd(_call_command(e["args"]))
+                            or test_outcome(e["result"]) in ("pass", "fail")):
+                        continue
+                    head = "test_failed: " if _ff5_status(e) == "failed" else "test: "
+                    add(head + _ff5_lean_line(e["result"],
+                                              _FF5_LEAN_CAPS["verify"]))
+                    break
+            good = sorted({path_of(e) for e in ev
+                           if e["kind"] == "read"
+                           and _ff5_status(e) in ("success", "partial")
+                           and path_of(e)})
+            bad = sorted({path_of(e) for e in ev
+                          if e["kind"] == "read" and _ff5_status(e) == "failed"
+                          and path_of(e)})
+            for p in good[:_FF5_LEAN_CAPS[stage if stage in _FF5_LEAN_CAPS
+                                          else "answer"]]:
+                add(f"read: {p}")
+            for p in bad[:4]:
+                add(f"failed_read: {p} (do not read it again)")
+            if stage == "analyze":
+                n = 0
+                for e in reversed(ev):
+                    if e["kind"] not in ("survey", "search"):
+                        continue
+                    n += 1
+                    add(f"search: {_ff5_lean_line(_call_command(e['args']), 100)}"
+                        f" -> {', '.join(hits(e['result'])[:3]) or 'no path'}")
+                    if n >= 2:
+                        break
+            for f in _ff5_exec_findings(ev):
+                add(f"verified: {f}")
+    except Exception as e:
+        log(f"[fix6] lean evidence error (stage={stage}): {e}")
+    return out
+
+
+def _ff5_allowed_tool_defs(step, tm):
+    """JSON schema blocks for step.tool_names ∩ tm -- the same ToolMap the
+    planner used, so allowlist and schema can never disagree."""
+    props = getattr(tm, "schemas", None) or {}
+    req = getattr(tm, "required", None) or {}
+    blocks = []
+    for name in list(getattr(step, "tool_names", ()) or []):
+        if name not in props:
+            continue
+        payload = {"name": name,
+                   "parameters": sorted(props.get(name) or ())}
+        r = sorted(req.get(name) or ())
+        if r:
+            payload["required"] = r
+        blocks.append("```json\n"
+                      + json.dumps(payload, ensure_ascii=False) + "\n```")
+    return blocks
+
+
+def _build_step_prompt_core(ctx, step, messages, tm):
+    """Dựng lean step prompt; trả None nếu step nằm ngoài phạm vi lean path."""
+    if step is None or tm is None:
+        return None
+    if getattr(step, "drive", False) or getattr(step, "local_text", None) is not None:
+        return None
+    pattern = _ff5_pat(getattr(ctx, "pattern", None))
+    if pattern not in _FF5_SPEC:
+        return None
+    perm = getattr(ctx, "perm", None)
+    if perm is None:
+        perm = _ff5_permissions(messages, pattern, getattr(ctx, "fix", False))
+        if getattr(perm, "scope", "__missing__") == "__missing__":
+            try:
+                perm.scope = _ff5_scope(ctx, messages)
+            except Exception:
+                perm.scope = None
+    stage = getattr(step, "stage", None) or _ff5_stage(step)
+    goal = _ff5_lean_line(getattr(ctx, "last", "") or "", 180) or "(none)"
+    scope = getattr(perm, "scope", None)
+    scope_txt = ", ".join(str(s) for s in scope[:8]) if scope \
+        else ("(none -- no writes allowed)" if scope == [] else "(unrestricted)")
+    lines = ["Goal: " + goal,
+             "Permissions: edit=" + ("allowed" if getattr(perm, "edit", False)
+                                     else "forbidden")
+             + " | commands=" + str(getattr(perm, "run", "readonly"))
+             + " | scope=" + scope_txt]
+    steps = _ff5_allowed_steps(pattern, getattr(ctx, "fix", False))
+    if steps:
+        lines.append("Pipeline: " + " -> ".join(steps))
+    evidence = select_evidence_for_step(stage, messages)
+    if evidence:
+        lines.append("Evidence:")
+        lines.extend(evidence)
+    lines.append("")          # blank line before Step.directive()
+    return "\n".join(lines)
+
+
+def build_step_prompt(ctx, step, messages, tm):
+    """Chuẩn hoá inputs rồi gọi _build_step_prompt_core; MỌI exception -> None.
+
+    None means "not applicable": the caller must fall back to the full prompt.
+    """
+    try:
+        if not _c5("flow6_lean_prompt"):
+            return None
+        if ctx is None or not getattr(ctx, "pattern", None):
+            return None
+        return _build_step_prompt_core(ctx, step, messages, tm)
+    except Exception as e:
+        log(f"[fix6] lean step prompt error, using the full prompt: {e}")
+        return None
 
 
 def _ff5_after_plan(step, messages, tm, ctx=None):
