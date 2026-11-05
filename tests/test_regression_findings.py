@@ -225,7 +225,13 @@ class NoHardcodedInstructionTests(unittest.TestCase):
     def test_no_foreign_filenames_in_server_source(self):
         import pathlib
         src = pathlib.Path(__file__).resolve().parent.parent.joinpath(
-            "gemini_web2api", "server.py").read_text(encoding="utf-8")
+            "gemini_web2api.py").read_text(encoding="utf-8")
+        # The implementation is consolidated into a single flat module, so
+        # restrict the check to the server section (where the instruction and
+        # tool blocks live) instead of the whole file.
+        marker = "# Section: server.py"
+        if marker in src:
+            src = src[src.index(marker):]
         for leaked in ("hand3d.py", "vkeyboard.py", "scorereader.py",
                        "handmesh.py", "handspec.py"):
             self.assertNotIn(leaked, src)
