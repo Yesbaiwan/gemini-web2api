@@ -1,23 +1,14 @@
-"""Tests for finding 15: the lean per-step prompt (docs/design_ff5_15_lean_step_prompt.md).
-
-Groups (design section 9):
-1. Unit ``select_evidence_for_step``: prefixes, caps, recency order, budget.
-2. Unit ``build_step_prompt``: Goal / Permissions / Evidence / schema blocks,
-   no old history text.
-3. Fallbacks: flag off -> None, ctx None -> None, unknown pattern -> None,
-   internal raise (monkeypatched ``_answered_calls``) -> None.
-4. Integration with a stubbed upstream call: flag on sends the step prompt,
-   flag off sends the full prompt; the retry nudge still appends.
-5. Regression: ``_ff5_after_plan`` must NOT inject the [Context] suffix when
-   ``flow6_lean_prompt`` is on, and must still inject it when it is off.
-"""
 import json
 import threading
 import unittest
 from unittest import mock
 
 from gemini_web2api import flow_patch as F
+from gemini_web2api import tools
 from gemini_web2api.config import CONFIG
+from gemini_web2api.server import GeminiHandler, SSE_PING_INTERVAL_SEC
+
+CALL = '```tool_call\n{"name":"read","arguments":{"path":"a"}}\n```'
 
 
 def _call(i, name, args, result):
@@ -57,9 +48,105 @@ def _perm(edit=False, run="readonly", scope=None):
     return p
 
 
-class FlagConfigMixin(unittest.TestCase):
-    """Deterministic config around every test in this file."""
+class WorkspaceGuardTests(unittest.TestCase):
+    def test_bare_word_rewritten(self):
+        out = tools.defuse_extension_words(
+            "Workspace root folder: D:\\p\n  this workspace is remote.")
+        self.assertIn("Project root folder", out)
+        self.assertIn("this project is remote", out)
 
+    def test_paths_and_identifiers_kept(self):
+        text = ("D:\\workspace\\app.py /home/u/workspace/x workspace.json "
+                "workspace_id my-workspace")
+        self.assertEqual(tools.defuse_extension_words(text), text)
+
+    def test_config_switch(self):
+        old = CONFIG.get("defuse_extension_words")
+        CONFIG["defuse_extension_words"] = False
+        try:
+            self.assertEqual(tools.defuse_extension_words("Workspace"),
+                             "Workspace")
+        finally:
+            CONFIG["defuse_extension_words"] = old
+
+    def test_prompt_is_defused(self):
+        prompt, _ = tools.messages_to_prompt(
+            [{"role": "user", "content": "Workspace root folder: D:\\p"}])
+        self.assertNotIn("Workspace", prompt)
+
+    def test_workspace_error_is_upstream_error(self):
+        self.assertTrue(tools.looks_like_upstream_error(
+            "I can't use Workspace because required Gmail settings are off. "
+            "Turn on these settings to continue."))
+
+
+class ToolStreamTests(unittest.TestCase):
+    def setUp(self):
+        self.orig = dict(CONFIG)
+        CONFIG["tool_retry_on_miss"] = True
+        CONFIG["tool_stream"] = True
+        CONFIG["retry_delay_sec"] = 0
+
+    def tearDown(self):
+        CONFIG.clear()
+        CONFIG.update(self.orig)
+
+    def _params(self, **over):
+        params = dict(prompt="p", model_id=2, think_mode=1, file_refs=None,
+                      extra=None, tools_active=True, allowed_names={"read"},
+                      tool_schemas={"read": {"path"}}, required_tool=False,
+                      messages=[{"role": "user", "content": "read file a"}],
+                      ticket=None, tool_required={"read": {"path"}},
+                      client_gone=threading.Event())
+        params.update(over)
+        return params
+
+    def _call(self, gen_attr, deltas, **over):
+        params = self._params(**over)
+        with mock.patch("gemini_web2api.server." + gen_attr,
+                        return_value=iter(deltas)) as m:
+            return (GeminiHandler.__new__(GeminiHandler)
+                    ._generate_with_tool_retry(**params)), m
+
+    def test_openai_loop_uses_generate_stream_when_tool_stream(self):
+        (text, calls), m = self._call("generate_stream", [CALL])
+        m.assert_called_once()
+        self.assertTrue(calls, "tool call should parse from streamed text")
+
+    def test_stream_attempt_exits_early_on_complete_fence(self):
+        seen = []
+
+        def fake_stream(*a, **k):
+            for d in ['```tool_cal', 'l\n{"name":"read","argum',
+                      'ents":{"path":"a"}}\n```', "TAIL SHOULD NOT BE READ"]:
+                seen.append(d)
+                yield d
+
+        with mock.patch("gemini_web2api.server.generate_stream",
+                        side_effect=fake_stream):
+            result = (GeminiHandler.__new__(GeminiHandler)
+                      ._generate_with_tool_retry(**self._params()))
+        self.assertTrue(result[1], "call parsed from streamed deltas")
+        self.assertNotIn("TAIL SHOULD NOT BE READ", seen,
+                         "early-exit must stop reading after the fence closes")
+
+    def test_buffered_path_still_uses_generate(self):
+        CONFIG["tool_stream"] = False
+        params = self._params()
+        with mock.patch("gemini_web2api.server.generate",
+                        return_value=CALL) as g, \
+             mock.patch("gemini_web2api.server.generate_stream") as s:
+            text, calls = (GeminiHandler.__new__(GeminiHandler)
+                           ._generate_with_tool_retry(**params))
+        g.assert_called_once()
+        s.assert_not_called()
+        self.assertTrue(calls, "buffered path still parses the tool call")
+
+    def test_ping_interval_reduced(self):
+        self.assertLessEqual(SSE_PING_INTERVAL_SEC, 5)
+
+
+class FlagConfigMixin(unittest.TestCase):
     def setUp(self):
         self.orig = dict(CONFIG)
         CONFIG["flow5_enabled"] = True
@@ -75,10 +162,6 @@ class FlagConfigMixin(unittest.TestCase):
         CONFIG.update(self.orig)
 
 
-# ---------------------------------------------------------------------------
-# 1. select_evidence_for_step
-# ---------------------------------------------------------------------------
-
 class SelectEvidence(FlagConfigMixin):
     def test_read_stage_prefixes_and_order(self):
         msgs = [{"role": "user", "content": "explain a.py"}]
@@ -88,7 +171,6 @@ class SelectEvidence(FlagConfigMixin):
         self.assertTrue(any(l.startswith("read: a.py") for l in ev), ev)
         self.assertTrue(any(l.startswith("failed_read: b.py")
                             and "do not read it again" in l for l in ev), ev)
-        # newest first: b.py (failed) precedes a.py in the iteration order
         ib = next(i for i, l in enumerate(ev) if l.startswith("failed_read"))
         ia = next(i for i, l in enumerate(ev) if l.startswith("read:"))
         self.assertLess(ib, ia)
@@ -137,13 +219,8 @@ class SelectEvidence(FlagConfigMixin):
         self.assertLessEqual(sum(map(len, ev)), budget)
 
     def test_fail_open_on_garbage(self):
-        # No messages at all -> empty list, never an exception.
         self.assertEqual(F.select_evidence_for_step("analyze", []), [])
 
-
-# ---------------------------------------------------------------------------
-# 2. build_step_prompt
-# ---------------------------------------------------------------------------
 
 class BuildStepPrompt(FlagConfigMixin):
     def test_contains_all_required_sections(self):
@@ -165,9 +242,8 @@ class BuildStepPrompt(FlagConfigMixin):
         self.assertIn("Evidence:", p)
         self.assertIn("read: a.py", p)
         self.assertIn("failed_read: gone.py", p)
-        # schema block comes from the same ToolMap the planner used
         self.assertIn('"name": "edit"', p)
-        self.assertNotIn('"name": "bash"', p)   # not in step.tool_names
+        self.assertNotIn('"name": "bash"', p)
 
     def test_no_old_history_text_leaks_in(self):
         CONFIG["flow6_lean_prompt"] = True
@@ -197,10 +273,6 @@ class BuildStepPrompt(FlagConfigMixin):
         self.assertIsNone(F.build_step_prompt(ctx, None, [], tm))
         self.assertIsNone(F.build_step_prompt(ctx, driven, [], None))
 
-
-# ---------------------------------------------------------------------------
-# 3. Fallbacks (always None -> caller keeps the full prompt)
-# ---------------------------------------------------------------------------
 
 class Fallbacks(FlagConfigMixin):
     def _args(self):
@@ -235,28 +307,9 @@ class Fallbacks(FlagConfigMixin):
             self.assertIsNone(F.build_step_prompt(ctx, step, msgs, tm))
 
 
-# ---------------------------------------------------------------------------
-# 4. Integration: the wrapper uses the step prompt only when the flag is on
-# ---------------------------------------------------------------------------
-
 class WrapperIntegration(FlagConfigMixin):
-    """The wrapper sends the lean prompt only for steps that go upstream.
-
-    ``flow_drive`` is OFF on purpose: with it on, a read step that already
-    carries its tool_call is emitted by the proxy itself and upstream is never
-    called, so there is no prompt to inspect (see test_driven_step_...).
-
-    ``F.install()`` patches module-level state (the handler method, hooks in
-    ``tools`` / ``server``, the classifier's thread-local model). setUp
-    snapshots all of it and the cleanup restores it, otherwise every test
-    module that runs after this one executes against a patched proxy.
-    """
-
     CALL_FENCE = ('```tool_call\n{"name": "read", '
                   '"arguments": {"filePath": "b.py"}}\n```')
-    # A declared tool of the WRONG kind for a read step. (An undeclared name
-    # would be dropped by the original retry loop, which re-asks by itself, so
-    # the flow layer would never see it and never add its own nudge.)
     WRONG_KIND = ('```tool_call\n{"name": "glob", '
                   '"arguments": {"pattern": "*.py"}}\n```')
     ASK = [{"role": "user", "content": "read b.py to explain it"}]
@@ -290,8 +343,6 @@ class WrapperIntegration(FlagConfigMixin):
         CONFIG["flow_max_retries"] = 1
         CONFIG["tool_retry_on_miss"] = True
         CONFIG["tool_stream"] = False
-        # keep the integration deterministic: the transition guards must not
-        # rewrite the planned step underneath us
         guards = mock.patch.object(F, "_ff5_plan_after",
                                    side_effect=lambda s, *a, **k: s)
         guards.start()
@@ -321,11 +372,11 @@ class WrapperIntegration(FlagConfigMixin):
         self._run(gen, long_hist, list(self.ASK))
         gen.assert_called()
         sent = gen.call_args[0][0]
-        self.assertNotIn(long_hist, sent)          # history replaced
+        self.assertNotIn(long_hist, sent)
         self.assertIn("Goal: read b.py to explain it", sent)
-        self.assertIn("[FLOW ", sent)             # the directive survived
+        self.assertIn("[FLOW ", sent)
         self.assertIn("Allowed tools this turn:", sent)
-        self.assertIn('"name": "read"', sent)     # schema of the allowed tool
+        self.assertIn('"name": "read"', sent)
         self.assertLess(len(sent), len(long_hist))
 
     def test_flag_off_sends_the_full_prompt(self):
@@ -335,7 +386,7 @@ class WrapperIntegration(FlagConfigMixin):
         self._run(gen, long_hist, list(self.ASK))
         gen.assert_called()
         sent = gen.call_args[0][0]
-        self.assertIn(long_hist, sent)            # original behaviour
+        self.assertIn(long_hist, sent)
         self.assertIn("[FLOW ", sent)
         self.assertNotIn("Goal:", sent)
 
@@ -348,8 +399,8 @@ class WrapperIntegration(FlagConfigMixin):
         self.assertEqual(gen.call_count, 2)
         second = gen.call_args[0][0]
         self.assertIn("That is not allowed at this step", second)
-        self.assertIn("Goal:", second)            # still the lean prompt
-        self.assertNotIn(prompt, second)          # nudge went on the lean prompt
+        self.assertIn("Goal:", second)
+        self.assertNotIn(prompt, second)
 
     def test_driven_step_never_reaches_upstream(self):
         CONFIG["flow_drive"] = True
@@ -359,10 +410,6 @@ class WrapperIntegration(FlagConfigMixin):
         gen.assert_not_called()
         self.assertTrue(calls)
 
-
-# ---------------------------------------------------------------------------
-# 5. Regression: double-inject guard in _ff5_after_plan
-# ---------------------------------------------------------------------------
 
 class ContextSuffixGuard(FlagConfigMixin):
     def _guided_step(self):
@@ -386,8 +433,6 @@ class ContextSuffixGuard(FlagConfigMixin):
         self.assertIn("goal=explain a.py", out.instruction)
 
     def test_instruction_identical_to_plain_step_when_lean_on(self):
-        # The lean path must hand the model the ORIGINAL instruction: the
-        # goal/permissions/evidence live in build_step_prompt instead.
         CONFIG["flow6_lean_prompt"] = True
         step = self._guided_step()
         before = step.instruction
