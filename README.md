@@ -172,6 +172,12 @@ Or use the JSON format:
 
 **Alternative (browser extension)**: Use any "Export Cookies" extension to export cookies for `gemini.google.com` in Netscape format, then convert to the single-line format above.
 
+**Bundled extension with auto-refresh**: Load `gemini-cookie-sync-extension`
+unpacked in Chrome. Its background worker pushes rotated cookies to the local
+server through `POST /v1/cookies` shortly after Google rotates them and every
+10 minutes. Point `cookie_file` at a writable JSON file so the refresh survives
+a server restart. See `gemini-cookie-sync-extension/SETUP.md`.
+
 ### Authenticated account path and XSRF token
 
 If the signed-in Gemini page URL contains an account index, such as:

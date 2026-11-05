@@ -3605,6 +3605,7 @@ import urllib.error
 import ssl
 import os
 import hashlib
+import tempfile
 import threading
 
 try:
@@ -3824,13 +3825,181 @@ def _get_httpx_client():
         return _httpx_client
 
 
+def _extract_sapisid(cookie_str: str) -> str:
+    if not cookie_str:
+        return ""
+    m = re.search(r"(?:^|;\s*)SAPISID=([^;\s]+)", cookie_str)
+    return m.group(1) if m else ""
+
+
+def _normalize_model_tickets(raw_tickets) -> dict:
+    """Validate ``model_tickets`` before persisting or applying them.
+
+    This fork stores the *full* ``X-Goog-Ext-525001261-Jspb`` header value
+    (a JSON array) keyed by family (``flash``, ``pro``, ...), because the
+    upstream routes on that header verbatim. The extension therefore sends
+    the header it captured, not just the 16-hex ticket id embedded at index 4.
+    Invalid entries are dropped rather than written into config.
+    """
+    if not isinstance(raw_tickets, dict):
+        return {}
+    clean = {}
+    for mk, mv in raw_tickets.items():
+        if len(clean) >= 32:
+            break
+        if not isinstance(mk, str) or not isinstance(mv, str):
+            continue
+        key = mk.strip()
+        value = mv.strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,47}", key):
+            continue
+        if not value or len(value) > 8192 or any(c in value for c in "\r\n\x00"):
+            continue
+        try:
+            parsed = json.loads(value)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            continue
+        if not isinstance(parsed, list) or len(parsed) < 5:
+            continue
+        ticket = parsed[4]
+        if not isinstance(ticket, str) or not re.fullmatch(r"[0-9a-f]{16}", ticket.strip().lower()):
+            continue
+        clean[key] = value
+    return clean
+
+
+def _normalize_metadata(data: dict) -> dict:
+    meta = {}
+    for k in ("xsrf_token", "gemini_bl"):
+        val = data.get(k)
+        if isinstance(val, str) and val.strip() and len(val) <= 4096 and not any(c in val for c in "\r\n\x00"):
+            meta[k] = val.strip()
+    au = data.get("auth_user")
+    if isinstance(au, (int, str)) and not isinstance(au, bool) and str(au).strip().isdigit():
+        meta["auth_user"] = str(au).strip()
+    tickets = _normalize_model_tickets(data.get("model_tickets"))
+    if tickets:
+        meta["model_tickets"] = tickets
+    return meta
+
+
+def update_cookie_payload(data: dict) -> tuple:
+    """Validate and apply a pushed cookie payload. Returns (ok, err_msg, status)."""
+    global _cookie_cache
+    if not isinstance(data, dict):
+        return False, "invalid JSON object", 400
+    raw_cookie = data.get("cookie")
+    if not isinstance(raw_cookie, str) or not raw_cookie.strip():
+        return False, "missing or invalid cookie field", 400
+    cookie_str = raw_cookie.strip()
+    if len(cookie_str) > 16384 or any(c in cookie_str for c in "\r\n\x00"):
+        return False, "invalid characters or length in cookie field", 400
+    sapisid = _extract_sapisid(cookie_str)
+    meta = _normalize_metadata(data)
+
+    with _cookie_file_lock:
+        cached_str, cached_sapisid, _cached_mtime = _cookie_cache
+        cf = CONFIG.get("cookie_file")
+        existing = {}
+        disk_cookie = ""
+        disk_sapisid = None
+        if cf and os.path.exists(cf):
+            try:
+                with open(cf, "r", encoding="utf-8-sig") as rf:
+                    raw_existing = rf.read().strip()
+                if raw_existing.startswith("{"):
+                    loaded = json.loads(raw_existing)
+                    if isinstance(loaded, dict):
+                        existing = loaded
+                        disk_cookie = existing.get("cookie", "") or ""
+                        disk_sapisid = existing.get("sapisid") or _extract_sapisid(disk_cookie)
+                else:
+                    disk_cookie = raw_existing
+                    disk_sapisid = _extract_sapisid(disk_cookie) or None
+            except Exception as e:
+                log(f"Cookie read error: {e}")
+                return False, "failed to read cookie file", 500
+
+        if cached_str:
+            current_cookie, current_sapisid = cached_str, cached_sapisid
+        else:
+            current_cookie, current_sapisid = disk_cookie, (disk_sapisid or None)
+        same_cookie = cookie_str == current_cookie and (sapisid or None) == current_sapisid
+
+        cur_tickets = dict(CONFIG.get("model_tickets") or {})
+        new_tickets = meta.get("model_tickets") or {}
+        disk_tickets = _normalize_model_tickets(existing.get("model_tickets"))
+        merged_tickets = dict(cur_tickets)
+        merged_tickets.update(disk_tickets)
+        merged_tickets.update(new_tickets)
+        merged_tickets = _normalize_model_tickets(merged_tickets)
+        tickets_changed = merged_tickets != cur_tickets
+        scalar_changed = any(
+            meta.get(k) != CONFIG.get(k) for k in meta if k != "model_tickets"
+        )
+        if same_cookie and not tickets_changed and not scalar_changed:
+            # Refresh the cache from disk when it was cold; nothing to write.
+            if cf and not cached_str and os.path.exists(cf):
+                try:
+                    _cookie_cache = (cookie_str, sapisid or None, os.path.getmtime(cf))
+                except OSError:
+                    pass
+            return True, "", 200
+
+        existing["cookie"] = cookie_str
+        if sapisid:
+            existing["sapisid"] = sapisid
+        else:
+            existing.pop("sapisid", None)
+        if merged_tickets:
+            existing["model_tickets"] = merged_tickets
+        else:
+            existing.pop("model_tickets", None)
+        for k, v in meta.items():
+            if k != "model_tickets":
+                existing[k] = v
+
+        mtime = 0
+        if cf:
+            tmp_path = None
+            try:
+                parent_dir = os.path.dirname(os.path.abspath(cf)) or "."
+                fd, tmp_path = tempfile.mkstemp(dir=parent_dir, prefix=".cookie-", suffix=".tmp")
+                with os.fdopen(fd, "w", encoding="utf-8") as wf:
+                    json.dump(existing, wf, ensure_ascii=False, indent=2)
+                os.replace(tmp_path, cf)
+                tmp_path = None
+                mtime = os.path.getmtime(cf)
+            except Exception as e:
+                if tmp_path and os.path.exists(tmp_path):
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+                log(f"Cookie persist error: {e}")
+                return False, "failed to persist cookie file", 500
+
+        with _config_lock_ctx():
+            for k, v in meta.items():
+                if k != "model_tickets":
+                    CONFIG[k] = v
+            if merged_tickets:
+                CONFIG["model_tickets"] = merged_tickets
+            elif "model_tickets" in CONFIG:
+                CONFIG.pop("model_tickets", None)
+        _cookie_cache = (cookie_str, sapisid or None, mtime)
+        log("Updated cookies via /v1/cookies")
+        return True, "", 200
+
+
 def load_cookie() -> tuple:
     """Load cookie from file with mtime-based caching."""
     global _cookie_cache, _cookie_last_mtime_check
     cookie_file = CONFIG.get("cookie_file")
-    if not cookie_file or not os.path.exists(cookie_file):
-        return "", None
     cached_str, cached_sapisid, cached_mtime = _cookie_cache
+    if not cookie_file or not os.path.exists(cookie_file):
+        # A pushed payload can live in memory even without a cookie_file.
+        return cached_str, cached_sapisid
     try:
         # Throttle mtime checks to avoid redundant I/O on filesystems with
         # coarse mtime granularity (e.g., FAT, some network mounts).
@@ -3839,35 +4008,39 @@ def load_cookie() -> tuple:
             # Return cached value without hitting disk.
             if cached_str:
                 return cached_str, cached_sapisid
-        _cookie_last_mtime_check = now
-        mtime = os.path.getmtime(cookie_file)
-        if mtime == cached_mtime and cached_str:
-            return cached_str, cached_sapisid
         # Serialize file reads and associated CONFIG updates to avoid
         # redundant I/O, partial reads, and interleaved config mutations
         # under concurrent requests.
         with _cookie_file_lock:
+            cached_str, cached_sapisid, cached_mtime = _cookie_cache
             # Re-check mtime after acquiring lock (another thread may have updated).
             mtime = os.path.getmtime(cookie_file)
             if mtime == cached_mtime and cached_str:
+                _cookie_last_mtime_check = now
                 return cached_str, cached_sapisid
-            with open(cookie_file, "r") as f:
+            _cookie_last_mtime_check = now
+            with open(cookie_file, "r", encoding="utf-8-sig") as f:
                 content = f.read().strip()
             if content.startswith("{"):
                 data = json.loads(content)
                 cookie_str = data.get("cookie", "")
-                sapisid = data.get("sapisid", "")
+                sapisid = data.get("sapisid", "") or _extract_sapisid(cookie_str)
                 # The bundled extension exports {cookie, sapisid, auth_user,
                 # xsrf_token, gemini_bl} in one file. Ignore the extra fields and
                 # StreamGenerate goes out without its `at` form field (HTTP 400)
                 # and with whatever stale build label happens to be configured,
                 # so sync them here: pointing cookie_file at the export must be
                 # enough on its own.
+                meta = _normalize_metadata(data)
                 with _config_lock_ctx():
                     if data.get("xsrf_token"):
                         CONFIG["xsrf_token"] = data["xsrf_token"]
                     if data.get("auth_user") not in (None, ""):
                         CONFIG["auth_user"] = data["auth_user"]
+                    if "model_tickets" in meta:
+                        cur_tickets = dict(CONFIG.get("model_tickets") or {})
+                        cur_tickets.update(meta["model_tickets"])
+                        CONFIG["model_tickets"] = cur_tickets
                     # The export's build label loses to a live one: the startup fetch
                     # and the 405 auto-refresh both write CONFIG first, and an
                     # operator-pinned label (anything but the built-in default) is
@@ -3880,8 +4053,7 @@ def load_cookie() -> tuple:
                             CONFIG["gemini_bl"] = data["gemini_bl"]
             else:
                 cookie_str = content
-                pairs = dict(p.split("=", 1) for p in cookie_str.split("; ") if "=" in p)
-                sapisid = pairs.get("SAPISID", "")
+                sapisid = _extract_sapisid(cookie_str)
         # One atomic swap: a reader either sees the whole old entry or the
         # whole new one.
         _cookie_cache = (cookie_str, sapisid or None, mtime)
@@ -12625,6 +12797,7 @@ import time
 import uuid
 import re
 import hmac
+import ipaddress
 import threading
 import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -12632,7 +12805,14 @@ from socketserver import ThreadingMixIn
 
 from gemini_web2api.config import CONFIG
 from gemini_web2api.models import MODELS, resolve_model, ticket_for
-from gemini_web2api.gemini import generate, generate_stream, log, GeminiError, trace
+from gemini_web2api.gemini import (
+    generate,
+    generate_stream,
+    log,
+    GeminiError,
+    trace,
+    update_cookie_payload,
+)
 from gemini_web2api.tools import (
     looks_like_tool_call,
     messages_to_prompt,
@@ -12681,6 +12861,15 @@ from gemini_web2api import __version__
 ERR_INVALID_REQUEST = "invalid_request_error"
 ERR_RATE_LIMIT = "rate_limit_error"
 ERR_API = "api_error"
+
+
+def _is_loopback(ip_str: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip_str)
+        mapped = getattr(addr, "ipv4_mapped", None)
+        return addr.is_loopback or bool(mapped and mapped.is_loopback)
+    except (ValueError, TypeError):
+        return False
 
 # Gap between SSE keep-alive comments while a buffered turn still works
 # upstream. Must stay well under every client's idle/chunk timeout (OpenCode
@@ -13092,6 +13281,18 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     def _send_cors_headers(self):
         """Send CORS headers if applicable."""
+        if self._route_path() == "/v1/cookies":
+            # The cookie-sync endpoint is called from the bundled extension.
+            # Keep its CORS grant narrow instead of reusing the API wildcard.
+            origin = self.headers.get("Origin", "")
+            if origin.startswith("chrome-extension://"):
+                self.send_header("Access-Control-Allow-Origin", origin)
+                self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+                self.send_header(
+                    "Access-Control-Allow-Headers",
+                    "Content-Type, X-Gemini-Cookie-Sync",
+                )
+            return
         origin = self._cors_origin()
         if origin:
             self.send_header("Access-Control-Allow-Origin", origin)
@@ -13366,6 +13567,22 @@ class GeminiHandler(BaseHTTPRequestHandler):
         return path not in ("/", "/health")
 
     def do_OPTIONS(self):
+        if self._route_path() == "/v1/cookies":
+            origin = self.headers.get("Origin", "")
+            if not origin.startswith("chrome-extension://"):
+                self.send_response(403)
+                self.end_headers()
+                return
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+            self.send_header(
+                "Access-Control-Allow-Headers",
+                "Content-Type, X-Gemini-Cookie-Sync",
+            )
+            self.send_header("Access-Control-Max-Age", "86400")
+            self.end_headers()
+            return
         requested = self.headers.get("Access-Control-Request-Headers")
         self.send_response(204)
         self._send_cors_headers()
@@ -13454,6 +13671,17 @@ class GeminiHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             path = self._route_path()
+            if path == "/v1/cookies":
+                # Cookie rotation arrives from the extension without an API
+                # key, so this route does its own header/host/loopback checks
+                # instead of the generic key + Origin policy below.
+                if not self.headers.get("Content-Type", "").startswith("application/json"):
+                    self.send_api_error(415, "Content-Type must be application/json", ERR_INVALID_REQUEST)
+                    return
+                body = self._read_request_body()
+                trace(f"CLIENT -> PROXY ({path})", body)
+                self._handle_update_cookies(body)
+                return
             if self._needs_auth(path) and not self._authorized():
                 self.send_api_error(401, "invalid api key", ERR_INVALID_REQUEST, "invalid_api_key")
                 return
@@ -13934,6 +14162,47 @@ class GeminiHandler(BaseHTTPRequestHandler):
         return text, tool_calls
 
     # ─── /v1/chat/completions ─────────────────────────────────────────────────
+
+    # ─── /v1/cookies ──────────────────────────────────────────────────────────
+
+    def _cookie_sync_allowed(self) -> bool:
+        """Authorize a cookie rotation push from the bundled extension.
+
+        The extension cannot send an API key, so the endpoint relies on what a
+        browser CSRF / DNS-rebinding request cannot forge: the custom header,
+        an extension Origin (when present), a loopback Host, and -- when no
+        api_keys are configured -- a loopback client address. With api_keys,
+        non-loopback clients must still authenticate normally.
+        """
+        origin = self.headers.get("Origin", "")
+        if origin and not origin.startswith("chrome-extension://"):
+            return False
+        if self.headers.get("X-Gemini-Cookie-Sync") != "1":
+            return False
+        host = self.headers.get("Host", "")
+        if host:
+            hostname = (urllib.parse.urlsplit("//" + host).hostname or "").lower()
+            if hostname and hostname not in ("127.0.0.1", "localhost", "::1"):
+                return False
+        client_ip = self.client_address[0] if self.client_address else ""
+        if not _is_loopback(client_ip):
+            if not (CONFIG.get("api_keys") and self._authorized()):
+                return False
+        return True
+
+    def _handle_update_cookies(self, body: bytes):
+        if not self._cookie_sync_allowed():
+            self.send_json({"error": {"message": "cookie sync forbidden"}}, 403)
+            return
+        req = self._parse_body(body)
+        if req is None:
+            self.send_json({"error": {"message": "invalid JSON"}}, 400)
+            return
+        ok, err_msg, status = update_cookie_payload(req)
+        if not ok:
+            self.send_json({"error": {"message": err_msg}}, status)
+            return
+        self.send_json({"status": "ok"})
 
     def _handle_chat(self, body: bytes):
         req = self._parse_body(body)
@@ -14995,6 +15264,106 @@ def main():
     except KeyboardInterrupt:
         print("\nStopped.")
         server.shutdown()
+
+
+# ==== flowfix11:begin (401 cookie/auth fix; patch.py) ====
+_FF11_AUTH = {"ts": 0.0, "logged": False}
+_ff11_prev_status_error = _status_error
+_ff11_prev_classify5 = _ff5_classify
+_ff11_prev_classify10 = _ff10_classify
+
+
+def _ff11_cookie_map(cookie_str):
+    out = {}
+    for part in re.split(r";\s*", cookie_str or ""):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
+def _ff11_auth_recent():
+    return time.time() - _FF11_AUTH["ts"] < 60
+
+
+def _build_headers(ticket: str = None) -> dict:
+    """Same as before, but: Authorization (SAPISIDHASH) is opt-in.
+
+    The browser sends only cookies + the `at` token to StreamGenerate. A stale
+    `sapisid` from the cookie-file JSON produced a wrong hash -> HTTP 401 even
+    with valid cookies. Set CONFIG["send_sapisidhash"] = true to restore it
+    (the SAPISID is then taken from the cookie string itself).
+    """
+    account_prefix = _account_prefix()
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Origin": "https://gemini.google.com",
+        "Referer": f"https://gemini.google.com{account_prefix}/app",
+        "X-Same-Domain": "1",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    }
+    if account_prefix:
+        headers["X-Goog-AuthUser"] = str(CONFIG["auth_user"])
+    cookie_str, json_sapisid = load_cookie()
+    cookie_str = (cookie_str or "").replace("\r", "").replace("\n", "").strip()
+    cmap = _ff11_cookie_map(cookie_str)
+    if cookie_str:
+        headers["Cookie"] = cookie_str
+        if not _FF11_AUTH["logged"]:
+            _FF11_AUTH["logged"] = True
+            log("[fix11] cookie names sent: " + ", ".join(sorted(cmap)) if cmap
+                else "[fix11] cookie string has no name=value pairs")
+            if "__Secure-1PSID" not in cmap and "__Secure-3PSID" not in cmap \
+                    and "SID" not in cmap:
+                log("[fix11] WARNING: no __Secure-1PSID/SID cookie -- the session "
+                    "is not logged in, Google will answer 401/400")
+            if "__Secure-1PSIDTS" not in cmap:
+                log("[fix11] WARNING: no __Secure-1PSIDTS cookie (re-export cookies)")
+    else:
+        if not _FF11_AUTH["logged"]:
+            _FF11_AUTH["logged"] = True
+            log("[fix11] WARNING: no cookie loaded (cookie_file=%r exists=%s)" % (
+                CONFIG.get("cookie_file"),
+                bool(CONFIG.get("cookie_file")
+                     and os.path.exists(CONFIG["cookie_file"]))))
+    if CONFIG.get("send_sapisidhash", False):
+        sapisid = (cmap.get("SAPISID") or cmap.get("__Secure-3PAPISID")
+                   or json_sapisid)
+        if sapisid:
+            headers["Authorization"] = make_sapisidhash(sapisid)
+    if ticket:
+        from gemini_web2api.models import TICKET_HEADER
+        headers[TICKET_HEADER] = ticket
+    return headers
+
+
+def _status_error(status):
+    err = _ff11_prev_status_error(status)
+    if status in (401, 403):
+        _FF11_AUTH["ts"] = time.time()
+        _FF11_AUTH["logged"] = False      # re-log cookie names on the next request
+        log("[fix11] Google rejected the session (HTTP %s). Re-export cookies "
+            "from a logged-in gemini.google.com tab (need __Secure-1PSID and "
+            "__Secure-1PSIDTS) and check cookie_file path: %r"
+            % (status, CONFIG.get("cookie_file")))
+        err = GeminiError(
+            "HTTP %s from Gemini upstream -- cookie rejected or expired; "
+            "re-export cookies and check cookie_file" % status, status=status)
+    return err
+
+
+def _ff5_classify(text):
+    if _ff11_auth_recent():
+        return None            # auth is broken: do not burn 3 calls per request
+    return _ff11_prev_classify5(text)
+
+
+def _ff10_classify(text, labels):
+    if _ff11_auth_recent():
+        return None
+    return _ff11_prev_classify10(text, labels)
+# ==== flowfix11:end ====
+
 
 
 if __name__ == "__main__":

@@ -520,13 +520,16 @@ class StreamingEndpointTests(unittest.TestCase):
         CONFIG.clear()
         CONFIG.update(self.original_config)
 
-    def post_json(self, path, payload):
+    def post_json(self, path, payload, headers=None):
+        req_headers = {"Content-Type": "application/json"}
+        if headers:
+            req_headers.update(headers)
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
         connection.request(
             "POST",
             path,
             body=json.dumps(payload),
-            headers={"Content-Type": "application/json"},
+            headers=req_headers,
         )
         response = connection.getresponse()
         body = response.read().decode()
@@ -1935,6 +1938,167 @@ class StreamingEndpointTests(unittest.TestCase):
                 error = json.loads(body)["error"]
                 self.assertEqual(error["code"], "method_not_allowed")
                 self.assertEqual(error["type"], "invalid_request_error")
+
+    def test_v1_cookies_updates_memory_preserves_metadata_and_blocks_csrf(self):
+        import gemini_web2api as single_file
+        from gemini_web2api.gemini import load_cookie
+
+        flash_ticket = (
+            '[1,null,null,null,"fbb127bbb056c959",null,null,0,'
+            '[4,5,6,8,4,5,6,8],null,null,1,null,null,1,1,"561701FD",'
+            'null,null,[[6,908199999],[1789884088,624000000]]]'
+        )
+        pro_ticket = (
+            '[1,null,null,null,"e6fa609c3fa255c0",null,null,0,'
+            '[4,5,6,8,4,5,6,8],null,null,1,null,null,3,1,"561701FD",'
+            'null,null,[[6,908199999],[1789884088,624000000]]]'
+        )
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as tf:
+            json.dump(
+                {
+                    "cookie": "SID=old; SAPISID=sapi_old",
+                    "sapisid": "sapi_old",
+                    "xsrf_token": "xsrf_keep",
+                    "gemini_bl": "boq_keep_p0",
+                    "auth_user": "2",
+                    "model_tickets": {"pro": pro_ticket},
+                },
+                tf,
+            )
+            temp_path = tf.name
+
+        sync_headers = {
+            "X-Gemini-Cookie-Sync": "1",
+            "Origin": "chrome-extension://abcdefghijklmnop",
+        }
+        previous_cache = single_file._cookie_cache
+        previous_mtime_check = single_file._cookie_last_mtime_check
+        single_file._cookie_cache = ("", None, 0)
+        single_file._cookie_last_mtime_check = 0
+        try:
+            with mock.patch.dict(CONFIG, {"cookie_file": temp_path, "api_keys": [],
+                                          "model_tickets": {}}):
+                # Missing X-Gemini-Cookie-Sync header -> 403.
+                csrf_status, _, _ = self.post_json(
+                    "/v1/cookies",
+                    {"cookie": "SID=evil; SAPISID=evil"},
+                )
+                self.assertEqual(csrf_status, 403)
+
+                # Non-extension Origin -> 403.
+                web_origin_status, _, _ = self.post_json(
+                    "/v1/cookies",
+                    {"cookie": "SID=evil; SAPISID=evil"},
+                    headers={"X-Gemini-Cookie-Sync": "1", "Origin": "http://localhost:3000"},
+                )
+                self.assertEqual(web_origin_status, 403)
+
+                # DNS-rebinding Host -> 403.
+                rebind_status, _, _ = self.post_json(
+                    "/v1/cookies",
+                    {"cookie": "SID=evil; SAPISID=evil"},
+                    headers={"X-Gemini-Cookie-Sync": "1", "Host": "evil.example:8081"},
+                )
+                self.assertEqual(rebind_status, 403)
+
+                # A real extension preflight gets the narrow CORS grant.
+                connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+                connection.request(
+                    "OPTIONS",
+                    "/v1/cookies",
+                    headers={
+                        "Origin": "chrome-extension://abcdefghijklmnop",
+                        "Access-Control-Request-Method": "POST",
+                        "Access-Control-Request-Headers": "content-type, x-gemini-cookie-sync",
+                    },
+                )
+                preflight = connection.getresponse()
+                preflight.read()
+                connection.close()
+                self.assertEqual(preflight.status, 204)
+                self.assertEqual(
+                    preflight.getheader("Access-Control-Allow-Origin"),
+                    "chrome-extension://abcdefghijklmnop",
+                )
+
+                # Valid extension push -> 200, memory and disk updated.
+                status, _, body = self.post_json(
+                    "/v1/cookies",
+                    {
+                        "cookie": "SID=new_sid; __Secure-1PSIDTS=ts_new; SAPISID=sapi_new",
+                        "auth_user": 1,
+                    },
+                    headers=sync_headers,
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(json.loads(body)["status"], "ok")
+
+                cookie_str, sapisid = load_cookie()
+                self.assertEqual(
+                    cookie_str,
+                    "SID=new_sid; __Secure-1PSIDTS=ts_new; SAPISID=sapi_new",
+                )
+                self.assertEqual(sapisid, "sapi_new")
+                self.assertEqual(CONFIG["auth_user"], "1")
+                self.assertEqual(CONFIG["model_tickets"], {"pro": pro_ticket})
+
+                with open(temp_path, "r", encoding="utf-8") as rf:
+                    saved = json.load(rf)
+                self.assertEqual(saved["cookie"], cookie_str)
+                self.assertEqual(saved["sapisid"], "sapi_new")
+                self.assertEqual(saved["xsrf_token"], "xsrf_keep")
+                self.assertEqual(saved["gemini_bl"], "boq_keep_p0")
+                self.assertEqual(saved["auth_user"], "1")
+                self.assertEqual(saved["model_tickets"], {"pro": pro_ticket})
+
+                # Ticket-only update with unchanged cookies merges additively
+                # and drops values that are not full, validated header strings.
+                status2, _, _ = self.post_json(
+                    "/v1/cookies",
+                    {
+                        "cookie": cookie_str,
+                        "model_tickets": {
+                            "flash": flash_ticket,
+                            "bad key!": flash_ticket,
+                            "auto": "95A4C0ABCBA24364",
+                        },
+                    },
+                    headers=sync_headers,
+                )
+                self.assertEqual(status2, 200)
+                self.assertEqual(
+                    CONFIG["model_tickets"],
+                    {"pro": pro_ticket, "flash": flash_ticket},
+                )
+                with open(temp_path, "r", encoding="utf-8") as rf2:
+                    saved2 = json.load(rf2)
+                self.assertEqual(
+                    saved2["model_tickets"],
+                    {"pro": pro_ticket, "flash": flash_ticket},
+                )
+
+                # CR/LF injection -> 400.
+                crlf_status, _, _ = self.post_json(
+                    "/v1/cookies",
+                    {"cookie": "SID=bad\r\nX-Injected: 1"},
+                    headers=sync_headers,
+                )
+                self.assertEqual(crlf_status, 400)
+
+                # A cold load reads model_tickets from disk into CONFIG.
+                single_file._cookie_cache = ("", None, 0)
+                single_file._cookie_last_mtime_check = 0
+                CONFIG["model_tickets"] = {}
+                load_cookie()
+                self.assertEqual(
+                    CONFIG["model_tickets"],
+                    {"pro": pro_ticket, "flash": flash_ticket},
+                )
+        finally:
+            single_file._cookie_cache = previous_cache
+            single_file._cookie_last_mtime_check = previous_mtime_check
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
 
 
 class GenerateStreamTests(unittest.TestCase):
