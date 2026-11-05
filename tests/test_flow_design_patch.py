@@ -67,5 +67,51 @@ class NewFile(unittest.TestCase):
         self.assertEqual(len(F._ff5_act_needs_read_problems([tc], msgs, ctx)), 1)
 
 
+class ContinuedRead(unittest.TestCase):
+    def test_finished_truncation_does_not_block_edit(self):
+        msgs = [{"role": "user",
+                 "content": "Implement thêm endpoint v1/health redirect google"}]
+        msgs += _call(0, "read", {"filePath": "server.py"},
+                      "1: a\n[Output truncated. Continue reading with offset: 100]")
+        msgs += _call(1, "read", {"filePath": "server.py", "offset": 100}, "100: b")
+        ctx = F._analyze(msgs)
+        self.assertEqual(ctx.pattern, "CHANGE")
+        tm = F.ToolMap({"read"}, {"read": {"filePath", "offset", "limit"}}, {})
+        _step, stop = F._ff5_evidence_gate(ctx, msgs, tm)
+        self.assertIsNone(stop)
+
+    def test_unfinished_truncation_without_offset_still_blocks_edit(self):
+        msgs = [{"role": "user",
+                 "content": "Implement thêm endpoint v1/health redirect google"}]
+        msgs += _call(0, "read", {"filePath": "server.py"},
+                      "1: a\n[Output truncated. Continue reading with offset: 100]")
+        ctx = F._analyze(msgs)
+        tm = F.ToolMap({"read"}, {"read": {"filePath", "limit"}}, {})
+        _step, stop = F._ff5_evidence_gate(ctx, msgs, tm)
+        self.assertTrue(stop)
+        self.assertNotIn("read failed", stop)
+
+    def test_failed_continuation_does_not_finish_truncation(self):
+        msgs = [{"role": "user",
+                 "content": "Implement thêm endpoint v1/health redirect google"}]
+        msgs += _call(0, "read", {"filePath": "server.py"},
+                      "1: a\n[Output truncated. Continue reading with offset: 100]")
+        msgs += _call(1, "read", {"filePath": "server.py", "offset": 100},
+                      "Error: cannot read server.py")
+        ctx = F._analyze(msgs)
+        self.assertEqual(
+            [p for _i, p, _n in F._ff4_unfinished(F._answered_calls(msgs))],
+            ["server.py"])
+        tm = F.ToolMap({"read"}, {"read": {"filePath", "limit"}}, {})
+        _step, stop = F._ff5_evidence_gate(ctx, msgs, tm)
+        self.assertTrue(stop)
+
+    def test_named_create_file_is_still_create(self):
+        ctx = F._analyze([{"role": "user",
+                           "content": "create util.py with a helper"}])
+        self.assertEqual(ctx.pattern, "CREATE")
+        self.assertEqual(ctx.target, "util.py")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1886,7 +1886,9 @@ def _analyze(messages):
         if det:
             ctx.pattern, ctx.fix = det
         elif ctx.pattern in (None, "CHANGE") and _c("fix_create_flow") \
-                and _create_intent(ctx.folded, ctx.scannable, ctx.last):
+                and _create_intent(ctx.folded, ctx.scannable, ctx.last) \
+                and (_named_files(ctx)
+                     or _MERGE_RE.search((ctx.folded or "").lower())):
             ctx.pattern = "CREATE"
             files = _named_files(ctx)
             ctx.target = files[0] if files else ""
@@ -3437,7 +3439,9 @@ def _analyze(messages):
                 and not _clarified(messages, ctx.idx)):
             folded = _ff4_scrub(ctx.folded or "")
             if (not _REVIEW_RE.search(folded.lower())
-                    and _create_intent(folded, ctx.scannable, ctx.last)):
+                    and _create_intent(folded, ctx.scannable, ctx.last)
+                    and (_named_files(ctx)
+                         or _MERGE_RE.search(folded.lower()))):
                 files = _named_files(ctx)
                 ctx.pattern = "CREATE"
                 ctx.fix = False
@@ -3506,11 +3510,12 @@ def _ff4_truncations(ev):
 
 
 def _ff4_unfinished(ev):
-    """Truncations with no later read at or beyond the offset they asked for."""
+    """Truncations with no later *successful* read at or beyond their offset."""
     out = []
     for i, path, nxt in _ff4_truncations(ev):
         later = [_ff4_off(x["args"]) for x in ev[i + 1:]
-                 if x["kind"] == "read" and _call_path(x["args"]) == path]
+                 if x["kind"] == "read" and _read_ok(x)
+                 and T._path_seen(path, [_call_path(x["args"])])]
         if not any(o >= nxt for o in later):
             out.append((i, path, nxt))
     return out
@@ -4040,6 +4045,9 @@ def _ff5_status_detail(e):
     if e.get("kind") == "read":
         if not res.strip():
             return f"{path}: the read tool returned no content"
+        if _ff5_status(e) == "partial":
+            return (f"{path}: the read was cut off and could not be continued "
+                    "to the end")
         return f"{path}: read failed -- {res[:180]}"
     if e.get("kind") == "act":
         if not res.strip():
@@ -4127,9 +4135,16 @@ def _ff5_evidence_gate(ctx, messages, tm):
                     "rest before doing anything else: " + names + ".",
                     [c for _p, c in conts], True, tm.names({"read"})), None
 
-    # 2. "partial" without an offset parameter: the proxy cannot continue it.
-    #    Never let that partial text justify a write.
-    partial = [e for e in reads if _ff5_status(e) == "partial"]
+    # 2. "partial" reads that no later successful read has completed. A
+    #    truncation that was continued to the end is finished and must not
+    #    block the edit; a partial read the proxy cannot track (no path, or an
+    #    unknown cut marker) still fails closed.
+    finished = {i for i, _p, _n in _ff4_truncations(ev)}
+    finished -= {i for i, _p, _n in _ff4_unfinished(ev)}
+    partial = [e for i, e in enumerate(ev)
+               if e["kind"] == "read"
+               and _ff5_status(e) == "partial"
+               and i not in finished]
     if partial and edit_expected:
         detail = "; ".join(_ff5_status_detail(e) for e in partial[:3])
         if _ff5_vi(ctx):
