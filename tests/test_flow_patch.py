@@ -1,4 +1,5 @@
 import json
+import re
 import unittest
 from unittest import mock
 
@@ -968,6 +969,192 @@ class EvidencePatchTests(unittest.TestCase):
             for i in (3, 7, 9)) + "\n```"
         self.assertEqual(tools.unverified_quotes(real, msgs), [])
         self.assertEqual(len(tools.unverified_quotes(fake, msgs)), 3)
+
+# ---------------------------------------------------------------------------
+# flowfix10: ambiguity-aware pattern routing
+#
+# A weak review verb ("tim", "find", "check") plus a code noun ("source",
+# "code") must not force the review flow when the user only asked to
+# understand the code. The deterministic regex stays the cheap filter; a
+# model tie-break is consulted only for weak review labels that conflict
+# with EXPLAIN/CHANGE/TOOL_DEMAND. ``OTHER`` means no forced flow and
+# ``AMBIGUOUS`` asks the client to pick through CLARIFY_MARK.
+# ---------------------------------------------------------------------------
+
+REPRO = ("giải thích phần xử lý tìm pattern flow. trường hợp regex ra nhiều "
+         "pattern trùng thì source đang làm thế nào")
+
+
+def _folded10(text):
+    scannable = F._strip_code_spans(text)
+    return re.sub(r"\s+", " ", F._fold_diacritics(scannable)).strip()
+
+
+class _Ff10Case(unittest.TestCase):
+    def setUp(self):
+        self._saved_model = getattr(F._ff5_tls, "model", None)
+        self._saved_flags = {
+            k: CONFIG.get(k)
+            for k in ("flow_tiebreak", "flow_ask_on_ambiguity",
+                      "flow_ask_when_unclear")
+        }
+        F._ff10_cache.clear()
+        F._ff5_cache.clear()
+
+    def tearDown(self):
+        F._ff5_tls.model = self._saved_model
+        F._ff10_cache.clear()
+        F._ff5_cache.clear()
+        for key, value in self._saved_flags.items():
+            if value is None:
+                CONFIG.pop(key, None)
+            else:
+                CONFIG[key] = value
+
+    def _with_model(self, reply):
+        """Install a fake classifier model; return (patch, calls)."""
+        F._ff5_tls.model = (7, 0, None, None)
+        calls = []
+
+        def fake_generate(prompt, *args, **kwargs):
+            calls.append(prompt)
+            return reply
+
+        return mock.patch.object(F, "generate", fake_generate), calls
+
+
+class Ff10LexicalDemotion(_Ff10Case):
+    def test_explain_question_is_not_a_source_review(self):
+        self.assertFalse(F._is_source_review(_folded10(REPRO)))
+
+    def test_explain_question_has_no_deterministic_pattern(self):
+        self.assertIsNone(F.detect_task_pattern([_u(REPRO)]))
+
+    def test_explain_question_analyzes_as_explain(self):
+        ctx = F._analyze([_u(REPRO)])
+        self.assertEqual("EXPLAIN", ctx.pattern)
+
+    def test_candidates_mark_the_weak_review_and_the_explain(self):
+        cands = F._ff10_candidates([_u(REPRO)])
+        self.assertEqual(["GENERIC_REVIEW", "EXPLAIN"],
+                         [c["label"] for c in cands])
+
+    def test_weak_review_plus_explain_is_ambiguous(self):
+        self.assertTrue(F._ff10_ambiguous(F._ff10_candidates([_u(REPRO)])))
+
+    def test_strong_review_is_not_demoted(self):
+        self.assertTrue(F._is_source_review(
+            _folded10("review the source code and report bugs")))
+        self.assertEqual(
+            "GENERIC_REVIEW",
+            F.detect_task_pattern([_u("review source code and find bugs")]))
+
+    def test_weak_review_without_explain_marker_still_reviews(self):
+        self.assertTrue(F._is_source_review(_folded10("check the source code")))
+        self.assertEqual(
+            "GENERIC_REVIEW",
+            F.detect_task_pattern([_u("check the source code")]))
+
+    def test_weak_review_with_a_defect_noun_is_not_demoted(self):
+        text = "giải thích giúp, source có bug ở phần tìm pattern không"
+        self.assertTrue(F._is_source_review(_folded10(text)))
+
+    def test_wrong_is_a_defect_noun(self):
+        self.assertTrue(F._is_source_review(
+            _folded10("find what is wrong in the source code")))
+        self.assertEqual(
+            "GENERIC_REVIEW",
+            F.detect_task_pattern([_u("find what is wrong in the source code")]))
+
+    def test_file_review_is_demoted_in_an_explain_question(self):
+        text = "đọc server.py rồi giải thích flow xử lý"
+        folded = _folded10(text)
+        self.assertTrue(F._ff10_orig_file_review(folded, text))
+        self.assertFalse(F._is_file_review(folded, text))
+
+
+class Ff10ModelTieBreak(_Ff10Case):
+    def test_model_can_override_the_weak_review(self):
+        patch, calls = self._with_model("GENERIC_REVIEW")
+        with patch:
+            ctx = F._analyze([_u(REPRO)])
+        self.assertEqual("GENERIC_REVIEW", ctx.pattern)
+        self.assertEqual(1, len(calls))
+        self.assertFalse(ctx.fix)
+
+    def test_model_can_override_a_weak_review_to_explain(self):
+        text = "check how the source handles errors"
+        self.assertEqual("GENERIC_REVIEW", F._analyze([_u(text)]).pattern)
+        patch, calls = self._with_model("EXPLAIN")
+        with patch:
+            ctx = F._analyze([_u(text)])
+        self.assertEqual("EXPLAIN", ctx.pattern)
+        self.assertEqual(1, len(calls))
+
+    def test_other_means_free_run_and_no_banner(self):
+        patch, _ = self._with_model("OTHER")
+        with patch:
+            ctx = F._analyze([_u(REPRO)])
+            banner = F._ff5_spec_banner([_u(REPRO)])
+        self.assertIsNone(ctx.pattern)
+        self.assertTrue(ctx.free_run)
+        self.assertFalse(ctx.ask_user)
+        self.assertEqual("", banner)
+
+    def test_ambiguous_asks_the_client(self):
+        patch, _ = self._with_model("AMBIGUOUS")
+        with patch:
+            ctx = F._analyze([_u(REPRO)])
+            text = F.clarification_text([_u(REPRO)])
+        self.assertTrue(ctx.ask_user)
+        self.assertIn(F.CLARIFY_MARK, text)
+
+    def test_ambiguous_does_not_ask_when_the_flag_is_off(self):
+        CONFIG["flow_ask_on_ambiguity"] = False
+        patch, _ = self._with_model("AMBIGUOUS")
+        with patch:
+            ctx = F._analyze([_u(REPRO)])
+            text = F.clarification_text([_u(REPRO)])
+        self.assertFalse(getattr(ctx, "ask_user", False))
+        self.assertIsNone(text)
+
+    def test_strong_review_never_calls_the_model(self):
+        patch, calls = self._with_model("EXPLAIN")
+        with patch:
+            ctx = F._analyze([_u("review source code and find bugs")])
+        self.assertEqual("GENERIC_REVIEW", ctx.pattern)
+        self.assertEqual([], calls)
+
+    def test_tiebreak_can_be_disabled(self):
+        CONFIG["flow_tiebreak"] = False
+        patch, calls = self._with_model("GENERIC_REVIEW")
+        with patch:
+            ctx = F._analyze([_u(REPRO)])
+        self.assertEqual("EXPLAIN", ctx.pattern)
+        self.assertEqual([], calls)
+
+    def test_unavailable_model_keeps_the_deterministic_pattern(self):
+        F._ff5_tls.model = None
+        with mock.patch.object(F, "generate",
+                               side_effect=AssertionError("must not call")):
+            ctx = F._analyze([_u(REPRO)])
+        self.assertEqual("EXPLAIN", ctx.pattern)
+
+
+class Ff10Regressions(_Ff10Case):
+    def test_how_can_i_fix_stays_explain(self):
+        self.assertEqual("EXPLAIN", F._analyze([_u("how can I fix a.py?")]).pattern)
+
+    def test_fix_request_stays_change(self):
+        self.assertEqual("CHANGE", F._analyze([_u("fix a.py")]).pattern)
+
+    def test_file_review_is_not_weak(self):
+        cands = F._ff10_candidates([_u("review server.py and find bugs")])
+        self.assertEqual(["FILE_REVIEW"], [c["label"] for c in cands])
+        self.assertFalse(cands[0]["weak"])
+        self.assertEqual("FILE_REVIEW",
+                         F.detect_task_pattern([_u("review server.py and find bugs")]))
+
 
 if __name__ == "__main__":
     unittest.main()

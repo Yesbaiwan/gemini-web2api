@@ -12235,6 +12235,361 @@ class _Ff9Trunc:
 _FF4_TRUNC_RE = _Ff9Trunc()
 # ==== flowfix9:end ====
 
+# ==== flowfix10:begin (ambiguity-aware pattern routing) ====
+# Problem: detect_task_pattern() commits the first regex match. A weak review
+# verb ("tim", "find", "doc", "check") plus a code noun ("source", "code") is
+# enough to force the GENERIC_REVIEW flow even when those tokens sit in
+# different clauses and the user only asked to understand the code:
+#     "giai thich phan xu ly tim pattern flow ... source dang lam the nao"
+# This layer keeps the regex as the cheap filter, demotes a weak review match
+# inside an explain/understand question, and lets a model tie-break only the
+# genuinely ambiguous cases. OTHER = no forced flow (free run); AMBIGUOUS =
+# ask the client to choose through the existing CLARIFY_MARK path.
+import hashlib as _ff10_hashlib
+
+_FF10_DEFAULTS = {
+    "flow_tiebreak": True,
+    "flow_ask_on_ambiguity": True,
+}
+
+
+def _c10(key):
+    return CONFIG.get(key, _FF10_DEFAULTS[key])
+
+
+# Previous definitions, captured before this section overrides them. The file
+# is a stack of patch layers: later definitions win, so every wrapper keeps a
+# handle on the layer below it.
+_ff10_orig_source_review = _is_source_review
+_ff10_orig_file_review = _is_file_review
+_ff10_prev_analyze = _analyze
+_ff10_prev_clarification = clarification_text
+_ff10_prev_spec_banner = _ff5_spec_banner
+_ff10_prev_install = install
+
+
+_FF10_EXPLAIN_RE = re.compile(
+    r"\b(?:giai\s+thich|tim\s+hieu|explain|describe|summari[sz]e|how|why|what|"
+    r"where|which|hoat\s+dong|nhu\s+the\s+nao|ra\s+sao|la\s+gi|tai\s+sao|o\s+dau|"
+    r"walk\s+me\s+through|tell\s+me)\b",
+    re.IGNORECASE,
+)
+_FF10_DEFECT_RE = re.compile(
+    r"\b(?:bug|bugs|error|errors|issue|issues|problem|problems|vulnerab\w*|"
+    r"security|correctness|wrong|incorrect|insecure|unsafe|risk|risks|loi|"
+    r"van\s+de|lo\s+hong|sai|hong|fail\w*|crash\w*|broken|leak\w*|"
+    r"deadlock|overflow|regression\w*)\b",
+    re.IGNORECASE,
+)
+_FF10_REVIEW_LABELS = ("GENERIC_REVIEW", "FILE_REVIEW")
+_FF10_OTHER_LABELS = ("EXPLAIN", "CHANGE", "TOOL_DEMAND")
+
+
+def _ff10_scrub(folded):
+    """Apply the flowfix4 noise scrub when that layer is present."""
+    scrub = globals().get("_ff4_scrub")
+    return scrub(folded or "") if scrub else (folded or "")
+
+
+def _ff10_is_source_review(folded):
+    f = _ff10_scrub(folded)
+    if not _ff10_orig_source_review(f):
+        return False
+    if _SOURCE_STRONG_VERB_RE.search(f):
+        return True
+    # "tim hieu source", "doc source roi giai thich", "find how ... works":
+    # a weak review verb inside an explain question is not an audit request.
+    if _FF10_EXPLAIN_RE.search(f) and not _FF10_DEFECT_RE.search(f):
+        return False
+    return True
+
+
+def _ff10_is_file_review(folded, scannable):
+    f = _ff10_scrub(folded)
+    if not _ff10_orig_file_review(f, scannable):
+        return False
+    if _SOURCE_STRONG_VERB_RE.search(f):
+        return True
+    if _FF10_EXPLAIN_RE.search(f) and not _FF10_DEFECT_RE.search(f):
+        return False
+    return True
+
+
+# detect_task_pattern()/review_demanded()/pending_tool_request() resolve these
+# names from this module, so assigning them here changes the deterministic gate
+# too. T is this same module (the flat bundle aliases every submodule).
+_is_source_review = _ff10_is_source_review
+_is_file_review = _ff10_is_file_review
+T._is_source_review = _is_source_review
+T._is_file_review = _is_file_review
+
+
+def _ff10_last_user(messages):
+    last = None
+    for msg in messages or []:
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            last = T._stringify_content(msg.get("content", ""))
+    return last
+
+
+def _ff10_message_text(messages):
+    last = _ff10_last_user(messages)
+    if not last:
+        return "", "", ""
+    scannable = T._strip_code_spans(last)
+    folded = re.sub(r"\s+", " ", T._fold_diacritics(scannable)).strip()
+    return last, scannable, folded
+
+
+def _ff10_candidates(messages):
+    """Weighted intent candidates for the newest user turn.
+
+    Deterministic routing still owns the final answer; this list only tells the
+    tie-breaker which labels are plausible. Review labels carry ``weak=True``
+    when they matched without a strong verb -- those are the only labels the
+    model is allowed to overrule.
+    """
+    last, scannable, folded = _ff10_message_text(messages)
+    if not last:
+        return []
+    scrubbed = _ff10_scrub(folded)
+    raw_file = _ff10_orig_file_review(scrubbed, scannable)
+    raw_source = not raw_file and _ff10_orig_source_review(scrubbed)
+    strong = bool(_SOURCE_STRONG_VERB_RE.search(folded))
+    explain = bool(_FF10_EXPLAIN_RE.search(folded)) or bool(
+        _is_code_question(last))
+    change = _is_change_request(folded, scannable, last)
+    out = []
+    if raw_file:
+        out.append({"label": "FILE_REVIEW", "score": 3 if strong else 1,
+                    "weak": not strong})
+    elif raw_source:
+        out.append({"label": "GENERIC_REVIEW", "score": 3 if strong else 1,
+                    "weak": not strong})
+    if explain:
+        out.append({"label": "EXPLAIN", "score": 2, "weak": False})
+    if change:
+        out.append({"label": "CHANGE", "score": 2, "weak": False})
+    if _TOOL_DEMAND_RE.search(folded):
+        out.append({"label": "TOOL_DEMAND", "score": 1, "weak": False})
+    return out
+
+
+def _ff10_ambiguous(cands):
+    labels = {c["label"] for c in cands}
+    if len(labels) < 2:
+        return False
+    weak_review = any(c["weak"] for c in cands
+                      if c["label"] in _FF10_REVIEW_LABELS)
+    if not weak_review:
+        return False
+    return bool(labels & set(_FF10_OTHER_LABELS))
+
+
+_ff10_cache = {}
+
+
+def _ff10_classify_prompt(text, labels):
+    lines = [
+        "Classify one coding-agent request. A deterministic classifier is "
+        "unsure between these labels:",
+    ]
+    for k in labels:
+        if k in _FF5_CATALOG:
+            lines.append("- %s: %s" % (k, _FF5_CATALOG[k]))
+    lines += [
+        "- OTHER: none of these labels fits; let the agent use tools freely.",
+        "- AMBIGUOUS: two labels genuinely fit and only the user can choose.",
+        "",
+        "Rules:",
+        "- Choose EXPLAIN when the user asks to understand or explain how code works.",
+        "- Choose GENERIC_REVIEW only when the user asks to audit or review for bugs.",
+        "- Never infer a code change unless the user asked for one.",
+        "",
+        "Request:",
+        (text or "").strip()[:600],
+        "",
+        "Answer with ONE label only, nothing else.",
+    ]
+    return T.defuse_extension_words("\n".join(lines))
+
+
+def _ff10_classify(text, labels):
+    text = (text or "").strip()
+    labels = [x for x in labels if x]
+    if len(text) < 8 or not labels:
+        return None
+    key = _ff10_hashlib.sha1(
+        (text + "\x00" + "|".join(labels)).encode("utf-8", "ignore")).hexdigest()
+    if key in _ff10_cache:
+        return _ff10_cache[key]
+    model = getattr(_ff5_tls, "model", None)
+    if not model:
+        return None
+    label, answered = None, False
+    try:
+        m_id, m_think, m_extra, m_ticket = model
+        raw = generate(_ff10_classify_prompt(text, labels), m_id, m_think,
+                       None, m_extra, m_ticket)
+        if raw and not T.looks_like_canned_failure(raw):
+            answered = True
+            for w in re.findall(r"[A-Z][A-Z_]{3,}", raw.upper()):
+                if w in labels:
+                    label = w
+                    break
+                if w in ("OTHER", "NONE"):
+                    label = "OTHER"
+                    break
+                if w == "AMBIGUOUS":
+                    label = "AMBIGUOUS"
+                    break
+        log("[flow10] model tie-break -> %s" % (label or "none"))
+    except Exception as e:
+        log("[flow10] model tie-break failed, keeping deterministic label: %s" % e)
+    if answered:
+        if len(_ff10_cache) > 300:
+            _ff10_cache.clear()
+        _ff10_cache[key] = label
+    return label
+
+
+def _ff10_apply_pattern(ctx, messages, label):
+    if not label:
+        return ctx
+    if label in ("OTHER", "NONE"):
+        ctx.pattern = None
+        ctx.free_run = True
+        ctx.ask_user = False
+        perm = _ff5_permissions(messages, None, getattr(ctx, "fix", False))
+        perm.scope = _ff5_scope(ctx, messages)
+        ctx.perm = perm
+        ctx.no_edit = not perm.edit
+        ctx.intent = ""
+        return ctx
+    if label == "PLAN":
+        ctx.plan = True
+        label = "EXPLAIN"
+    _ff5_apply_label(ctx, label)
+    if ctx.pattern in ("CHANGE", "CREATE", "DEBUG"):
+        ctx.fix = bool(_FIX_RE.search((ctx.folded or "").lower()))
+    perm = _ff5_permissions(messages, ctx.pattern, getattr(ctx, "fix", False))
+    if ctx.pattern in ("CHANGE", "CREATE") and not perm.edit:
+        log("[flow10] %s -> EXPLAIN (%s)" % (ctx.pattern, perm.reason))
+        ctx.pattern = "EXPLAIN"
+        ctx.fix = False
+        perm = _ff5_permissions(messages, ctx.pattern, False)
+    if ctx.pattern == "DEBUG" and ctx.fix and not perm.edit:
+        ctx.fix = False
+        perm = _ff5_permissions(messages, ctx.pattern, False)
+    perm.scope = _ff5_scope(ctx, messages)
+    ctx.perm = perm
+    ctx.no_edit = not perm.edit
+    ctx.intent = (ctx.pattern or "").lower()
+    ctx.free_run = False
+    ctx.ask_user = False
+    return ctx
+
+
+def _ff10_tiebreak(ctx, messages, cands):
+    if not _c10("flow_tiebreak") or not _c5("flow5_classify"):
+        return ctx
+    weak = next((c for c in cands if c["weak"]
+                 and c["label"] in _FF10_REVIEW_LABELS), None)
+    if weak is None:
+        return ctx
+    labels = [weak["label"]]
+    for c in cands:
+        if c["label"] in _FF10_OTHER_LABELS and c["label"] not in labels:
+            labels.append(c["label"])
+    labels = labels[:3]
+    label = _ff10_classify(getattr(ctx, "last", ""), labels)
+    if label == "AMBIGUOUS":
+        if _c10("flow_ask_on_ambiguity"):
+            ctx.ask_user = True
+            log("[flow10] model says AMBIGUOUS -> asking the client")
+        return ctx
+    if label in ("OTHER", "NONE"):
+        log("[flow10] model says OTHER -> free run (no forced flow)")
+        return _ff10_apply_pattern(ctx, messages, "OTHER")
+    if label:
+        return _ff10_apply_pattern(ctx, messages, label)
+    log("[flow10] tie-break unavailable -> keeping deterministic pattern %s"
+        % (getattr(ctx, "pattern", None) or "NONE"))
+    return ctx
+
+
+def _analyze(messages):
+    ctx = _ff10_prev_analyze(messages)
+    if ctx is None:
+        return ctx
+    try:
+        cands = _ff10_candidates(messages)
+        ctx.candidates = [c["label"] for c in cands]
+        ctx.ambiguous = False
+        if not _c10("flow_tiebreak") or not _ff10_ambiguous(cands):
+            return ctx
+        # High-confidence labels (CHANGE/TOOL_DEMAND/RUN_*/...) are not
+        # reviewed by the model: overriding them could grant edit rights.
+        if getattr(ctx, "pattern", None) not in (
+                None, "GENERIC_REVIEW", "FILE_REVIEW", "EXPLAIN"):
+            return ctx
+        if getattr(ctx, "pattern", None) is None:
+            # The earlier _analyze already ran the full classifier for this
+            # shape; a second call would only add latency.
+            return ctx
+        if _clarified(messages, getattr(ctx, "idx", -1)):
+            return ctx
+        ctx.ambiguous = True
+        log("[flow10] candidates=" + ", ".join(
+            "%s:%s" % (c["label"], c["score"]) for c in cands))
+        return _ff10_tiebreak(ctx, messages, cands)
+    except Exception as e:
+        log("[flow10] tie-break error: %s" % e)
+        return ctx
+
+
+def _ff10_clarify_text(text):
+    if _VI_RE.search((text or "").lower()):
+        return ("Mình thấy yêu cầu này có thể hiểu theo nhiều hướng. Bạn chọn giúp:\n"
+                "1. Review / audit source\n2. Implement / sửa code\n"
+                "3. Giải thích / tìm hiểu code\n4. Chạy một lệnh / tool cụ thể\n"
+                f"Trả lời 1-4 hoặc mô tả rõ hơn. {CLARIFY_MARK}")
+    return ("I can read this request more than one way. Please pick:\n"
+            "1. Review / audit the source\n2. Implement / change code\n"
+            "3. Explain / understand the code\n4. Run a specific command/tool\n"
+            f"Reply 1-4 or describe it more precisely. {CLARIFY_MARK}")
+
+
+def clarification_text(messages):
+    if _c10("flow_ask_on_ambiguity") and messages:
+        try:
+            ctx = _analyze(messages)
+            if ctx is not None and getattr(ctx, "ask_user", False):
+                log("[flow10] ambiguous request -> asking the client to pick a pattern")
+                return _ff10_clarify_text(getattr(ctx, "last", ""))
+        except Exception as e:
+            log("[flow10] clarification error: %s" % e)
+    return _ff10_prev_clarification(messages)
+
+
+def _ff5_spec_banner(messages):
+    try:
+        ctx = _analyze(messages)
+        if ctx is not None and getattr(ctx, "free_run", False):
+            return ""
+    except Exception as e:
+        log("[flow10] banner guard error: %s" % e)
+    return _ff10_prev_spec_banner(messages)
+
+
+def install():
+    _ff10_prev_install()
+    for k, v in _FF10_DEFAULTS.items():
+        CONFIG.setdefault(k, v)
+
+
+# ==== flowfix10:end ====
+
 
 # ==============================================================================
 # Section: server.py
