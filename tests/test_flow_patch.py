@@ -1156,5 +1156,42 @@ class Ff10Regressions(_Ff10Case):
                          F.detect_task_pattern([_u("review server.py and find bugs")]))
 
 
+class Ff10GrepPlannerPaths(unittest.TestCase):
+    """Grep snippets must not become read targets (live session 11/5)."""
+
+    GREP = (
+        "Found 2 matches\n"
+        + r"D:\Project\gemini-web2api\tests\test_flow_patch.py:" + "\n"
+        + r'  Line 207: msgs += _call(0, "glob", {"pattern": "**/*.py"}, '
+        + r'"pkg/a.py\npkg/b.py")' + "\n"
+        + r"  Line 8: import gemini_web2api.flow_patch as F" + "\n"
+    )
+
+    def _msgs(self):
+        return [_u(REPRO)] + _call(0, "grep", {"pattern": "pattern"}, self.GREP)
+
+    def test_search_hits_only_keeps_header_paths(self):
+        ev = F._answered_calls(self._msgs())
+        self.assertEqual(
+            {"D:/Project/gemini-web2api/tests/test_flow_patch.py": 1},
+            F._search_hits(ev))
+
+    def test_planned_read_uses_the_full_path(self):
+        step = F.plan_for(self._msgs(), _tm())
+        self.assertEqual("read", step.name, msg=getattr(step, "instruction", ""))
+        paths = [json.loads(c["function"]["arguments"])["filePath"]
+                 for c in (step.calls or [])]
+        self.assertEqual(["D:/Project/gemini-web2api/tests/test_flow_patch.py"],
+                         paths)
+
+    def test_base_planner_uses_the_full_path(self):
+        step = F._base_plan_for(self._msgs(), _tm())
+        self.assertEqual("read", step.name, msg=getattr(step, "instruction", ""))
+        paths = [json.loads(c["function"]["arguments"])["filePath"]
+                 for c in (step.calls or [])]
+        self.assertEqual(["D:/Project/gemini-web2api/tests/test_flow_patch.py"],
+                         paths)
+
+
 if __name__ == "__main__":
     unittest.main()

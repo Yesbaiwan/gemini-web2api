@@ -1747,6 +1747,7 @@ def looks_like_upstream_error(text: str) -> bool:
 _CANNED_FAILURE_RES = (
     re.compile(r"sorry,?\s+something\s+went\s+wrong", re.IGNORECASE),
     re.compile(r"please\s+try\s+your\s+request\s+again", re.IGNORECASE),
+    re.compile(r"\bi\s+seem\s+to\s+be\s+encountering\s+an\s+error\b", re.IGNORECASE),
     re.compile(r"i\s+can'?t\s+use\s+[a-z][a-z .'\-]{0,60}?\s+because\s+"
                r"required\s+.{0,80}?(settings|permissions)\s+are\s+off",
                re.IGNORECASE),
@@ -4115,13 +4116,23 @@ def extract_response_text(raw: str) -> str:
     raise_bard_error(raw)
     best_text = ""
     best_call = ""
+    canned = ""
     for line in raw.split("\n"):
         for t in _extract_texts_from_line(line):
             if looks_like_tool_call(t):
                 if len(t) > len(best_call):
                     best_call = t
+            elif looks_like_canned_failure(t):
+                canned = t
             elif len(t) > len(best_text):
                 best_text = t
+    if canned:
+        # Gemini can abort mid-answer: the payload keeps the partial text and
+        # replaces the rest with a canned failure sentence. Longest-wins then
+        # returned the cut-off sentence as a finished turn (live 11/5), so the
+        # retry layer never learned the generation failed. Return the
+        # placeholder instead; every caller already treats it as an error.
+        return clean_text(canned)
     return clean_text(best_call or best_text)
 
 
@@ -5858,12 +5869,7 @@ def _base_plan_for(messages, tm, ctx=None):
                         "Locate the relevant code with grep/glob first.",
                         [call] if call else None, True, tm.names(kinds))
         if not read_set and tm.first("read"):
-            hits = {}
-            for e in ev:
-                if e["kind"] == "search":
-                    body = e["result"].replace("\\", "/")
-                    for f in T._files_in(body):
-                        hits[f] = hits.get(f, 0) + body.count(f)
+            hits = _search_hits(ev)
             pool = list(hits) or listing
             pool = _core_sources(pool, True, 400) or pool
             ranked = _rank(pool, kws, hits)[:2] or pool[:1]
@@ -7388,12 +7394,7 @@ def _plan_explain(ctx, ev, tm):
         s = _survey_step(pat, tm, ev, 1, total)
         if s:
             return s
-    hits = {}
-    for e in ev:
-        if e["kind"] == "search":
-            body = e["result"].replace("\\", "/")
-            for f in T._files_in(body):
-                hits[f] = hits.get(f, 0) + body.count(f)
+    hits = _search_hits(ev)
     if not code_read and not known and can_read:
         if hits:
             pool = list(hits)
@@ -7580,6 +7581,27 @@ def _listing_files(ev):
             if not (not drive.match(l) and "/" in l
                     and any(drive.match(o) and o.endswith("/" + l)
                             for o in low))]
+
+
+def _search_hits(ev):
+    """``{path: occurrences}`` for real files named in search/grep results.
+
+    Scraping ``_files_in`` over the whole result is wrong for grep output:
+    the body embeds source snippets, so it invents filenames (``a.py``,
+    ``pkg/a.py\\npkg/b.py``) and drops drive letters
+    (``D:/Project/...`` -> ``Project/...``).  The planner then read paths
+    that do not exist.  ``_listing_files`` reads the grep header lines
+    instead, which keeps the full path; count occurrences in the body so
+    the ranking still reflects how often a file matched.
+    """
+    hits = {}
+    for e in ev:
+        if e["kind"] != "search":
+            continue
+        body = e["result"].replace("\\", "/")
+        for f in _listing_files([e]):
+            hits[f] = hits.get(f, 0) + max(1, body.count(f))
+    return hits
 
 
 # --------------------------------------------------------------------------
@@ -8322,8 +8344,10 @@ _FF4_CANNED = (
 
 def _ff4_extend_canned():
     cur = tuple(T._CANNED_FAILURE_RES)
-    if not any(r in cur for r in _FF4_CANNED):
-        T._CANNED_FAILURE_RES = cur + _FF4_CANNED
+    have = {r.pattern for r in cur}
+    extra = tuple(r for r in _FF4_CANNED if r.pattern not in have)
+    if extra:
+        T._CANNED_FAILURE_RES = cur + extra
 
 
 # --------------------------------------------------------------------------

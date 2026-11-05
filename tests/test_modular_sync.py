@@ -31,6 +31,7 @@ from gemini_web2api.tools import (
     implement_test_owed,
     is_read_retry_reason,
     is_required_tool_choice,
+    looks_like_canned_failure,
     looks_like_missed_tool_call,
     looks_like_tool_call,
     looks_like_upstream_error,
@@ -2000,6 +2001,28 @@ class ResponseExtractionTests(unittest.TestCase):
         raw = _wrb_line_parts(["ngan.", long])
 
         self.assertEqual(extract_response_text(raw).strip(), long.strip())
+
+    def test_an_upstream_error_sentence_wins_over_the_partial_answer(self):
+        """Gemini aborted mid-answer: the payload keeps the partial text and
+        then replaces the rest with a canned failure sentence.
+
+        Returning the longer partial text (the old longest-wins rule) handed
+        the client a sentence cut mid-word and told the retry layer the turn
+        had finished (live session 11/5).
+        """
+        partial = ("Trong source code cua gemini_web2api: phan xu ly pattern "
+                   "flow khi regex ra nhieu pattern trung lap. " * 3)
+        canned = ("I seem to be encountering an error. Can I try something "
+                  "else for you?")
+        self.assertGreater(len(partial), len(canned))
+        raw = _wrb_line(partial) + "\n" + _wrb_line(canned)
+
+        self.assertEqual(extract_response_text(raw).strip(), canned)
+
+    def test_the_canned_sentence_can_be_detected_without_flow_patches(self):
+        canned = ("I seem to be encountering an error. Can I try something "
+                  "else for you?")
+        self.assertTrue(looks_like_canned_failure(canned))
 
     def test_json_quoted_in_prose_is_not_mistaken_for_a_call(self):
         """A fenced example carrying ``name`` must not win the tie.
