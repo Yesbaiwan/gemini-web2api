@@ -240,27 +240,63 @@ class Fallbacks(FlagConfigMixin):
 # ---------------------------------------------------------------------------
 
 class WrapperIntegration(FlagConfigMixin):
+    """The wrapper sends the lean prompt only for steps that go upstream.
+
+    ``flow_drive`` is OFF on purpose: with it on, a read step that already
+    carries its tool_call is emitted by the proxy itself and upstream is never
+    called, so there is no prompt to inspect (see test_driven_step_...).
+
+    ``F.install()`` patches module-level state (the handler method, hooks in
+    ``tools`` / ``server``, the classifier's thread-local model). setUp
+    snapshots all of it and the cleanup restores it, otherwise every test
+    module that runs after this one executes against a patched proxy.
+    """
+
     CALL_FENCE = ('```tool_call\n{"name": "read", '
                   '"arguments": {"filePath": "b.py"}}\n```')
+    # A declared tool of the WRONG kind for a read step. (An undeclared name
+    # would be dropped by the original retry loop, which re-asks by itself, so
+    # the flow layer would never see it and never add its own nudge.)
+    WRONG_KIND = ('```tool_call\n{"name": "glob", '
+                  '"arguments": {"pattern": "*.py"}}\n```')
+    ASK = [{"role": "user", "content": "read b.py to explain it"}]
 
     def setUp(self):
         super().setUp()
+        from gemini_web2api import server, tools as T
+        saved = []
+        for mod, names in (
+                (T, ("_is_change_request", "change_demanded",
+                     "_is_file_review", "_is_source_review",
+                     "_CANNED_FAILURE_RES", "_TASK_BANNER_HOOK")),
+                (server, ("change_demanded", "_is_file_review",
+                          "_is_source_review"))):
+            for name in names:
+                saved.append((mod, name, getattr(mod, name, None)))
+        handler = server.GeminiHandler._generate_with_tool_retry
+        tls_model = getattr(F._ff5_tls, "model", None)
+
+        def restore():
+            for mod, name, value in saved:
+                setattr(mod, name, value)
+            server.GeminiHandler._generate_with_tool_retry = handler
+            F._ff5_tls.model = tls_model
+
+        self.addCleanup(restore)
+
         CONFIG["flow_enabled"] = True
-        CONFIG["flow_drive"] = True
+        CONFIG["flow_drive"] = False
         CONFIG["flow_mapreduce"] = False
         CONFIG["flow_max_retries"] = 1
         CONFIG["tool_retry_on_miss"] = True
         CONFIG["tool_stream"] = False
         # keep the integration deterministic: the transition guards must not
         # rewrite the planned step underneath us
-        self._guards = mock.patch.object(F, "_ff5_plan_after",
-                                         side_effect=lambda s, *a, **k: s)
-        self._guards.start()
-        self.addCleanup(self._guards.stop)
+        guards = mock.patch.object(F, "_ff5_plan_after",
+                                   side_effect=lambda s, *a, **k: s)
+        guards.start()
+        self.addCleanup(guards.stop)
         F.install()
-        self.addCleanup(lambda: setattr(
-            F.__dict__.get("_ff5_orig_marker", object), "x", 1)
-            if False else None)
 
     def _run(self, generate, prompt, messages):
         params = dict(prompt=prompt, model_id=2, think_mode=1, file_refs=None,
@@ -281,39 +317,47 @@ class WrapperIntegration(FlagConfigMixin):
     def test_flag_on_sends_the_lean_step_prompt(self):
         CONFIG["flow6_lean_prompt"] = True
         long_hist = "OLD-CHAT-HISTORY-" + "w" * 4000
-        prompt = long_hist
-        messages = [{"role": "user", "content": "read b.py to explain it"}]
         gen = mock.Mock(return_value=self.CALL_FENCE)
-        self._run(gen, prompt, messages)
+        self._run(gen, long_hist, list(self.ASK))
+        gen.assert_called()
         sent = gen.call_args[0][0]
         self.assertNotIn(long_hist, sent)          # history replaced
+        self.assertIn("Goal: read b.py to explain it", sent)
         self.assertIn("[FLOW ", sent)             # the directive survived
         self.assertIn("Allowed tools this turn:", sent)
-        self.assertLess(len(sent), len(prompt))   # strictly shorter
+        self.assertIn('"name": "read"', sent)     # schema of the allowed tool
+        self.assertLess(len(sent), len(long_hist))
 
     def test_flag_off_sends_the_full_prompt(self):
         CONFIG["flow6_lean_prompt"] = False
         long_hist = "OLD-CHAT-HISTORY-" + "w" * 4000
-        prompt = long_hist
-        messages = [{"role": "user", "content": "read b.py to explain it"}]
         gen = mock.Mock(return_value=self.CALL_FENCE)
-        self._run(gen, prompt, messages)
+        self._run(gen, long_hist, list(self.ASK))
+        gen.assert_called()
         sent = gen.call_args[0][0]
         self.assertIn(long_hist, sent)            # original behaviour
         self.assertIn("[FLOW ", sent)
+        self.assertNotIn("Goal:", sent)
 
     def test_retry_nudge_still_appends_to_the_step_prompt(self):
         CONFIG["flow6_lean_prompt"] = True
         CONFIG["flow_max_retries"] = 1
         prompt = "FULL-PROMPT-MARKER-" + "v" * 2000
-        messages = [{"role": "user", "content": "read b.py to explain it"}]
-        bad = '```tool_call\n{"name": "bogus_not_allowed", "arguments": {}}\n```'
-        gen = mock.Mock(side_effect=[bad, self.CALL_FENCE])
-        self._run(gen, prompt, messages)
+        gen = mock.Mock(side_effect=[self.WRONG_KIND, self.CALL_FENCE])
+        self._run(gen, prompt, list(self.ASK))
         self.assertEqual(gen.call_count, 2)
         second = gen.call_args[0][0]
         self.assertIn("That is not allowed at this step", second)
+        self.assertIn("Goal:", second)            # still the lean prompt
         self.assertNotIn(prompt, second)          # nudge went on the lean prompt
+
+    def test_driven_step_never_reaches_upstream(self):
+        CONFIG["flow_drive"] = True
+        CONFIG["flow6_lean_prompt"] = True
+        gen = mock.Mock(return_value=self.CALL_FENCE)
+        _text, calls = self._run(gen, "prompt", list(self.ASK))
+        gen.assert_not_called()
+        self.assertTrue(calls)
 
 
 # ---------------------------------------------------------------------------

@@ -1304,12 +1304,9 @@ def install():
         # -> every call below falls back to the original `prompt` verbatim.
         lean = (_c5("flow6_lean_prompt") and ctx is not None
                 and getattr(ctx, "pattern", None) in _FF5_SPEC
-                and not getattr(step, "drive", False))
+                and not _ff5_step_driven(step))
         step_prompt = build_step_prompt(ctx, step, messages, tm) if lean else None
         if step_prompt is not None:
-            defs = _ff5_allowed_tool_defs(step, tm)
-            if defs:
-                step_prompt += "\n".join(defs) + "\n"
             _ff5_metric("lean_prompt_used")
             _ff5_metric("lean_saved_chars", max(0, len(prompt) - len(step_prompt)))
 
@@ -4368,13 +4365,21 @@ def select_evidence_for_step(stage, messages, *, budget=2400):
         elif stage == "edit":
             for e in reversed(ev):
                 p = path_of(e)
-                if e["kind"] in ("read", "act") and p \
-                        and p.lower() not in seen_paths:
-                    seen_paths.add(p.lower())
-                    add(f"target: {p}")
-                elif e["kind"] == "act" and _ff5_status(e) == "failed":
+                if e["kind"] == "act" and _ff5_status(e) == "failed":
                     add("edit_failed: "
                         + _ff5_lean_line(_ff5_status_detail(e), 220))
+                elif e["kind"] == "read" and p:
+                    st = _ff5_status(e)
+                    low = p.lower()
+                    if st in ("success", "partial") and low not in seen_paths:
+                        seen_paths.add(low)
+                        add(f"read: {p}")
+                    elif st == "failed" and low not in seen_bad:
+                        seen_bad.add(low)
+                        add(f"failed_read: {p} (do not read it again)")
+                elif e["kind"] == "act" and p and p.lower() not in seen_paths:
+                    seen_paths.add(p.lower())
+                    add(f"target: {p}")
                 if len(out) >= _FF5_LEAN_CAPS["edit"]:
                     break
         elif stage == "diff":
@@ -4424,7 +4429,11 @@ def select_evidence_for_step(stage, messages, *, budget=2400):
             for f in _ff5_exec_findings(ev):
                 add(f"verified: {f}")
     except Exception as e:
+        # Propagate: build_step_prompt turns ANY failure into "use the full
+        # prompt". Swallowing here would ship a lean prompt whose evidence is
+        # silently incomplete.
         log(f"[fix6] lean evidence error (stage={stage}): {e}")
+        raise
     return out
 
 
@@ -4447,11 +4456,21 @@ def _ff5_allowed_tool_defs(step, tm):
     return blocks
 
 
+def _ff5_step_driven(step):
+    """True when the proxy emits this step's call itself (no upstream call).
+
+    A step that carries a ready tool_call is only "driven" while flow_drive is
+    on; with it off the same step is guided, i.e. it DOES go upstream and so
+    it is exactly the kind of step the lean prompt is for.
+    """
+    return bool(getattr(step, "drive", False) and _cfg("flow_drive"))
+
+
 def _build_step_prompt_core(ctx, step, messages, tm):
     """Dựng lean step prompt; trả None nếu step nằm ngoài phạm vi lean path."""
     if step is None or tm is None:
         return None
-    if getattr(step, "drive", False) or getattr(step, "local_text", None) is not None:
+    if _ff5_step_driven(step) or getattr(step, "local_text", None) is not None:
         return None
     pattern = _ff5_pat(getattr(ctx, "pattern", None))
     if pattern not in _FF5_SPEC:
@@ -4481,6 +4500,10 @@ def _build_step_prompt_core(ctx, step, messages, tm):
     if evidence:
         lines.append("Evidence:")
         lines.extend(evidence)
+    defs = _ff5_allowed_tool_defs(step, tm)
+    if defs:
+        lines.append("Allowed tool schemas:")
+        lines.extend(defs)
     lines.append("")          # blank line before Step.directive()
     return "\n".join(lines)
 

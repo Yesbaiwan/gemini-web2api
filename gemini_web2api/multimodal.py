@@ -362,6 +362,18 @@ def _fetch_once_proxy(url, timeout=30):
         return e.code, None, b""
 
 
+def _ssrf7_hop(url, parsed, ip):
+    """One validated hop: ``(status, location, body)``.
+
+    The single network seam of fetch_image_bytes, so redirect handling can be
+    tested without sockets. The caller has already checked that ``ip`` is
+    public; through a proxy the IP cannot be pinned and redirects stay manual.
+    """
+    if CONFIG.get("proxy"):
+        return _fetch_once_proxy(url)
+    return _fetch_once(parsed, ip)
+
+
 def fetch_image_bytes(url):
     """Fetch an image from ``url``; b"" on any refusal or failure."""
     cur = url
@@ -375,10 +387,7 @@ def fetch_image_bytes(url):
             log(f"Image fetch blocked for non-public target: {parsed.hostname or 'none'}")
             return b""
         try:
-            if CONFIG.get("proxy"):
-                status, loc, data = _fetch_once_proxy(cur)
-            else:
-                status, loc, data = _fetch_once(parsed, ip)
+            status, loc, data = _ssrf7_hop(cur, parsed, ip)
         except Exception as e:
             log(f"Image fetch failed: {e}")
             return b""
