@@ -1,3 +1,5 @@
+importScripts("ticket-map.js");
+
 // Background service worker: auto-syncs rotated Google/Gemini session cookies
 // to the local gemini-web2api server via POST /v1/cookies.
 const EXPORT_ORDER = [
@@ -42,21 +44,6 @@ const KEY_COOKIES = [
 const SESSION_COOKIES = ["__Secure-1PSID", "__Secure-3PSID", "SID"];
 const LOCAL_ENDPOINT = "http://127.0.0.1:8081/v1/cookies";
 
-// This fork's server stores the *full* X-Goog-Ext-525001261-Jspb header value
-// keyed by family (see gemini_web2api.py: _normalize_model_tickets). The
-// 16-hex id at index 4 is only used to validate capture; the header itself is
-// what upstream routes on.
-const TICKET_ROUTE_KEYS = {
-  "1,1": "flash",
-  "1,2": "flash-thinking",
-  "3,1": "pro",
-  "3,2": "pro-thinking",
-  "5,1": "lite-thinking",
-  "5,2": "lite-thinking",
-  "6,1": "lite",
-  "6,2": "lite-thinking"
-};
-
 let debounceTimer = null;
 let lastKeySignature = "";
 let lastCookieSignature = "";
@@ -83,23 +70,6 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
   { urls: ["https://gemini.google.com/*"] },
   ["requestHeaders", "extraHeaders"]
 );
-
-function parseTicketHeader(headerVal) {
-  if (!headerVal || typeof headerVal !== "string") return null;
-  if (headerVal.length > 8192 || /[\r\n\0]/.test(headerVal)) return null;
-  try {
-    const arr = JSON.parse(headerVal);
-    if (!Array.isArray(arr) || typeof arr[4] !== "string") return null;
-    const ticket = arr[4].trim().toLowerCase();
-    if (!/^[0-9a-f]{16}$/.test(ticket)) return null;
-    if (!Number.isInteger(arr[14]) || !Number.isInteger(arr[15])) return null;
-    const key = TICKET_ROUTE_KEYS[`${arr[14]},${arr[15]}`];
-    if (!key) return null;
-    return { key, header: headerVal.trim() };
-  } catch {
-    return null;
-  }
-}
 
 async function getStoredModelTickets() {
   if (cachedTickets) return { ...cachedTickets };

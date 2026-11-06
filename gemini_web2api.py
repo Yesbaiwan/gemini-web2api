@@ -246,6 +246,18 @@ MODELS = {
         "mode": 6, "think": 4, "variant": 1, "ticket": "lite",
         "desc": "Alias for gemini-flash-lite (Gemini 3.5 Flash-Lite)",
     },
+    "gemini-3.5-flash-lite-low": {
+        "mode": 6, "think": 4, "variant": 1, "ticket": "lite",
+        "desc": "Flash-Lite thinking low (family 6 variant 1)",
+    },
+    "gemini-3.5-flash-lite-medium": {
+        "mode": 6, "think": 4, "variant": 4, "ticket": "lite-medium",
+        "desc": "Flash-Lite thinking medium (family 6 variant 4)",
+    },
+    "gemini-3.5-flash-lite-high": {
+        "mode": 6, "think": 4, "variant": 2, "ticket": "lite-thinking",
+        "desc": "Flash-Lite thinking high (family 6 variant 2)",
+    },
 }
 
 
@@ -259,6 +271,7 @@ EXPECTED_TICKET_ROUTES = {
     "flash": (1, 1),
     "flash-thinking": (1, 2),
     "lite": (6, 1),
+    "lite-medium": (6, 4),
     "lite-thinking": (6, 2),
     "pro": (3, 1),
     "pro-thinking": (3, 2),
@@ -344,6 +357,43 @@ def resolve_model(model_name: str, default: str = "gemini-3.6-flash"):
     if "variant" in cfg and 80 not in extra:
         extra[80] = cfg["variant"]
     return model_name, mode_id, think_mode, None, extra or None
+
+
+# Flash-Lite thinking level selected by the OpenAI-style `reasoning_effort`
+# request field. Only the two base lite ids are re-routed: an explicit
+# -low/-medium/-high model name always wins, and other families ignore it.
+_LITE_EFFORT_MODELS = {
+    "minimal": "gemini-3.5-flash-lite-low",
+    "low": "gemini-3.5-flash-lite-low",
+    "medium": "gemini-3.5-flash-lite-medium",
+    "high": "gemini-3.5-flash-lite-high",
+}
+_LITE_BASE_MODELS = {"gemini-3.5-flash-lite", "gemini-flash-lite"}
+
+
+def _reasoning_effort(req):
+    """Return a normalized lite effort from a request body, or None.
+
+    Accepts the top-level ``reasoning_effort`` string, or the Responses-style
+    ``reasoning.effort`` nested object. Unknown values are ignored.
+    """
+    if not isinstance(req, dict):
+        return None
+    effort = req.get("reasoning_effort")
+    if not isinstance(effort, str):
+        reasoning = req.get("reasoning")
+        effort = reasoning.get("effort") if isinstance(reasoning, dict) else None
+    if not isinstance(effort, str):
+        return None
+    effort = effort.strip().lower()
+    return effort if effort in _LITE_EFFORT_MODELS else None
+
+
+def _lite_effort_model(model_name, effort):
+    """Map a base Flash-Lite model id to its effort-specific alias."""
+    if model_name in _LITE_BASE_MODELS and effort in _LITE_EFFORT_MODELS:
+        return _LITE_EFFORT_MODELS[effort]
+    return model_name
 
 
 # ==============================================================================
@@ -3839,6 +3889,8 @@ def _normalize_model_tickets(raw_tickets) -> dict:
     (a JSON array) keyed by family (``flash``, ``pro``, ...), because the
     upstream routes on that header verbatim. The extension therefore sends
     the header it captured, not just the 16-hex ticket id embedded at index 4.
+    Index 4 is optional metadata: most real captures carry ``null`` there, and
+    routing reads the ``(family, variant)`` pair at indexes 14/15 instead.
     Invalid entries are dropped rather than written into config.
     """
     if not isinstance(raw_tickets, dict):
@@ -3859,10 +3911,11 @@ def _normalize_model_tickets(raw_tickets) -> dict:
             parsed = json.loads(value)
         except (json.JSONDecodeError, ValueError, TypeError):
             continue
-        if not isinstance(parsed, list) or len(parsed) < 5:
+        if not isinstance(parsed, list) or len(parsed) < 16:
             continue
-        ticket = parsed[4]
-        if not isinstance(ticket, str) or not re.fullmatch(r"[0-9a-f]{16}", ticket.strip().lower()):
+        fam, var = parsed[14], parsed[15]
+        if (not isinstance(fam, int) or isinstance(fam, bool)
+                or not isinstance(var, int) or isinstance(var, bool)):
             continue
         clean[key] = value
     return clean
@@ -4354,6 +4407,10 @@ def check_routing(raw: str, model_id: int, extra_fields: dict = None, ticket: st
             f"but upstream served {echo[0]!r} (family={fam} variant={var}); "
             f"the model ticket in CONFIG['model_tickets'] may be missing or "
             f"expired -- refresh it from a fresh browser capture")
+        if (want_fam, want_var) in ((6, 2), (6, 4)) and (fam, var) == (6, 1):
+            log("Routing hint: upstream fell back to Flash-Lite low (6,1); "
+                "anonymous sessions or exhausted quota cannot use medium/high "
+                "tickets")
         if ticket is None:
             try:
                 from gemini_web2api.models import MODELS
@@ -8545,6 +8602,47 @@ def _ff4_offset_key(tm):
     return _pick(props, _OFFSET_KEYS)
 
 
+def _ff5_limit_key(tm):
+    name = tm.first("read")
+    props = (tm.schemas.get(name) if name else None) or set()
+    return _pick(props, _LIMIT_KEYS)
+
+
+def _ff5_enlarge_read_calls(partial, ev, tm):
+    """Retry truncated reads with a larger ``limit`` when the tool has one.
+
+    A client whose read tool exposes ``limit`` but no ``offset`` cannot be
+    continued at an offset. Re-reading the same path with a limit four times
+    the previous one (at least 4000) is the only way to get the rest of the
+    file. A path already retried more than four times is left to the caller's
+    refusal so a broken tool cannot loop forever.
+    """
+    lkey = _ff5_limit_key(tm)
+    if not lkey:
+        return []
+    out = []
+    for e in partial[:3]:
+        path = _call_path(e.get("args") or {})
+        if not path:
+            continue
+        n_reads = sum(1 for x in ev if x["kind"] == "read"
+                      and T._path_seen(path, [_call_path(x["args"])]))
+        if n_reads > 4:
+            continue
+        args = dict(e.get("args") or {})
+        try:
+            current = int(args.get(lkey)) if args.get(lkey) is not None else 0
+        except (TypeError, ValueError):
+            current = 0
+        limit = max(current * 4, 4000)
+        args[lkey] = limit
+        log(f"[flow] read truncated; retrying with limit={limit} for {path}")
+        out.append({"id": "call_" + uuid.uuid4().hex[:8], "type": "function",
+                    "function": {"name": e.get("name") or "read",
+                                 "arguments": json.dumps(args, ensure_ascii=False)}})
+    return out
+
+
 def _ff4_truncations(ev):
     """[(event_index, path, next_offset)] for reads whose output was cut off."""
     out = []
@@ -8575,12 +8673,16 @@ def _ff4_continuations(ev, okey):
     if not okey:
         return []
     out, seen = [], set()
+    deleted = _ff4_deleted(ev)
     for i, path, nxt in _ff4_unfinished(ev):
+        if any(T._path_seen(path, [p]) for p in deleted):
+            continue
         if (path, nxt) in seen:
             continue
         seen.add((path, nxt))
         n_reads = sum(1 for x in ev
-                      if x["kind"] == "read" and _call_path(x["args"]) == path)
+                      if x["kind"] == "read"
+                      and T._path_seen(path, [_call_path(x["args"])]))
         if n_reads > _FF4_MAX_CONT:
             continue
         args = dict(ev[i]["args"])
@@ -9034,6 +9136,8 @@ _FF5_TEST_SEG_RE = re.compile(
 _FF5_READFAIL_RE = re.compile(
     r"(?i)^\s*(?:error|cannot\s+(?:read|open|find)|no\s+such\s+file|file\s+not\s+found|"
     r"enoent|the\s+system\s+cannot|failed\s+to\s+read|does\s+not\s+exist|permission\s+denied)")
+_FF5_NOTFOUND_RE = re.compile(
+    r"(?i)no such file|not found|does not exist|enoent|cannot find|cannot open|can't find")
 _FF5_TRUNC_RE = re.compile(r"(?i)(?:truncated|output\s+(?:was\s+)?cut|more\s+lines|\.\.\.\s*\[?\d+\s+(?:more|lines))")
 _FF5_EXEC_FAIL_RE = re.compile(
     r"(?im)^(?:fatal:|error:|exception:|traceback \(most recent call last\)|"
@@ -9084,6 +9188,25 @@ def _ff5_status(e):
             return "failed"
         return "success"
     return "unknown"
+
+
+def _ff4_deleted(ev):
+    """Paths whose truncated read was followed by a 'not found' read.
+
+    The file disappeared between the first (truncated) read and the
+    continuation, so re-issuing the continuation would loop forever.
+    """
+    out = set()
+    for i, path, _nxt in _ff4_truncations(ev):
+        for e in ev[i + 1:]:
+            if e["kind"] != "read" or not T._path_seen(
+                    path, [_call_path(e["args"])]):
+                continue
+            res = e.get("result") or ""
+            if (_ff5_status(e) == "failed" and _FF5_READFAIL_RE.match(res)
+                    and _FF5_NOTFOUND_RE.search(res[:300])):
+                out.add(path)
+    return out
 
 
 def _ff5_status_detail(e):
@@ -9195,14 +9318,53 @@ def _ff5_evidence_gate(ctx, messages, tm):
                and _ff5_status(e) == "partial"
                and i not in finished]
     if partial and edit_expected:
+        deleted = _ff4_deleted(ev)
+        deleted_reads = []
+        for e in partial:
+            p = _call_path(e.get("args") or {})
+            if not p or not any(T._path_seen(p, [d]) for d in deleted):
+                continue
+            later = [x for x in ev
+                     if x["kind"] == "read"
+                     and T._path_seen(p, [_call_path(x["args"])])
+                     and _ff5_status(x) == "failed"
+                     and _FF5_READFAIL_RE.match(x.get("result") or "")
+                     and _FF5_NOTFOUND_RE.search((x.get("result") or "")[:300])]
+            if later:
+                deleted_reads.append(later[-1])
+        if deleted_reads:
+            detail = "; ".join(_ff5_status_detail(e) for e in deleted_reads[:3])
+            if _ff5_vi(ctx):
+                return None, ("File đã bị xóa trong lúc đọc nên mình KHÔNG sửa gì ("
+                              + detail + "). Hãy kiểm tra lại đường dẫn hoặc mở lại "
+                              "file rồi yêu cầu lại.")
+            return None, ("The file was deleted while it was being read, so I made "
+                          "NO edit (" + detail + "). Check the path or reopen the "
+                          "file and ask again.")
+        calls = _ff5_enlarge_read_calls(partial, ev, tm)
+        if calls:
+            paths = []
+            for c in calls:
+                try:
+                    args = json.loads(c["function"]["arguments"])
+                except (KeyError, TypeError, json.JSONDecodeError):
+                    args = {}
+                p = _call_path(args)
+                if p:
+                    paths.append(p)
+            names = ", ".join(sorted(set(paths)))
+            return Step(pattern, "read", 1, 1, {"read"},
+                        "A previous read was cut off. Re-read it with a larger "
+                        "limit before doing anything else: " + names + ".",
+                        calls, True, tm.names({"read"})), None
         detail = "; ".join(_ff5_status_detail(e) for e in partial[:3])
         if _ff5_vi(ctx):
             return None, ("Một lần đọc đã bị cắt và công cụ đọc không hỗ trợ "
-                          "offset nên mình KHÔNG sửa gì (" + detail + "). Hãy "
-                          "đọc lại file với giới hạn lớn hơn rồi yêu cầu lại.")
+                          "offset lẫn limit nên mình KHÔNG sửa gì (" + detail +
+                          "). Hãy đọc lại file với giới hạn lớn hơn rồi yêu cầu lại.")
         return None, ("A read was truncated and the read tool exposes no offset "
-                      "parameter, so I made NO edit (" + detail + "). Re-read the "
-                      "file with a larger limit and ask again.")
+                      "or limit parameter, so I made NO edit (" + detail + "). "
+                      "Re-read the file with a larger limit and ask again.")
 
     # 3. unknown (empty) read: retry once, then stop rather than guess.
     pending_unknown, exhausted = [], []
@@ -11439,6 +11601,8 @@ def _ff6c_filter(ctx, messages):
             return messages
         created = T._created_files(scannable, ctx.folded)
         keep_named = [f for f in _named_files(ctx) if f.lower() not in created]
+        truncated = {p for _i, p, _n in
+                     _ff4_truncations(_answered_calls(messages))}
         start = T._last_user_index(messages)
         calls, drop = {}, set()
         for msg in messages[start + 1:]:
@@ -11458,7 +11622,8 @@ def _ff6c_filter(ctx, messages):
                 body = T._stringify_content(msg.get("content"))
                 if (path and _FF5_READFAIL_RE.match(body)
                         and _FF6C_NOTFOUND_RE.search(body[:300])
-                        and not any(T._path_seen(path, [f]) for f in keep_named)):
+                        and not any(T._path_seen(path, [f]) for f in keep_named)
+                        and not any(T._path_seen(path, [p]) for p in truncated)):
                     drop.add(msg.get("tool_call_id"))
         if not drop:
             return messages
@@ -13665,6 +13830,17 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_api_error(400, err, ERR_INVALID_REQUEST)
             return None
         echo = raw if isinstance(raw, str) and raw else model_name
+        effort = _reasoning_effort(req)
+        alias = _lite_effort_model(model_name, effort)
+        if alias != model_name:
+            # Preserve an explicit @think= suffix while switching the level.
+            think_suffix = ""
+            if isinstance(raw, str) and "@think=" in raw:
+                think_suffix = raw[raw.index("@think="):]
+            model_name, model_id, think_mode, _, extra = resolve_model(
+                alias + think_suffix, default=CONFIG["default_model"])
+            from gemini_web2api.gemini import log
+            log(f"[model] reasoning_effort={effort} -> {alias}")
         # The ticket is what upstream routes on; [79]/[80] alone are ignored.
         return echo, model_name, model_id, think_mode, extra, ticket_for(model_name)
 

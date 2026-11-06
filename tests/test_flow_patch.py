@@ -518,16 +518,61 @@ class ContinuedRead(unittest.TestCase):
         _step, stop = F._ff5_evidence_gate(ctx, msgs, tm)
         self.assertIsNone(stop)
 
-    def test_unfinished_truncation_without_offset_still_blocks_edit(self):
+    def test_truncated_read_with_limit_retries_with_larger_limit(self):
+        msgs = [{"role": "user",
+                 "content": "Implement thêm endpoint v1/health redirect google"}]
+        msgs += _call(0, "read", {"filePath": "server.py", "limit": 2000},
+                      "1: a\n[Output truncated. Continue reading with offset: 100]")
+        ctx = F._analyze(msgs)
+        tm = F.ToolMap({"read"}, {"read": {"filePath", "limit"}}, {})
+        step, stop = F._ff5_evidence_gate(ctx, msgs, tm)
+        self.assertIsNone(stop)
+        self.assertEqual(step.name, "read")
+        args = json.loads(step.calls[0]["function"]["arguments"])
+        self.assertEqual(args["filePath"], "server.py")
+        self.assertGreaterEqual(args["limit"], 4000)
+
+    def test_truncated_read_without_offset_or_limit_stops(self):
         msgs = [{"role": "user",
                  "content": "Implement thêm endpoint v1/health redirect google"}]
         msgs += _call(0, "read", {"filePath": "server.py"},
                       "1: a\n[Output truncated. Continue reading with offset: 100]")
         ctx = F._analyze(msgs)
-        tm = F.ToolMap({"read"}, {"read": {"filePath", "limit"}}, {})
-        _step, stop = F._ff5_evidence_gate(ctx, msgs, tm)
+        tm = F.ToolMap({"read"}, {"read": {"filePath"}}, {})
+        step, stop = F._ff5_evidence_gate(ctx, msgs, tm)
+        self.assertIsNone(step)
         self.assertTrue(stop)
-        self.assertNotIn("read failed", stop)
+        self.assertIn("offset", stop)
+        self.assertIn("limit", stop)
+
+    def test_deleted_file_after_truncation_stops_without_reissuing(self):
+        msgs = [{"role": "user",
+                 "content": "Implement thêm endpoint v1/health redirect google"}]
+        msgs += _call(0, "read", {"filePath": "server.py"},
+                      "1: a\n[Output truncated. Continue reading with offset: 100]")
+        msgs += _call(1, "read", {"filePath": "server.py", "offset": 100},
+                      "Error: file not found")
+        ctx = F._analyze(msgs)
+        self.assertEqual(
+            [p for _i, p, _n in F._ff4_unfinished(F._answered_calls(msgs))],
+            ["server.py"])
+        tm = F.ToolMap({"read"}, {"read": {"filePath", "offset"}}, {})
+        step, stop = F._ff5_evidence_gate(ctx, msgs, tm)
+        self.assertIsNone(step)
+        self.assertTrue(stop)
+        self.assertTrue("deleted" in stop or "xóa" in stop)
+        self.assertIn("file not found", stop)
+
+    def test_filter_keeps_not_found_read_of_truncated_path(self):
+        msgs = [{"role": "user",
+                 "content": "Implement thêm endpoint v1/health redirect google"}]
+        msgs += _call(0, "read", {"filePath": "server.py"},
+                      "1: a\n[Output truncated. Continue reading with offset: 100]")
+        msgs += _call(1, "read", {"filePath": "server.py", "offset": 100},
+                      "Error: file not found")
+        ctx = F._analyze(msgs)
+        filtered = F._ff6c_filter(ctx, msgs)
+        self.assertEqual(len(filtered), len(msgs))
 
     def test_failed_continuation_does_not_finish_truncation(self):
         msgs = [{"role": "user",
@@ -540,7 +585,7 @@ class ContinuedRead(unittest.TestCase):
         self.assertEqual(
             [p for _i, p, _n in F._ff4_unfinished(F._answered_calls(msgs))],
             ["server.py"])
-        tm = F.ToolMap({"read"}, {"read": {"filePath", "limit"}}, {})
+        tm = F.ToolMap({"read"}, {"read": {"filePath"}}, {})
         _step, stop = F._ff5_evidence_gate(ctx, msgs, tm)
         self.assertTrue(stop)
 

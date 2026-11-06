@@ -116,6 +116,37 @@ The upstream does **not** route on the model name. It routes on the
 Without a ticket the upstream **ignores the requested model and answers with
 the account default** (3.1 Pro), so every model silently becomes Pro.
 
+Gemini 3.5 Flash-Lite has three thinking levels, each routed by the
+`(family, variant)` pair embedded in its ticket (indexes 14/15):
+
+| Model | Route | Ticket key |
+| --- | --- | --- |
+| `gemini-3.5-flash-lite-low` (also `gemini-3.5-flash-lite`) | (6, 1) | `lite` |
+| `gemini-3.5-flash-lite-medium` | (6, 4) | `lite-medium` |
+| `gemini-3.5-flash-lite-high` (also `gemini-3.5-flash-thinking-lite`) | (6, 2) | `lite-thinking` |
+
+Instead of switching between the three model ids, clients can select the base
+`gemini-3.5-flash-lite` model and send an OpenAI-style `reasoning_effort` (or
+`reasoning.effort`): `minimal`/`low` -> low `(6,1)`, `medium` -> medium
+`(6,4)`, `high` -> high `(6,2)`. For example, an OpenCode V2 model config can
+expose the levels as variants:
+
+```jsonc
+"gemini-3.5-flash-lite": {
+  "modelID": "gemini-3.5-flash-lite",
+  "variants": [
+    { "id": "low",    "body": { "reasoning_effort": "low" } },
+    { "id": "medium", "body": { "reasoning_effort": "medium" } },
+    { "id": "high",   "body": { "reasoning_effort": "high" } }
+  ]
+}
+```
+
+Select the base model, then the variant. `minimal` counts as low. Explicit
+`-low`/`-medium`/`-high` model names still work and are never overridden by
+`reasoning_effort`; only the lite models react to it, and other model families
+ignore it.
+
 Put one captured ticket per family in `config.json`:
 
 ```json
@@ -124,12 +155,17 @@ Put one captured ticket per family in `config.json`:
     "flash": "[1,null,null,null,\"fbb127bbb056c959\",...]",
     "flash-thinking": "...",
     "lite": "...",
+    "lite-medium": "...",
     "lite-thinking": "...",
     "pro": "...",
     "pro-thinking": "..."
   }
 }
 ```
+
+The ticket is the full `X-Goog-Ext-525001261-Jspb` header value. Index 4 is
+optional metadata: most real captures carry `null` there. Routing reads the
+`(family, variant)` pair at indexes 14/15, so a ticket with `[4]=null` is valid.
 
 To capture one: open [gemini.google.com](https://gemini.google.com), pick the
 model in the UI, send a message, then in DevTools → Network select the
@@ -143,6 +179,19 @@ Routing mismatch: requested family=5 variant=2 but upstream served '3.1 Pro'
 (family=3 variant=1); the model ticket in CONFIG['model_tickets'] may be
 missing or expired -- refresh it from a fresh browser capture
 ```
+
+Anonymous sessions or exhausted quota always fall back to Flash-Lite low
+`(6, 1)`. A medium/high request then still succeeds, but the log adds:
+
+```
+Routing hint: upstream fell back to Flash-Lite low (6,1); anonymous sessions
+or exhausted quota cannot use medium/high tickets
+```
+
+Tickets captured by the bundled Chrome extension are pushed to the server at
+runtime. They only survive a restart when `cookie_file` points at a writable
+JSON file (for example `"cookie_file": "gemini-auth.json"`); otherwise the next
+startup has no tickets and the upstream serves the account default.
 
 Re-capture the ticket for that family; nothing else needs changing.
 
@@ -454,7 +503,7 @@ resp = client.chat.completions.create(
 - **Single-turn only**: Each request is an independent conversation. Multi-turn context is simulated by including previous messages in the prompt.
 - **Rate limits**: Google may throttle high-frequency requests. The server retries automatically but sustained heavy use may be blocked.
 - **Token usage is an estimate**: `usage` is computed as `len(text) // 4`. This is a rough heuristic and can be noticeably off for Vietnamese/Chinese text and for code.
-- **Ignored request parameters**: `temperature`, `top_p`, `seed`, `logprobs`, `parallel_tool_calls`, `reasoning_effort`, `service_tier`, `store`, `metadata`, `input_audio`/`file` content parts, and the legacy `functions`/`function` role are accepted and echoed where the spec requires them, but have no effect on generation — Gemini's web endpoint exposes none of them.
+- **Ignored request parameters**: `temperature`, `top_p`, `seed`, `logprobs`, `parallel_tool_calls`, `service_tier`, `store`, `metadata`, `input_audio`/`file` content parts, and the legacy `functions`/`function` role are accepted and echoed where the spec requires them, but have no effect on generation — Gemini's web endpoint exposes none of them. `reasoning_effort` is the exception: it selects the Flash-Lite thinking level (low/medium/high) as described under "Model routing tickets"; other model families still ignore it.
 - **Only `type: "function"` tools**: other tool types (`custom`, `local_shell`, `apply_patch`, hosted tools) are dropped with a log line, so a client that depends on them sees no calls.
 - **Unsupported methods answer in JSON**: `PUT`/`PATCH` return `405 method_not_allowed`, `DELETE /v1/responses/{id}` and `GET /v1/responses/{id}` return `404 response_not_found` (nothing is stored). Unimplemented paths keep the OpenAI error shape instead of the stdlib's plain-text `501`.
 - **Upstream failures return `503`**: the status codes the spec declares for `/chat/completions` (400/401/403/404/429/500/503) and `/responses` (400/404/429/503) — never `502`, which the spec documents only for the audio endpoints.

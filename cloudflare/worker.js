@@ -203,7 +203,7 @@ var DEFAULT_CONFIG = {
 
   // ---- 模型票据（决定上游真正使用哪个模型）----
   // 键名对应 MODELS 里每个模型的 ticket 字段：
-  //   flash / flash-thinking / lite / lite-thinking / pro / pro-thinking
+  //   flash / flash-thinking / lite / lite-medium / lite-thinking / pro / pro-thinking
   // 值是从浏览器 StreamGenerate 请求头 X-Goog-Ext-525001261-Jspb
   // 原样复制的整串 JSON。抓取方法：
   //   1. 打开 https://gemini.google.com 并选择要抓取的模型
@@ -514,6 +514,27 @@ var MODELS = {
     variant: 1,     // inner[80] - 标准版
     ticket: 'lite',
     desc: 'Lightweight fast model',
+  },
+  'gemini-3.5-flash-lite-low': {
+    mode: 6,        // FLASH_LITE - 轻量快速
+    think: 4,       // AUTO
+    variant: 1,     // inner[80] - 低思考（family 6 variant 1）
+    ticket: 'lite',
+    desc: 'Flash-Lite thinking low (family 6 variant 1)',
+  },
+  'gemini-3.5-flash-lite-medium': {
+    mode: 6,        // FLASH_LITE - 轻量快速
+    think: 4,       // AUTO
+    variant: 4,     // inner[80] - 中思考（family 6 variant 4）
+    ticket: 'lite-medium',
+    desc: 'Flash-Lite thinking medium (family 6 variant 4)',
+  },
+  'gemini-3.5-flash-lite-high': {
+    mode: 6,        // FLASH_LITE - 轻量快速
+    think: 4,       // AUTO
+    variant: 2,     // inner[80] - 高思考（family 6 variant 2）
+    ticket: 'lite-thinking',
+    desc: 'Flash-Lite thinking high (family 6 variant 2)',
   },
 };
 

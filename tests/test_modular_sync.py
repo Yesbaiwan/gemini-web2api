@@ -16,12 +16,21 @@ from gemini_web2api.config import CONFIG, DEFAULT_CONFIG
 from gemini_web2api.gemini import (
     _build_headers,
     _build_payload,
+    _normalize_model_tickets,
     check_routing,
     extract_response_text,
     generate_stream,
     upstream_echo,
 )
-from gemini_web2api.models import TICKET_HEADER, resolve_model, ticket_for
+from gemini_web2api.models import (
+    EXPECTED_TICKET_ROUTES,
+    TICKET_HEADER,
+    _lite_effort_model,
+    _reasoning_effort,
+    resolve_model,
+    ticket_for,
+    ticket_warnings,
+)
 from gemini_web2api.server import GeminiHandler, ThreadedServer
 from gemini_web2api.tools import (
     PROMPT_MAX_BYTES,
@@ -204,15 +213,31 @@ class ModelTicketTests(unittest.TestCase):
     # The upstream routes BY the X-Goog-Ext-525001261-Jspb ticket and ignores
     # f.req [79]/[80] without it (verified live: (3,1)+pro-ticket -> Pro,
     # (3,1)+flash-ticket -> Flash -- the ticket wins over the body).
+    HIGH_TICKET = ('[1,null,null,null,"cf41b0e0dd7d53e5",null,"en",null,'
+                   '[4,33,22,5,6,8,16,19,20],null,null,null,null,null,6,2,'
+                   '"BED71B1C-F2D7-410A-913F-B1415D1452C6",'
+                   '["boq_gemini-web-uiserver_20261105.19_p0"],null,'
+                   '[[null,491200000],[1793982546,474000000],"Asia/Bangkok"]]')
+    MEDIUM_TICKET = ('[1,null,null,null,"cf41b0e0dd7d53e5",null,"en",null,'
+                     '[4,33,22,5,6,8,16,19,20],null,null,null,null,null,6,4,'
+                     '"BED71B1C-F2D7-410A-913F-B1415D1452C6",'
+                     '["boq_gemini-web-uiserver_20261105.19_p0"],null,'
+                     '[[null,536200000],[1793982759,780000000],"Asia/Bangkok"]]')
+    LOW_TICKET = ('[1,null,null,null,"cf41b0e0dd7d53e5",null,"en",null,'
+                  '[4,33,22,5,6,8,16,19,20],null,null,null,null,null,6,1,'
+                  '"BED71B1C-F2D7-410A-913F-B1415D1452C6",'
+                  '["boq_gemini-web-uiserver_20261105.19_p0"],null,'
+                  '[[null,496900000],[1793982856,15000000],"Asia/Bangkok"]]')
+
     def setUp(self):
         self.original_config = dict(CONFIG)
         CONFIG["model_tickets"] = {
             "flash": '[1,null,null,null,"fbb127bbb056c959",null,null,0,'
                      '[4,5,6,8,4,5,6,8],null,null,1,null,null,1,1,"561701FD",'
                      'null,null,[[6,908199999],[1789884088,624000000]]]',
-            "lite-thinking": '[1,null,null,null,"cf41b0e0dd7d53e5",null,null,0,'
-                             '[4,5,6,8,4,5,6,8],null,null,1,null,null,6,2,"279B5F21",'
-                             'null,null,[[2,950300000],[1789899759,320000000]]]',
+            "lite": self.LOW_TICKET,
+            "lite-medium": self.MEDIUM_TICKET,
+            "lite-thinking": self.HIGH_TICKET,
         }
 
     def tearDown(self):
@@ -234,6 +259,111 @@ class ModelTicketTests(unittest.TestCase):
         lite_thinking = json.loads(CONFIG["model_tickets"]["lite-thinking"])
         self.assertEqual((flash[14], flash[15]), (1, 1))
         self.assertEqual((lite_thinking[14], lite_thinking[15]), (6, 2))
+
+    def test_ticket_with_null_index4_is_accepted(self):
+        low_null = self.LOW_TICKET.replace('"cf41b0e0dd7d53e5"', "null")
+        self.assertEqual(
+            _normalize_model_tickets({"lite": low_null}), {"lite": low_null})
+
+    def test_ticket_without_family_variant_is_rejected(self):
+        too_short = '[1,null,null,null,"cf41b0e0dd7d53e5"]'
+        no_route = json.dumps([1] + [None] * 15)
+        bool_route = json.dumps([1] + [None] * 13 + [True, False])
+        self.assertEqual(
+            _normalize_model_tickets(
+                {"lite": too_short, "lite-medium": no_route,
+                 "lite-thinking": bool_route}),
+            {})
+
+    def test_lite_thinking_levels(self):
+        cases = {
+            "gemini-3.5-flash-lite-low": ("lite", 6, 1),
+            "gemini-3.5-flash-lite-medium": ("lite-medium", 6, 4),
+            "gemini-3.5-flash-lite-high": ("lite-thinking", 6, 2),
+        }
+        for name, (ticket_key, mode, variant) in cases.items():
+            with self.subTest(model=name):
+                _, resolved_mode, _, err, extra = resolve_model(name)
+                self.assertIsNone(err)
+                self.assertEqual(resolved_mode, mode)
+                self.assertEqual(extra[80], variant)
+                self.assertEqual(
+                    ticket_for(name), CONFIG["model_tickets"][ticket_key])
+
+    def test_lite_effort_model_maps_base_names(self):
+        cases = {
+            "minimal": "gemini-3.5-flash-lite-low",
+            "low": "gemini-3.5-flash-lite-low",
+            "medium": "gemini-3.5-flash-lite-medium",
+            "high": "gemini-3.5-flash-lite-high",
+        }
+        for base in ("gemini-3.5-flash-lite", "gemini-flash-lite"):
+            for effort, expected in cases.items():
+                with self.subTest(base=base, effort=effort):
+                    self.assertEqual(
+                        _lite_effort_model(base, effort), expected)
+
+    def test_explicit_lite_level_wins_over_effort(self):
+        self.assertEqual(
+            _lite_effort_model("gemini-3.5-flash-lite-medium", "low"),
+            "gemini-3.5-flash-lite-medium")
+        self.assertEqual(
+            _lite_effort_model("gemini-3.5-flash-lite-high", "minimal"),
+            "gemini-3.5-flash-lite-high")
+
+    def test_non_lite_model_ignores_effort(self):
+        self.assertEqual(
+            _lite_effort_model("gemini-3.6-flash", "high"),
+            "gemini-3.6-flash")
+
+    def test_reasoning_effort_sources(self):
+        self.assertEqual(
+            _reasoning_effort({"reasoning_effort": " Medium "}), "medium")
+        self.assertEqual(
+            _reasoning_effort({"reasoning": {"effort": "HIGH"}}), "high")
+        self.assertIsNone(_reasoning_effort({}))
+        self.assertIsNone(_reasoning_effort({"reasoning_effort": "none"}))
+        self.assertIsNone(_reasoning_effort({"reasoning_effort": 3}))
+        self.assertIsNone(_reasoning_effort({"reasoning": {"effort": 3}}))
+        self.assertIsNone(_reasoning_effort(None))
+
+    def test_handler_reroutes_base_lite_by_effort(self):
+        cases = {
+            "low": ("gemini-3.5-flash-lite-low", 1, "lite"),
+            "medium": ("gemini-3.5-flash-lite-medium", 4, "lite-medium"),
+            "high": ("gemini-3.5-flash-lite-high", 2, "lite-thinking"),
+        }
+        handler = object.__new__(GeminiHandler)
+        for effort, (model, variant, ticket_key) in cases.items():
+            with self.subTest(effort=effort):
+                resolved = handler._resolve_request_model({
+                    "model": "gemini-3.5-flash-lite",
+                    "reasoning_effort": effort,
+                })
+                self.assertEqual(resolved[0], "gemini-3.5-flash-lite")
+                self.assertEqual(resolved[1], model)
+                self.assertEqual(resolved[2], 6)
+                self.assertEqual(resolved[4][80], variant)
+                self.assertEqual(
+                    resolved[5], CONFIG["model_tickets"][ticket_key])
+
+    def test_expected_ticket_routes_has_lite_medium(self):
+        self.assertEqual(EXPECTED_TICKET_ROUTES["lite"], (6, 1))
+        self.assertEqual(EXPECTED_TICKET_ROUTES["lite-medium"], (6, 4))
+        self.assertEqual(EXPECTED_TICKET_ROUTES["lite-thinking"], (6, 2))
+
+    def test_ticket_warnings_accepts_lite_medium(self):
+        self.assertEqual(ticket_warnings(), [])
+
+    def test_low_fallback_hint_is_logged(self):
+        raw = self._raw_echo("3.5 Flash-Lite", 6, 1)
+        with mock.patch("gemini_web2api.gemini.log") as logger:
+            check_routing(raw, model_id=6, extra_fields={80: 4},
+                          ticket=CONFIG["model_tickets"]["lite-medium"])
+        messages = [c.args[0] for c in logger.call_args_list]
+        self.assertTrue(any("Routing mismatch" in m for m in messages))
+        self.assertTrue(any("fell back to Flash-Lite low" in m
+                            for m in messages))
 
     def test_ticket_header_sent(self):
         headers = _build_headers(ticket="TICKET-VALUE")
