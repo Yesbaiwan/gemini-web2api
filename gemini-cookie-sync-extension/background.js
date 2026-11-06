@@ -63,6 +63,27 @@ let lastCookieSignature = "";
 let cachedTickets = null;
 let ticketWriteQueue = Promise.resolve();
 
+async function getLiveCookie() {
+  const r = await chrome.storage.local.get("live_cookie");
+  return r?.live_cookie || "";
+}
+
+chrome.webRequest.onBeforeSendHeaders.addListener(
+  (details) => {
+    for (const h of details.requestHeaders || []) {
+      if (h.name.toLowerCase() !== "cookie" || !h.value) continue;
+      if (!/(?:^|;\s*)SID=/.test(h.value) || !h.value.includes("__Secure-1PSIDTS")) continue;
+      chrome.storage.local.get("live_cookie").then((r) => {
+        if (r?.live_cookie === h.value) return;
+        chrome.storage.local.set({ live_cookie: h.value }).then(() => scheduleCookieSync(true));
+      });
+      break;
+    }
+  },
+  { urls: ["https://gemini.google.com/*"] },
+  ["requestHeaders", "extraHeaders"]
+);
+
 function parseTicketHeader(headerVal) {
   if (!headerVal || typeof headerVal !== "string") return null;
   if (headerVal.length > 8192 || /[\r\n\0]/.test(headerVal)) return null;
@@ -219,7 +240,8 @@ async function syncCookiesToLocalServer(force = false) {
       .map((name) => `${name}=${selected.get(name).value}`)
       .join("; ");
 
-    const payload = { cookie: cookieString };
+    const live = await getLiveCookie();
+    const payload = { cookie: live || cookieString };
     if (refreshedMeta.xsrf_token) payload.xsrf_token = refreshedMeta.xsrf_token;
     if (refreshedMeta.gemini_bl) payload.gemini_bl = refreshedMeta.gemini_bl;
     if (ticketKeys.length > 0) payload.model_tickets = modelTickets;
@@ -286,6 +308,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
   if (msg?.type === "sync-now") {
     void syncCookiesToLocalServer(true).then((ok) => sendResponse({ ok }));
+    return true;
+  }
+  if (msg?.type === "get-live-cookie") {
+    void getLiveCookie().then((cookie) => sendResponse({ cookie }));
     return true;
   }
   return false;

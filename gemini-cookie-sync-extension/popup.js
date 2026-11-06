@@ -403,7 +403,8 @@ exportButton.addEventListener("click", async () => {
       throw new Error(inspectionMessage(info));
     }
 
-    const cookieString = buildCookieString(info);
+    const live = (await chrome.runtime.sendMessage({ type: "get-live-cookie" }))?.cookie;
+    const cookieString = live || buildCookieString(info);
     const ticketKeys = Object.keys(info.modelTickets || {});
     const payload = {
       cookie: cookieString,

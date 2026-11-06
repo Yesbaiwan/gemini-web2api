@@ -11,22 +11,8 @@ The extension reads the current signed-in Gemini session and exports:
 - `SNlM0e` (`xsrf_token`)
 - `cfb2h` (`gemini_bl`)
 - `auth_user`
-- Captured model routing tickets (`X-Goog-Ext-525001261-Jspb`), keyed by
-  family (`flash`, `flash-thinking`, `pro`, `lite`, `lite-thinking`)
 
 It saves them locally as `gemini-auth.json`.
-
-While the local server is running, the background worker also pushes rotated
-cookies to `http://127.0.0.1:8081/v1/cookies` automatically:
-
-- shortly after Google rotates a watched auth cookie (`__Secure-1PSIDTS`,
-  `__Secure-3PSIDTS`, `SID`, `SAPISID`, ...);
-- every 10 minutes, so a restarted server recovers the current session;
-- when you click **Export gemini-auth.json**.
-
-The server updates its in-memory cookie immediately and atomically rewrites
-`cookie_file` when configured, preserving existing `xsrf_token`, `gemini_bl`,
-`auth_user`, and `model_tickets` metadata. No native-messaging host is needed.
 
 ## Install and export
 
@@ -84,10 +70,6 @@ mv "$tmp" config.json
 
 chmod 600 config.json
 ```
-
-Keep `cookie_file` pointing at a writable JSON file (as above) if you want
-auto-synced cookies to survive a server restart. Without it, `/v1/cookies`
-still updates the running server's memory but nothing is persisted.
 
 Quick check:
 
