@@ -3,6 +3,8 @@
   "port": 8081,
   "retry_attempts": 3,
   "retry_delay_sec": 2,
+  "upstream_min_interval_sec": 1.0,
+  "upstream_max_concurrency": 1,
   "request_timeout_sec": 180,
   "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
   "auto_update_bl": true,

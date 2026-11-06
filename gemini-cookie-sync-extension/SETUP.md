@@ -106,3 +106,6 @@ curl -sS http://127.0.0.1:10012/v1/chat/completions \
 ## Keep it secret
 
 `gemini-auth.json` contains a real Google session. Do not share it, print it, or commit it to Git.
+
+For ticket capture, model routing, and verification, see
+[../TICKET_SETUP.md](../TICKET_SETUP.md).

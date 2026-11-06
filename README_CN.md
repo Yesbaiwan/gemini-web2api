@@ -157,6 +157,8 @@ Pro 路由需要 **Gemini Advanced** (付费订阅). 免费 Google 账号的 coo
   "port": 8081,
   "retry_attempts": 3,
   "retry_delay_sec": 2,
+  "upstream_min_interval_sec": 1.0,
+  "upstream_max_concurrency": 1,
   "request_timeout_sec": 180,
   "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
   "auto_update_bl": true,
@@ -173,6 +175,11 @@ Pro 路由需要 **Gemini Advanced** (付费订阅). 免费 Google 账号的 coo
 
 将 `temporary_chats` 设置为 `true` 后，请求会使用 Gemini 网页版的临时聊天，
 不会将对话保存在账号历史记录中。
+
+`upstream_min_interval_sec` 和 `upstream_max_concurrency` 是可选的全局限流：
+前者规定两次模型请求开始之间的最小间隔秒数，后者限制同时进行中的上游请求数。
+代码默认值 `0.0` / `0` 表示关闭限流；`1.0` / `1` 适合个人使用。重试以及
+tool/flow 的后续调用都会经过同一个限流；BL 刷新、页面 token、图片上传下载不受影响。
 
 `api_keys` 为空数组 `[]` 时不校验密钥；填入一个或多个密钥后, `/v1/*` 接口需要 `Authorization: Bearer <key>` 或 `x-api-key: <key>`.
 

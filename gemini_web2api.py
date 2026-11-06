@@ -47,6 +47,13 @@ DEFAULT_CONFIG = {
     "tool_delta_forward": True,
     "retry_attempts": 3,
     "retry_delay_sec": 2,
+    # Optional process-wide throttle in front of upstream model requests.
+    # upstream_min_interval_sec spaces the *starts* of two generation calls
+    # (retries included); 0 disables spacing. upstream_max_concurrency caps
+    # simultaneous in-flight generation calls; 0 means unlimited. Both are
+    # read at call time, so a config reload takes effect without a restart.
+    "upstream_min_interval_sec": 0.0,
+    "upstream_max_concurrency": 0,
     "request_timeout_sec": 180,
     "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
     # Refresh gemini_bl from gemini.google.com on startup. Set to false to pin
@@ -3657,6 +3664,7 @@ import os
 import hashlib
 import tempfile
 import threading
+import contextlib
 
 try:
     import httpx
@@ -3843,6 +3851,59 @@ def _get_ssl_ctx():
     if _ssl_ctx is None:
         _ssl_ctx = ssl.create_default_context()
     return _ssl_ctx
+
+
+# One process-wide gate for every model generation request. State is guarded by
+# _upstream_gate_lock; the semaphore is rebuilt only when the configured limit
+# changes. Both knobs are read per call so tests and a future reload work.
+_upstream_gate_lock = threading.Lock()
+_upstream_last_start = 0.0
+_upstream_sem = None
+_upstream_sem_limit = 0
+
+
+def _upstream_semaphore():
+    """Return the semaphore for the current limit, or None when unlimited."""
+    global _upstream_sem, _upstream_sem_limit
+    limit = int(CONFIG.get("upstream_max_concurrency") or 0)
+    if limit <= 0:
+        return None
+    with _upstream_gate_lock:
+        if _upstream_sem is None or _upstream_sem_limit != limit:
+            _upstream_sem = threading.BoundedSemaphore(limit)
+            _upstream_sem_limit = limit
+        return _upstream_sem
+
+
+@contextlib.contextmanager
+def _upstream_gate():
+    """Hold one upstream slot and enforce the minimum start-to-start interval."""
+    global _upstream_last_start
+    sem = _upstream_semaphore()
+    if sem is not None:
+        sem.acquire()
+    try:
+        interval = float(CONFIG.get("upstream_min_interval_sec") or 0)
+        if interval > 0:
+            with _upstream_gate_lock:
+                now = time.monotonic()
+                wait = _upstream_last_start + interval - now
+                if wait > 0:
+                    time.sleep(wait)
+                _upstream_last_start = time.monotonic()
+        yield
+    finally:
+        if sem is not None:
+            sem.release()
+
+
+def _reset_upstream_gate():
+    """Test helper: clear spacing history and the cached semaphore."""
+    global _upstream_last_start, _upstream_sem, _upstream_sem_limit
+    with _upstream_gate_lock:
+        _upstream_last_start = 0.0
+        _upstream_sem = None
+        _upstream_sem_limit = 0
 
 
 def _get_httpx_client():
@@ -4455,17 +4516,18 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
         url = _get_url()
         headers = _build_headers(ticket)
         try:
-            req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-            if proxy:
-                opener = urllib.request.build_opener(
-                    urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
-                    urllib.request.HTTPSHandler(context=ctx)
-                )
-                with opener.open(req, timeout=CONFIG["request_timeout_sec"]) as resp:
-                    raw = resp.read().decode("utf-8", errors="replace")
-            else:
-                with urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"]) as resp:
-                    raw = resp.read().decode("utf-8", errors="replace")
+            with _upstream_gate():
+                req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+                if proxy:
+                    opener = urllib.request.build_opener(
+                        urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
+                        urllib.request.HTTPSHandler(context=ctx)
+                    )
+                    with opener.open(req, timeout=CONFIG["request_timeout_sec"]) as resp:
+                        raw = resp.read().decode("utf-8", errors="replace")
+                else:
+                    with urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"]) as resp:
+                        raw = resp.read().decode("utf-8", errors="replace")
             if CONFIG.get("debug_raw"):
                 _dump_raw(raw)
             trace("MODEL -> PROXY", raw)
@@ -4521,110 +4583,111 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
         emitted_any = False
         raw_full = ""
         try:
-            with client.stream("POST", url, content=body, headers=headers) as resp:
-                resp.raise_for_status()
-                buf = ""
-                for chunk in resp.iter_text():
-                    buf += chunk
-                    raw_full += chunk
-                    # Enforce max line buffer to prevent unbounded memory growth
-                    # if upstream sends a massive line without newlines.
-                    if len(buf) > _MAX_STREAM_LINE_BYTES:
-                        log(f"Stream line buffer exceeded {_MAX_STREAM_LINE_BYTES} bytes, forcing flush")
-                        # Process what we have as a pseudo-line.
-                        texts = _extract_texts_from_line(buf)
-                        for index, t in enumerate(texts):
-                            if t == emitted_raw_text or emitted_raw_text.startswith(t):
-                                continue
-                            if index:
-                                block = clean_text(t, strip=False)
-                                if block:
-                                    emitted_any = True
-                                    yield block
-                                continue
-                            if t.startswith(emitted_raw_text):
-                                clean_buf += t[len(emitted_raw_text):]
-                                emitted_raw_text = t
-                            else:
-                                common_len = 0
-                                min_len = min(len(t), len(emitted_raw_text))
-                                while common_len < min_len and t[common_len] == emitted_raw_text[common_len]:
-                                    common_len += 1
-                                if common_len > 0:
-                                    clean_buf = t[common_len:]
+            with _upstream_gate():
+                with client.stream("POST", url, content=body, headers=headers) as resp:
+                    resp.raise_for_status()
+                    buf = ""
+                    for chunk in resp.iter_text():
+                        buf += chunk
+                        raw_full += chunk
+                        # Enforce max line buffer to prevent unbounded memory growth
+                        # if upstream sends a massive line without newlines.
+                        if len(buf) > _MAX_STREAM_LINE_BYTES:
+                            log(f"Stream line buffer exceeded {_MAX_STREAM_LINE_BYTES} bytes, forcing flush")
+                            # Process what we have as a pseudo-line.
+                            texts = _extract_texts_from_line(buf)
+                            for index, t in enumerate(texts):
+                                if t == emitted_raw_text or emitted_raw_text.startswith(t):
+                                    continue
+                                if index:
+                                    block = clean_text(t, strip=False)
+                                    if block:
+                                        emitted_any = True
+                                        yield block
+                                    continue
+                                if t.startswith(emitted_raw_text):
+                                    clean_buf += t[len(emitted_raw_text):]
                                     emitted_raw_text = t
                                 else:
-                                    clean_buf = t
-                                    emitted_raw_text = t
-                        if _holds_scaffold(clean_buf):
-                            # Hold incomplete scaffold blocks.
-                            pass
-                        else:
-                            delta = clean_text(clean_buf, strip=False)
-                            clean_buf = ""
-                            if delta:
-                                emitted_any = True
-                                yield delta
-                        buf = ""  # Force clear buffer after processing.
-                    if "BardErrorInfo" in buf:
-                        raise_bard_error(buf)
-                    while "\n" in buf:
-                        line, buf = buf.split("\n", 1)
-                        texts = _extract_texts_from_line(line)
-                        for index, t in enumerate(texts):
-                            if t == emitted_raw_text or emitted_raw_text.startswith(t):
-                                continue
-                            if index:
-                                # Later text in the *same* line is a separate
-                                # block (thinking summary), not a cumulative
-                                # echo of the earlier one: emit it immediately.
-                                # Keep the primary cumulative text tracking
-                                # intact so the next line still has a prefix
-                                # relation and does not log spurious warnings.
-                                block = clean_text(t, strip=False)
-                                if block:
-                                    emitted_any = True
-                                    yield block
-                                continue
-                            if t.startswith(emitted_raw_text):
-                                clean_buf += t[len(emitted_raw_text):]
-                                emitted_raw_text = t
-                            else:
-                                # First text of the line disagrees with everything
-                                # emitted so far. Upstream may have reset or corrected.
-                                # Try to find the longest common prefix to salvage
-                                # continuity; if none, reset tracking and continue
-                                # from the new text to avoid dropping data.
-                                common_len = 0
-                                min_len = min(len(t), len(emitted_raw_text))
-                                while common_len < min_len and t[common_len] == emitted_raw_text[common_len]:
-                                    common_len += 1
-                                if common_len > 0:
-                                    # Salvage the delta after the common prefix.
-                                    clean_buf = t[common_len:]
-                                    emitted_raw_text = t
-                                    log(f"Stream prefix reset at {common_len} chars, continuing")
-                                else:
-                                    # No common prefix: full reset. Emit the new text
-                                    # from scratch rather than dropping it.
-                                    clean_buf = t
-                                    emitted_raw_text = t
-                                    log(f"Stream full reset, emitting new segment: {t[:120]!r}")
+                                    common_len = 0
+                                    min_len = min(len(t), len(emitted_raw_text))
+                                    while common_len < min_len and t[common_len] == emitted_raw_text[common_len]:
+                                        common_len += 1
+                                    if common_len > 0:
+                                        clean_buf = t[common_len:]
+                                        emitted_raw_text = t
+                                    else:
+                                        clean_buf = t
+                                        emitted_raw_text = t
                             if _holds_scaffold(clean_buf):
-                                # Inside an open upstream scaffolding block:
-                                # hold until it closes so clean_text can drop it
-                                # in one piece.
-                                continue
-                            delta = clean_text(clean_buf, strip=False)
-                            clean_buf = ""
-                            if delta:
-                                if not _ttfb_logged:
-                                    _ttfb_logged = True
-                                    log(f"[timing] stream attempt "
-                                        f"{attempt + 1}: first token in "
-                                        f"{time.monotonic() - _t0:.1f}s")
-                                emitted_any = True
-                                yield delta
+                                # Hold incomplete scaffold blocks.
+                                pass
+                            else:
+                                delta = clean_text(clean_buf, strip=False)
+                                clean_buf = ""
+                                if delta:
+                                    emitted_any = True
+                                    yield delta
+                            buf = ""  # Force clear buffer after processing.
+                        if "BardErrorInfo" in buf:
+                            raise_bard_error(buf)
+                        while "\n" in buf:
+                            line, buf = buf.split("\n", 1)
+                            texts = _extract_texts_from_line(line)
+                            for index, t in enumerate(texts):
+                                if t == emitted_raw_text or emitted_raw_text.startswith(t):
+                                    continue
+                                if index:
+                                    # Later text in the *same* line is a separate
+                                    # block (thinking summary), not a cumulative
+                                    # echo of the earlier one: emit it immediately.
+                                    # Keep the primary cumulative text tracking
+                                    # intact so the next line still has a prefix
+                                    # relation and does not log spurious warnings.
+                                    block = clean_text(t, strip=False)
+                                    if block:
+                                        emitted_any = True
+                                        yield block
+                                    continue
+                                if t.startswith(emitted_raw_text):
+                                    clean_buf += t[len(emitted_raw_text):]
+                                    emitted_raw_text = t
+                                else:
+                                    # First text of the line disagrees with everything
+                                    # emitted so far. Upstream may have reset or corrected.
+                                    # Try to find the longest common prefix to salvage
+                                    # continuity; if none, reset tracking and continue
+                                    # from the new text to avoid dropping data.
+                                    common_len = 0
+                                    min_len = min(len(t), len(emitted_raw_text))
+                                    while common_len < min_len and t[common_len] == emitted_raw_text[common_len]:
+                                        common_len += 1
+                                    if common_len > 0:
+                                        # Salvage the delta after the common prefix.
+                                        clean_buf = t[common_len:]
+                                        emitted_raw_text = t
+                                        log(f"Stream prefix reset at {common_len} chars, continuing")
+                                    else:
+                                        # No common prefix: full reset. Emit the new text
+                                        # from scratch rather than dropping it.
+                                        clean_buf = t
+                                        emitted_raw_text = t
+                                        log(f"Stream full reset, emitting new segment: {t[:120]!r}")
+                                if _holds_scaffold(clean_buf):
+                                    # Inside an open upstream scaffolding block:
+                                    # hold until it closes so clean_text can drop it
+                                    # in one piece.
+                                    continue
+                                delta = clean_text(clean_buf, strip=False)
+                                clean_buf = ""
+                                if delta:
+                                    if not _ttfb_logged:
+                                        _ttfb_logged = True
+                                        log(f"[timing] stream attempt "
+                                            f"{attempt + 1}: first token in "
+                                            f"{time.monotonic() - _t0:.1f}s")
+                                    emitted_any = True
+                                    yield delta
             if clean_buf:
                 # If the stream ended inside an open scaffolding fence, handle it.
                 if _holds_scaffold(clean_buf):

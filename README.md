@@ -195,6 +195,9 @@ startup has no tickets and the upstream serves the account default.
 
 Re-capture the ticket for that family; nothing else needs changing.
 
+For a step-by-step capture/verification guide (including how to add a new
+model family), see [TICKET_SETUP.md](TICKET_SETUP.md).
+
 ## Optional: Cookie for Pro
 
 Anonymous access works for all models, but `gemini-3.1-pro` routes to Flash without authentication. To get real Pro routing, you need a **Gemini Advanced (paid subscription)** account cookie:
@@ -262,6 +265,8 @@ Create `config.json` in the same directory:
   "port": 8081,
   "retry_attempts": 3,
   "retry_delay_sec": 2,
+  "upstream_min_interval_sec": 1.0,
+  "upstream_max_concurrency": 1,
   "request_timeout_sec": 180,
   "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
   "auto_update_bl": true,
@@ -286,6 +291,15 @@ persisting conversations to the account history.
 Agent clients send tens of KB per file read, so the default is deliberately
 generous (upstream accepted 500 KB+ probes); truncation drops the *middle* of
 the history only when a conversation exceeds it. Lower it to shrink payloads.
+
+`upstream_min_interval_sec` and `upstream_max_concurrency` add an opt-in,
+process-wide throttle in front of model generation calls. The defaults in code
+are `0.0` / `0`, which preserves the old behavior (no sleep, no concurrency
+cap). `1.0` / `1` is a safe personal-use setting: at most one upstream call at a
+time and at least one second between call starts. Retries and tool/flow
+follow-up calls count as separate calls and pass through the same gate;
+auxiliary traffic (BL refresh, page-token fetch, image upload/download) is not
+throttled.
 
 Set `debug_trace` to `true` to append a four-leg raw trace to `trace_file`:
 what the client sent (`CLIENT -> PROXY`), the prompt the proxy built
