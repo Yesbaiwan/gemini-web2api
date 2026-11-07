@@ -2248,7 +2248,7 @@ _TOOL_DEMAND_RE = re.compile(
 # proxy/server/service/... count. Weak verbs keep the narrow code nouns, so
 # "check the server status" stays silent.
 _SOURCE_REVIEW_VERB_RE = re.compile(
-    r"\b(?:review|audit|inspect|examine|check|find|kiem\s+tra|soat|tim|xem\s+xet|doc|danh\s+gia|danhgia)\b",
+    r"\b(?:review|audit|inspect|examine|check|find|kiem\s+tra|soat|tim(?!\s+hieu\b)|xem\s+xet|doc|danh\s+gia|danhgia)\b",
     re.IGNORECASE,
 )
 _SOURCE_STRONG_VERB_RE = re.compile(
@@ -3644,11 +3644,14 @@ def _quoted_snippets(text) -> list:
             continue
         for ln in m.group(2).split("\n"):
             s = ln.strip()
-            if len(s) >= 25:
+            if len(s) >= 25 and not s.startswith(("#", "//")):
                 out.append(s)
     rest = re.sub(r"```.*?```", " ", text, flags=re.DOTALL)
-    for m in re.finditer(r"`([^`\n]{25,})`", rest):
-        out.append(m.group(1).strip())
+    for m in re.finditer(r"`([^`\n]+)`", rest):
+        s = m.group(1).strip()
+        if (len(s) >= 25 and not s.startswith(("#", "//"))
+                and "->" not in s and "=>" not in s and "\u2192" not in s):
+            out.append(s)
     seen, uniq = set(), []
     for s in out:
         if s not in seen:
@@ -3672,7 +3675,12 @@ def unverified_quotes(text, messages) -> list:
     for msg in messages or []:
         if isinstance(msg, dict) and msg.get("role") in ("tool", "user"):
             parts.append(_stringify_content(msg.get("content", "")))
-    corpus = _norm_code("\n".join(parts))
+    raw_joined = "\n".join(parts)
+    corpus = _norm_code(raw_joined)
+    if CONFIG.get("defuse_extension_words", True):
+        defused = _norm_code(defuse_extension_words(raw_joined))
+        if defused and defused != corpus:
+            corpus = corpus + " " + defused
     if len(corpus) < 200:
         return []
     snippets = _quoted_snippets(text)
@@ -4441,12 +4449,21 @@ def _get_url() -> str:
     )
 
 
+_MID_DRAFT_RESTART_RE = re.compile(
+    r"(?m)^[^\n`]*`(?:[^\n`]*`[^\n`]*`)*[a-z0-9_./-]+"
+    r"([A-Z\u00c0-\u1ef9][a-z\u00e0-\u1ef9]+\s+[^\n]{20,})$"
+)
+
+
 def clean_text(text: str, strip: bool = True) -> str:
     text = re.sub(
         r'```(?:python|javascript|text)\?code_(?:reference|stdout)&code_event_index=\d+\n.*?```\n?',
         '', text, flags=re.DOTALL
     )
     text = re.sub(r'http://googleusercontent\.com/card_content/\d+\n?', '', text)
+    m = _MID_DRAFT_RESTART_RE.search(text)
+    if m and "\n1. " in text[:m.start()] and "\n1. " in text[m.start(1):]:
+        text = text[m.start(1):]
     return text.strip() if strip else text
 
 
@@ -5848,7 +5865,9 @@ _STOP = set(
 
 def _base_keywords(text, limit=6):
     out = []
-    for m in re.finditer(r"`([^`\n]{2,60})`", text or ""):
+    for m in re.finditer(r"`([^`\n]+)`", text or ""):
+        if not (2 <= len(m.group(1)) <= 60):
+            continue
         k = re.sub(r"[()\s]", "", m.group(1))
         if k and k.lower() not in out:
             out.append(k.lower())
@@ -5935,7 +5954,32 @@ def _strip_linenos(text):
     return text
 
 
+_READ_HEADER_RE = re.compile(
+    r"^\s*(?:Read\s+file\s+[^\n]+?(?:,\s*lines\s+\d+\s*-\s*\d+)?|<file>)\s*$",
+    re.IGNORECASE,
+)
+_READ_FOOTER_RE = re.compile(
+    r"^\s*(?:</file>|\(\s*end\s+of\s+file\b[^()\n]*\))\s*$",
+    re.IGNORECASE,
+)
+
+
+def _strip_read_envelope(text):
+    if not isinstance(text, str) or not text:
+        return ""
+    lines = text.replace("\r\n", "\n").split("\n")
+    while lines and _READ_HEADER_RE.match(lines[0]):
+        lines.pop(0)
+    while lines and _READ_FOOTER_RE.match(lines[-1]):
+        lines.pop()
+    return "\n".join(lines)
+
+
 def _clean_file_text(text):
+    text = _strip_read_envelope(text or "")
+    trunc = globals().get("_FF4_TRUNC_RE")
+    if trunc is not None:
+        text = trunc.sub("", text).rstrip()
     lines = text.replace("\r\n", "\n").split("\n")
     if T._already_numbered(lines):
         lines = [_LINENO_RE.sub("", ln, count=1) for ln in lines]
@@ -6071,7 +6115,13 @@ def _base_analyze(messages):
         ctx.pattern = T.detect_task_pattern(messages)
         if not ctx.pattern and _cfg("flow_explain") and _is_code_question(ctx.last):
             ctx.pattern = "EXPLAIN"
-    ctx.scannable = T._strip_code_spans(ctx.request)
+    req_text = ctx.request or ""
+    strip_fn = globals().get("_strip_pasted_content")
+    if callable(strip_fn):
+        stripped = strip_fn(req_text)
+        if stripped.strip():
+            req_text = stripped
+    ctx.scannable = T._strip_code_spans(req_text)
     ctx.folded = re.sub(r"\s+", " ", T._fold_diacritics(ctx.scannable)).strip()
     return ctx
 
@@ -6428,7 +6478,7 @@ def _verify_findings(text, chunk):
     if re.fullmatch(r"\W*NONE\W*", (text or "").strip(), re.IGNORECASE):
         return kept, dropped
     for item in _split_findings(text):
-        snippets = re.findall(r"`([^`\n]{8,})`", item)
+        snippets = [s for s in re.findall(r"`([^`\n]+)`", item) if len(s) >= 8]
         if snippets and all(T._norm_code(x) in corpus for x in snippets):
             kept.append(item)
         else:
@@ -7058,8 +7108,24 @@ def local_imports(path, text, listing, scored=False):
 
 
 def _read_texts(ev):
-    return {_call_path(e["args"]): e["result"] for e in ev
-            if e["kind"] == "read" and _read_ok(e) and _call_path(e["args"])}
+    out = {}
+    trunc = globals().get("_FF4_TRUNC_RE")
+    off_fn = globals().get("_ff4_off")
+    for e in ev:
+        if e["kind"] != "read" or not _read_ok(e):
+            continue
+        p = _call_path(e["args"])
+        if not p:
+            continue
+        body = _strip_read_envelope(e.get("result") or "")
+        if trunc is not None:
+            body = trunc.sub("", body).rstrip()
+        off = off_fn(e["args"]) if callable(off_fn) else 0
+        if off > 0 and p in out:
+            out[p] += "\n" + body
+        else:
+            out[p] = body
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -7214,7 +7280,9 @@ _STOP2 -= {"flow"}
 def _keywords(text, limit=6):
     """Từ khoá: identifier/backtick trước, từ thường (>=4 ký tự) sau."""
     strong, weak = [], []
-    for m in re.finditer(r"`([^`\n]{2,60})`", text or ""):
+    for m in re.finditer(r"`([^`\n]+)`", text or ""):
+        if not (2 <= len(m.group(1)) <= 60):
+            continue
         k = re.sub(r"[()\s]", "", m.group(1)).lower()
         if k and k not in strong:
             strong.append(k)
@@ -7232,7 +7300,9 @@ def _keywords(text, limit=6):
 
 _FX_QUESTION_RE = re.compile(
     r"\b(how|where|why|what|which|explain|does|show me|giai thich|o dau|nhu the nao"
-    r"|hoat dong|la gi|tai sao|dinh nghia|tim hieu|mo ta|tom tat)\b")
+    r"|hoat dong|la gi|tai sao|dinh nghia|tim hieu|mo ta|tom tat"
+    r"|dieu tra xem|phan tich xem|khao sat xem"
+    r"|(?:kiem tra xem|xem)\b[^.!\n]*?\bco the\b[^.!\n]*?\bkhong)\b")
 _FX_PROJECT_RE = re.compile(
     r"\b(this|the|our|nay|cua)\s+(project|repo|repository|codebase|code|proxy|server"
     r"|module|function|class|file|source|flow|pipeline|system|app)\b"
@@ -7278,7 +7348,8 @@ def _analyze(messages):
             folded = (ctx.folded or "").lower()
             idents = [s for s in re.findall(r"`([^`\n]+)`", ctx.last or "")
                       if _IDENT_RE.match(s.strip())]
-            if _CHG_V_RE.search(folded) and (idents or _named_files(ctx)):
+            if (_CHG_V_RE.search(folded) and (idents or _named_files(ctx))
+                    and _is_change_request(ctx.folded, ctx.scannable, ctx.last)):
                 ctx.pattern = "CHANGE"
     except Exception as e:
         log(f"[fix] analyze error: {e}")
@@ -8879,7 +8950,7 @@ _FF9_TRUNC_PAREN = re.compile(
     r"\([^()\n]*?(?:showing\s+lines|truncated|more\s+lines)[^()\n]*?"
     r"\boffset\s*[=:]\s*(\d+)[^()\n]*\)", re.IGNORECASE)
 _FF15_TRUNC_LEGACY = re.compile(
-    r"\(\s*file\s+has\s+more\s+lines[^()\n]*?\bline\s+(\d+)[^()\n]*\)", re.I)
+    r"\(\s*(?:file\s+has\s+more\s+lines|output\s+(?:truncated|capped))[^()\n]*?\b(?:beyond\s+)?line\s+(\d+)[^()\n]*\)", re.I)
 
 
 class _Ff9Trunc:
@@ -8888,29 +8959,51 @@ class _Ff9Trunc:
     def __init__(self):
         self._rxs = (_FF4_TRUNC_BASE, _FF9_TRUNC_PAREN, _FF15_TRUNC_LEGACY)
 
+    @staticmethod
+    def _is_code_literal(text, m):
+        s = m.group(0)
+        if '"' in s or "\\n" in s:
+            return True
+        after = (text or "")[m.end():m.end() + 1]
+        if after in ('"', "'"):
+            return True
+        return False
+
     def findall(self, text):
         hits = []
+        t = text or ""
         for rx in self._rxs:
-            for m in rx.finditer(text or ""):
-                hits.append((m.start(), m.group(1)))
+            for m in rx.finditer(t):
+                if not self._is_code_literal(t, m):
+                    hits.append((m.start(), m.group(1)))
         return [v for _s, v in sorted(hits)]
 
     def search(self, text):
+        t = text or ""
         for rx in self._rxs:
-            m = rx.search(text or "")
-            if m:
-                return m
+            for m in rx.finditer(t):
+                if not self._is_code_literal(t, m):
+                    return m
         return None
 
     def sub(self, repl, text, count=0):
+        t = text or ""
         for rx in self._rxs:
-            text = rx.sub(repl, text, count=count)
-        return text
+            replaced = [0]
+            def _repl(m, _rx=rx):
+                if count and replaced[0] >= count:
+                    return m.group(0)
+                if self._is_code_literal(t, m):
+                    return m.group(0)
+                replaced[0] += 1
+                return repl(m) if callable(repl) else m.expand(repl)
+            t = rx.sub(_repl, t)
+        return t
 
 
 _FF4_TRUNC_RE = _Ff9Trunc()
 _ff9_trunc_orig = _FF4_TRUNC_BASE
-_FF4_MAX_CONT = 8
+_FF4_MAX_CONT = 32
 
 
 def _ff4_off(args):
@@ -9005,10 +9098,11 @@ def _ff4_continuations(ev, okey):
         if (path, nxt) in seen:
             continue
         seen.add((path, nxt))
+        max_cont = int(CONFIG.get("flow4_max_continuations", _FF4_MAX_CONT) or _FF4_MAX_CONT)
         n_reads = sum(1 for x in ev
                       if x["kind"] == "read"
                       and T._path_seen(path, [_call_path(x["args"])]))
-        if n_reads > _FF4_MAX_CONT:
+        if n_reads > max_cont:
             continue
         args = dict(ev[i]["args"])
         args[okey] = nxt
@@ -9048,7 +9142,7 @@ def _review_materials(messages):
             p = _call_path(e["args"])
             if not p:
                 continue
-            body = _FF4_TRUNC_RE.sub("", e["result"]).rstrip()
+            body = _strip_read_envelope(_FF4_TRUNC_RE.sub("", e["result"]).rstrip())
             if p in bodies:
                 bodies[p] += "\n" + body
             else:
@@ -9322,7 +9416,13 @@ _FF5_NORUN_RE = re.compile(
 
 
 def _ff5_fold(text):
-    scannable = T._strip_code_spans(text or "")
+    raw = text or ""
+    strip_fn = globals().get("_strip_pasted_content")
+    if callable(strip_fn):
+        stripped = strip_fn(raw)
+        if stripped.strip():
+            raw = stripped
+    scannable = T._strip_code_spans(raw)
     return re.sub(r"\s+", " ", T._fold_diacritics(scannable)).lower()
 
 
@@ -9338,11 +9438,15 @@ class _Ff5Perm:
 
 
 _FF6C_Q_LEAD = re.compile(
-    r"^(?:(?:ok|okay|so|hey|hi|and|also|then|vay|the|nhung|ma|oi)\b[\s,]*)?"
+    r"^(?:(?:ok|okay|so|hey|hi|and|also|then|vay|the|nhung|ma|oi|hay|nho|ban|giup(?:\s+minh|\s+toi)?)\b[\s,]*)?"
     r"(?:how\s+(?:can|could|do|does|should|would|to)\b|should\s+(?:i|we)\b|"
     r"what(?:'s|\s+is)\s+the\s+(?:best\s+)?way\s+to\b|lam\s+sao\b|"
     r"lam\s+the\s+nao\b|cach\s+nao\b|huong\s+dan\b|chi\s+(?:minh\s+)?cach\b|"
-    r"nen\s+(?:sua|lam)\b)")
+    r"nen\s+(?:sua|lam)\b|"
+    r"(?:dieu\s+tra|tim\s+hieu|phan\s+tich|khao\s+sat)\s+xem\b|"
+    r"(?:kiem\s+tra\s+xem|xem(?:\s+thu)?)\b[^.!\n]*?\bco\s+the\b[^.!\n]*?\bkhong\b|"
+    r"lieu\s+(?:co\s+the|source|code|file|ham|module)\b|"
+    r"is\s+it\s+possible\s+to\b)")
 _FF6C_IMPERATIVE = re.compile(
     r"^(?:(?:please|pls|hay|vui\s+long|then|and|also|va|roi)\b[\s,]*)*"
     r"(?:fix|implement|add|update|change|modify|refactor|create|write|make|"
@@ -9835,6 +9939,15 @@ def _ff5_evidence_gate(ctx, messages, tm):
                         "A previous read was cut off. Re-read it with a larger "
                         "limit before doing anything else: " + names + ".",
                         calls, True, tm.names({"read"})), None
+        max_cont = int(CONFIG.get("flow4_max_continuations", _FF4_MAX_CONT) or _FF4_MAX_CONT)
+        if okey and all(
+            sum(1 for x in ev
+                if x["kind"] == "read" and _read_ok(x)
+                and T._path_seen(_call_path(e.get("args") or {}), [_call_path(x["args"])])) > max_cont
+            for e in partial
+        ):
+            partial = []
+    if partial and edit_expected:
         detail = "; ".join(_ff5_status_detail(e) for e in partial[:3])
         if _ff5_vi(ctx):
             return None, ("Một lần đọc đã bị cắt và công cụ đọc không hỗ trợ "
@@ -10594,7 +10707,7 @@ def _ff5_spec_banner(messages):
 
 
 _FF5_REVERT_RE = re.compile(
-    r"\b(?:revert|undo|rollback|roll\s+back|hoan\s+tac|khoi\s+phuc|huy|quay\s+lai|tra\s+ve)\b"
+    r"\b(?:revert|undo|rollback|roll\s+back|hoan\s+tac|khoi\s+phuc|huy|quay\s+lai|tra\s+lai)\b"
     r"[^.\n]{0,80}?\b(?:thay\s+doi|changes?|session|modifications?|edits?|sua\s+doi|tat\s+ca|everything)\b")
 _FF5_RUNV_RE = re.compile(r"\b(?:run|execute|exec|chay|thuc\s+thi)\b")
 _FF5_SHOWV_RE = re.compile(r"\b(?:show|xem|cho|list|liet\s+ke|display)\b")
@@ -10613,11 +10726,14 @@ _FF5_NOEDIT_RE = re.compile(
     r"\b(?:do\s+not|don'?t|dont|never)\s+(?:edit|modify|change|touch|write\s+to|alter|"
     r"overwrite|rewrite|update)\s+(?:(?:my|the|any|these|those|your|our)\s+)?"
     r"(?:files?|code|source|anything|repo|repository|project|codebase)\b"
+    r"|\b(?:do\s+not|don'?t|dont|never)\s+edit(?:\s+yet)?(?:\s*$|\s*[.,;!?)]|\s+(?:anything|yet))\b"
+    r"|\b(?:no\s+edits?|not\s+editing(?:\s+yet)?)\b"
     r"|\bwithout\s+(?:editing|modifying|changing|touching|writing|altering)\b"
     r"|\bread[\s-]*only\b"
-    r"|\b(?:khong|dung)\s+(?:duoc\s+)?(?:sua|chinh\s+sua|thay\s+doi|ghi|cap\s+nhat|dong\s+vao)"
-    r"\s+(?:vao\s+)?(?:file|code|ma\s+nguon|source|bat\s+ky|gi|du\s+an)\b"
-    r"|\bchi\s+(?:doc|giai\s+thich|huong\s+dan|goi\s+y)\b")
+    r"|\b(?:khong|dung|chua|khoan)\s+(?:duoc\s+|can\s+|voi\s+)?(?:sua|chinh\s+sua|thay\s+doi|ghi|cap\s+nhat|dong\s+vao)"
+    r"\s+(?:vao\s+)?(?:file|code|ma\s+nguon|source|source\s+code|bat\s+ky|gi|du\s+an|repo|project)\b"
+    r"|\b(?:chua|khoan|khong|dung)\s+(?:duoc\s+|can\s+|voi\s+)?(?:sua|chinh\s+sua)(?:\s+(?:code|source|file|gi|vội|voi|luon|ngay|nhe|nha))*(?:\s*$|\s*[.,;!?)]|\s+(?:ma|nhung|chi|truoc)\b)"
+    r"|\bchi\s+(?:doc|giai\s+thich|huong\s+dan|goi\s+y|dieu\s+tra|phan\s+tich|kiem\s+tra|xem|danh\s+gia|khao\s+sat|review)\b")
 
 _FF5_DESTRUCTIVE_RE = re.compile(
     r"\bgit\s+(?:clean\s+-\w*[fdx]|reset\s+--hard|checkout\s+(?:--\s+)?\.(?:\s|$)|"
@@ -10963,6 +11079,18 @@ def _analyze(messages):
             log(f"[fix5] {ctx.pattern} -> EXPLAIN ({perm.reason})")
             ctx.pattern = "EXPLAIN"
             perm = _ff5_permissions(messages, ctx.pattern, ctx.fix)
+        elif (ctx.pattern is None and not perm.edit and _c5("flow5_respect_no_edit")
+              and ("user forbade edits" in (perm.reason or "") or "guidance question" in (perm.reason or ""))):
+            f_low = (ctx.folded or "").lower()
+            prev_chg = globals().get("_rf_prev_is_change_request")
+            first_cl = globals().get("_ff_first_clause")
+            exp_rx = globals().get("_EXPLAIN_LEAD_RE")
+            if ((callable(prev_chg) and prev_chg(ctx.folded, ctx.scannable, ctx.last))
+                    or _FF5_HOWTO_RE.search(f_low)
+                    or (callable(first_cl) and exp_rx and exp_rx.match(first_cl(ctx.last or "")))):
+                log(f"[fix5] NONE -> EXPLAIN ({perm.reason})")
+                ctx.pattern = "EXPLAIN"
+                perm = _ff5_permissions(messages, ctx.pattern, ctx.fix)
         if ctx.pattern == "DEBUG" and ctx.fix and not perm.edit:
             ctx.fix = False
             perm = _ff5_permissions(messages, ctx.pattern, False)
@@ -11367,7 +11495,7 @@ def _verify_findings(text, chunk):
         return kept, dropped
     files = [(p, b) for p, b in chunk]
     for item in _split_findings(text):
-        snippets = re.findall(r"`([^`\n]{8,})`", item)
+        snippets = [s for s in re.findall(r"`([^`\n]+)`", item) if len(s) >= 8]
         if not snippets:
             dropped += 1
             continue
@@ -12325,7 +12453,7 @@ def _ff8_file_views(ev):
         if e["kind"] == "act" and _ff5_status(e) == "success":
             last_act[key] = i
         elif e["kind"] == "read" and _ff5_status(e) in ("success", "partial"):
-            body = _ff5_trunc_re().sub("", e.get("result") or "").rstrip()
+            body = _strip_read_envelope(_ff5_trunc_re().sub("", e.get("result") or "").rstrip())
             off = _ff4_off(e["args"]) if "_ff4_off" in globals() else 0
             v = views.get(key)
             if v is None or off <= 0:
@@ -13017,7 +13145,13 @@ def _ff10_classify(text, labels):
     key = _ff10_hashlib.sha1(
         (text + "\x00" + "|".join(labels)).encode("utf-8", "ignore")).hexdigest()
     if key in _ff10_cache:
-        return _ff10_cache[key]
+        cached = _ff10_cache[key]
+        if isinstance(cached, tuple) and len(cached) == 2 and cached[0] == "_ERR_":
+            if time.monotonic() < cached[1]:
+                return None
+            _ff10_cache.pop(key, None)
+        else:
+            return cached
     model = getattr(_ff5_tls, "model", None)
     if not model:
         return None
@@ -13041,6 +13175,7 @@ def _ff10_classify(text, labels):
         log("[flow10] model tie-break -> %s" % (label or "none"))
     except Exception as e:
         log("[flow10] model tie-break failed, keeping deterministic label: %s" % e)
+        _ff10_cache[key] = ("_ERR_", time.monotonic() + 15.0)
     if answered:
         if len(_ff10_cache) > 300:
             _ff10_cache.clear()
@@ -13134,6 +13269,8 @@ def _analyze(messages):
             # shape; a second call would only add latency.
             return ctx
         if _clarified(messages, getattr(ctx, "idx", -1)):
+            return ctx
+        if _answered_calls(messages):
             return ctx
         ctx.ambiguous = True
         log("[flow10] candidates=" + ", ".join(
@@ -15679,6 +15816,7 @@ def main():
 
     port = CONFIG["port"]
     host = CONFIG["host"]
+    had_configured_keys = bool(CONFIG.get("api_keys"))
     _guard_bind(host, args.allow_insecure)
     server = ThreadedServer((host, port), GeminiHandler)
     print(f"gemini-web2api v{__version__}")
@@ -15687,7 +15825,7 @@ def main():
     print(f"  Models:    {', '.join(MODELS.keys())}")
     auth_enabled = bool(CONFIG.get('api_keys'))
     auth_msg = 'enabled' if auth_enabled else 'DISABLED (any client can call this)'
-    if auth_enabled and not CONFIG.get('api_keys'):
+    if auth_enabled and not had_configured_keys:
         # Auto-generated key case: show that auth is required
         auth_msg = 'enabled (auto-generated key required)'
     print(f"  Auth:      {auth_msg}")
@@ -16756,7 +16894,10 @@ _RF_ASK_RE = re.compile(
     r"does|explain|review|audit|danh\s+gia|kiem\s+tra|check)\b|\?", re.I)
 
 _EXPLAIN_LEAD_RE = re.compile(
-    r"^(?:giai\s+thich(?:\s+(?:tai\s+sao|vi\s+sao|giup(?:\s+minh|\s+toi)?))?|tai\s+sao|vi\s+sao|explain(?:\s+why)?|why)\b",
+    r"^(?:giai\s+thich(?:\s+(?:tai\s+sao|vi\s+sao|giup(?:\s+minh|\s+toi)?))?|tai\s+sao|vi\s+sao|explain(?:\s+why)?|why|"
+    r"(?:dieu\s+tra|tim\s+hieu|phan\s+tich|khao\s+sat)(?:\s+xem)?|"
+    r"(?:kiem\s+tra\s+xem|xem(?:\s+thu)?)\b[^.!\n]*?\bco\s+the\b[^.!\n]*?\bkhong|"
+    r"lieu\s+(?:co\s+the|source|code|file|ham|module)|is\s+it\s+possible\s+to)\b",
     re.IGNORECASE)
 
 _PASTE_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
@@ -16773,12 +16914,21 @@ _PASTE_LOG_RE = re.compile(
     r"(?:\d{4}-\d{2}-\d{2}|\d{2}:\d{2}:\d{2})\b|"
     r"\[?(?:DEBUG|INFO|WARNING|WARN|ERROR|FATAL|CRITICAL)\]?[:\s]|\bat\s+\S+\s+\([^)\n]*:\d+:\d+\)).*)",
     re.IGNORECASE)
+_PASTE_SESSION_SPLIT_RE = re.compile(
+    r"\n\s*(?:-{3,}\s*\n+\s*)?\*\*Session\s+ID:\*\*\s+\S+",
+    re.IGNORECASE)
+_PASTE_READ_DUMP_RE = re.compile(
+    r"^\s*(?:Read\s+file\s+\S+.*,\s*lines\s+\d+\s*-\s*\d+|\d+:\s.*|<truncated\s+\d+\s+bytes>)$",
+    re.IGNORECASE)
 
 
 def _strip_pasted_content(text: str) -> str:
-    """Remove URLs, price/currency lines, stack traces/logs, and UI tables from text."""
+    """Remove URLs, price/currency lines, stack traces/logs, UI tables, and pasted session dumps from text."""
     if not isinstance(text, str) or not text:
         return ""
+    m_sess = _PASTE_SESSION_SPLIT_RE.search(text)
+    if m_sess and text[:m_sess.start()].strip():
+        text = text[:m_sess.start()]
     text = _PASTE_URL_RE.sub(" ", text)
     lines = text.splitlines()
     clean_lines = []
@@ -16787,7 +16937,8 @@ def _strip_pasted_content(text: str) -> str:
         if not s:
             clean_lines.append("")
             continue
-        if _PASTE_PRICE_RE.search(s) or _PASTE_UI_RE.search(s) or _PASTE_LOG_RE.search(s):
+        if (_PASTE_PRICE_RE.search(s) or _PASTE_UI_RE.search(s)
+                or _PASTE_LOG_RE.search(s) or _PASTE_READ_DUMP_RE.match(s)):
             continue
         clean_lines.append(line)
     return "\n".join(clean_lines)
@@ -16815,13 +16966,20 @@ _rf_prev_is_change_request = _is_change_request
 def _is_change_request(folded, scannable, raw=""):
     raw_text = raw or scannable or folded or ""
     clean_raw = _strip_pasted_content(raw_text)
-    if clean_raw != raw_text:
+    if clean_raw != raw_text and clean_raw.strip():
         scannable = T._strip_code_spans(clean_raw)
         folded = re.sub(r"\s+", " ", T._fold_diacritics(scannable)).strip()
         raw = clean_raw
 
+    f_low = (folded or "").lower()
+    if _c5("flow5_respect_no_edit"):
+        if _FF5_NOEDIT_RE.search(f_low) or _ff5_noedit_text(raw):
+            return False
+        if _FF5_HOWTO_RE.search(f_low) and not _FF5_GRANT_RE.search(f_low):
+            return False
+
     c0 = _ff_first_clause(raw_text)
-    if c0 and _EXPLAIN_LEAD_RE.match(c0) and not (_CHANGE_ACT_RE.search(c0) or _FF5_GRANT_RE.search(folded)):
+    if c0 and _EXPLAIN_LEAD_RE.match(c0) and not (_CHANGE_ACT_RE.search(c0) or _FF5_GRANT_RE.search(f_low)):
         return False
 
     if _rf_prev_is_change_request(folded, scannable, raw):
@@ -16832,6 +16990,9 @@ def _is_change_request(folded, scannable, raw=""):
         return bool(_RF_VERB_RE.search(folded or "") and _RF_NOUN_RE.search(folded or ""))
     except Exception:
         return False
+
+
+T._is_change_request = _is_change_request
 
 
 
@@ -17328,6 +17489,14 @@ def _change_tail(pat, ctx, ev, tm, names_all, total, extra=""):
 _ff14_prev_review_demanded = review_demanded
 
 
+_FF14_REFACTOR_Q_RE = re.compile(
+    r"\b(?:refactor\w*|restructur\w*|clean\s*up|tinh\s+gon|gon\s+hon|"
+    r"tach\s+(?:module|file|nho|ham)|to\s+chuc\s+lai|cau\s+truc\s+lai|"
+    r"viet\s+lai|toi\s+uu)\b",
+    re.IGNORECASE,
+)
+
+
 def review_demanded(messages) -> bool:
     if _ff14_prev_review_demanded(messages):
         return True
@@ -17336,7 +17505,12 @@ def review_demanded(messages) -> bool:
         for msg in messages or []:
             if isinstance(msg, dict) and msg.get("role") == "user":
                 last_user = _stringify_content(msg.get("content", ""))
-        return bool(last_user) and bool(_is_code_question(last_user))
+        if not last_user or not _is_code_question(last_user):
+            return False
+        folded = T._fold_diacritics(T._strip_code_spans(last_user))
+        if _FF14_REFACTOR_Q_RE.search(folded) and not _FF10_DEFECT_RE.search(folded):
+            return False
+        return True
     except Exception:
         return False
 
@@ -17449,7 +17623,9 @@ def _keywords(text, limit=6):
         return _ff15_prev_keywords(text, limit)
     strong, weak = [], []
     text = text or ""
-    for m in re.finditer(r"`([^`\n]{2,60})`", text):
+    for m in re.finditer(r"`([^`\n]+)`", text):
+        if not (2 <= len(m.group(1)) <= 60):
+            continue
         k = re.sub(r"[()\s]", "", m.group(1)).lower()
         if k and k not in strong:
             strong.append(k)
@@ -17896,11 +18072,18 @@ def _ff16_prev_assistant_plan(messages) -> str:
 def _ff16_read_plan_bodies(messages) -> list:
     """[(path, text)] for any plan/doc/todo file read in the conversation."""
     out = []
+    last_user = _ff5_last_user_text(messages) if messages else ""
+    folded_user = _ff5_fold(last_user) if last_user else ""
+    plan_ref = bool(_FF16_PLAN_REF_RE.search(folded_user))
+    user_files = set(f.lower() for f in T._files_in(T._strip_code_spans(last_user or "")))
     for e in _answered_calls(messages):
         if e.get("kind") != "read" or not _read_ok(e):
             continue
         p = _call_path(e.get("args") or {})
-        if p and (_ff16_is_plan_doc(p) or _is_doc(p)):
+        if not p:
+            continue
+        if _ff16_is_plan_doc(p) or (
+                _is_doc(p) and (plan_ref or any(T._path_seen(p, [uf]) for uf in user_files))):
             out.append((p, _clean_file_text(e.get("result") or "")))
     return out
 
@@ -18273,11 +18456,11 @@ def _verify_findings(text, chunk):
                 continue
         else:
             cand = files
-        quote_snips = [s for s in re.findall(r"`([^`\n]{6,})`", quote_part)
-                       if not _FF16_LOC_SPAN_RE.match(s)]
+        quote_snips = [s for s in re.findall(r"`([^`\n]+)`", quote_part)
+                       if len(s) >= 6 and not _FF16_LOC_SPAN_RE.match(s)]
         if not quote_snips:
-            quote_snips = [s for s in re.findall(r"`([^`\n]{8,})`", item)
-                           if not _FF16_LOC_SPAN_RE.match(s)]
+            quote_snips = [s for s in re.findall(r"`([^`\n]+)`", item)
+                           if len(s) >= 8 and not _FF16_LOC_SPAN_RE.match(s)]
         if not quote_snips:
             dropped += 1
             continue
@@ -18402,22 +18585,48 @@ _ff16_prev_local_imports = local_imports
 _ff16_prev_plan_explain = _plan_explain
 
 
+_STDLIB_MODS = getattr(sys, "stdlib_module_names", frozenset()) | {
+    "os", "sys", "re", "json", "time", "math", "uuid", "hmac", "hashlib",
+    "socket", "select", "ssl", "urllib", "http", "html", "email", "logging",
+    "threading", "multiprocessing", "subprocess", "shutil", "pathlib",
+    "posixpath", "ntpath", "glob", "fnmatch", "io", "tempfile", "collections",
+    "itertools", "functools", "operator", "typing", "dataclasses", "enum",
+    "abc", "contextlib", "copy", "pprint", "traceback", "inspect", "ast",
+    "dis", "unittest", "doctest", "argparse", "configparser", "csv", "sqlite3",
+    "zipfile", "tarfile", "gzip", "bz2", "lzma", "base64", "binascii",
+    "struct", "codecs", "unicodedata", "string", "textwrap", "difflib",
+    "random", "secrets", "statistics", "decimal", "fractions", "numbers",
+    "datetime", "calendar", "zoneinfo", "ipaddress", "signal", "errno",
+    "ctypes", "platform", "sysconfig", "warnings", "weakref", "gc", "atexit",
+    "queue", "asyncio", "concurrent", "pytest", "httpx", "requests", "flask",
+    "fastapi", "pydantic", "numpy", "pandas", "scipy", "matplotlib", "yaml",
+    "toml", "tomli", "dotenv", "aiohttp", "websockets", "werkzeug", "jinja2",
+    "click", "rich", "tqdm", "PIL", "cv2", "torch", "tensorflow", "sklearn",
+}
+
+
 def local_imports(path, text, listing, scored=False):
     """Also infer sibling/package paths when `listing` came from `grep` (partial)
     rather than a full-repo `glob`."""
     res = _ff16_prev_local_imports(path, text, listing, scored=scored)
     if res or not _ff16_c("flow16_explain_imports"):
         return res
+    if len(listing or ()) >= 4:
+        return res
     text = text or ""
     norm_p = _norm(path or "")
     cur_dir = posixpath.dirname(norm_p)
-    pkg_root = norm_p.split("/", 1)[0] if "/" in norm_p else ""
+    pkg_root = norm_p.split("/", 1)[0] if ("/" in norm_p and not re.match(r"^[A-Za-z]:/", norm_p)) else ""
+    self_stem = posixpath.splitext(_base(norm_p))[0]
     augmented = list(listing or [])
     for m in re.finditer(r"(?m)^[ \t]*from\s+([\w.]+)\s+import\s+\(?([^\n#]+)", text):
         base_mod = m.group(1)
         names = [n.strip().strip("()").split(" as ")[0].strip()
                  for n in m.group(2).split(",") if n.strip().strip("()")]
         stripped_base = base_mod.lstrip(".")
+        top_pkg = stripped_base.split(".", 1)[0] if stripped_base else ""
+        if top_pkg and (top_pkg in _STDLIB_MODS or top_pkg == self_stem):
+            continue
         if not stripped_base:
             candidates = [base_mod + nm for nm in names if re.match(r"^\w+$", nm)]
         elif "." not in stripped_base and pkg_root and stripped_base == pkg_root:
@@ -18439,6 +18648,9 @@ def local_imports(path, text, listing, scored=False):
             if cand_path not in augmented:
                 augmented.append(cand_path)
     for m in re.finditer(r"(?m)^[ \t]*import\s+([\w.]+)", text):
+        top_pkg = m.group(1).split(".", 1)[0]
+        if top_pkg in _STDLIB_MODS or top_pkg == self_stem:
+            continue
         rel = "/".join(x for x in m.group(1).split(".") if x)
         if rel and (rel + ".py") not in augmented:
             augmented.append(rel + ".py")
@@ -18748,11 +18960,17 @@ def _ff17_c(key, default=None):
 # --------------------------------------------------------------------------
 def _ff17_strip_numbered_lines(text):
     """Return unnumbered source text and a list mapping 0-based index -> file line number."""
-    lines = (text or "").split("\n")
+    cleaned = _strip_read_envelope(text or "")
+    trunc = globals().get("_FF4_TRUNC_RE")
+    if trunc is not None:
+        cleaned = trunc.sub("", cleaned).rstrip()
+    lines = cleaned.split("\n")
     numbered = T._already_numbered(lines)
     clean_lines = []
     line_nums = []
     for i, ln in enumerate(lines):
+        if _READ_HEADER_RE.match(ln) or _READ_FOOTER_RE.match(ln):
+            continue
         if numbered:
             m = re.match(r"^(\s*(\d+)\s*(?:\||:|\t|\u2192)\s?)(.*)$", ln)
             if m:
@@ -19334,6 +19552,70 @@ def _plan_change(ctx, ev, tm, pat="CHANGE", total=5):
     return _ff17_prev_plan_change(ctx, ev, tm, pat=pat, total=total)
 
 
+def _ff17_large_file_structure_index(messages):
+    """Build a compact structural index (sections, classes, multi-layer definitions
+    with exact 1-based line numbers) when a file read in `messages` exceeds 100 KB
+    so prompt truncation never hides earlier sections of a large file."""
+    ev = _answered_calls(messages or [])
+    total_read_chars = sum(len(e.get("result") or "") for e in ev
+                           if e.get("kind") == "read" and _read_ok(e))
+    if total_read_chars < 100000:
+        return ""
+    views = _ff8_file_views(ev)
+    blocks = []
+    for v in views:
+        text = v.get("text") or ""
+        if len(text) < 80000:
+            continue
+        clean_src, line_nums = _ff17_strip_numbered_lines(text)
+        src_lines = clean_src.split("\n")
+        sections, classes = [], []
+        defs = _ff17_collections.defaultdict(list)
+        for idx, raw_ln in enumerate(src_lines):
+            lno = line_nums[idx] if idx < len(line_nums) else (idx + 1)
+            s = raw_ln.rstrip()
+            if re.match(r"^#\s*(?:Section:|====\s*\w+)", s):
+                sections.append(f"  {lno}: {s}")
+            elif re.match(r"^class\s+\w+\b.*:", s):
+                classes.append(f"  {lno}: {s}")
+            else:
+                m_def = re.match(r"^def\s+(\w+)\s*\(", s)
+                if m_def:
+                    defs[m_def.group(1)].append((lno, s))
+        multi_defs = [
+            f"  {name} (defined {len(locs)}x at lines "
+            + ", ".join(str(ln) for ln, _ in locs)
+            + f"): {locs[-1][0]}: `{locs[-1][1]}`"
+            for name, locs in defs.items() if len(locs) > 1
+        ]
+        parts = [f"[Structure index for {v.get('path')} ({len(src_lines)} lines total -- earlier read chunks may be truncated above; cite exact line numbers below):]"]
+        if sections:
+            parts.append("Sections / Patch Layers:\n" + "\n".join(sections[:45]))
+        if classes:
+            parts.append("Classes:\n" + "\n".join(classes[:25]))
+        if multi_defs:
+            parts.append("Functions redefined/wrapped across layers:\n" + "\n".join(multi_defs[:45]))
+        blocks.append("\n".join(parts))
+    return "\n\n".join(blocks)
+
+
+_ff17_prev_after_plan = _ff5_after_plan
+
+
+def _ff5_after_plan(step, messages, tm, ctx=None):
+    step = _ff17_prev_after_plan(step, messages, tm, ctx)
+    try:
+        if (step is not None and getattr(step, "name", None) == "answer"
+                and getattr(step, "local_text", None) is None
+                and not _c5("flow6_lean_prompt")):
+            idx_block = _ff17_large_file_structure_index(messages)
+            if idx_block and "[Structure index for " not in (step.instruction or ""):
+                step.instruction = (step.instruction or "") + "\n\n" + idx_block
+    except Exception as e:
+        log(f"[fix17] structure index error: {e}")
+    return step
+
+
 _ff17_prev_install = install
 
 
@@ -19346,5 +19628,3 @@ def install():
 
 if __name__ == "__main__":
     main()
-
-
