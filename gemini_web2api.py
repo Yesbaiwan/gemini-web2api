@@ -2273,6 +2273,12 @@ def _is_source_review(folded: str) -> bool:
                 and _SOURCE_CODE_NOUN_RE.search(folded))
 
 
+_READ_THEN_CHANGE_RE = re.compile(
+    r"\b(?:thuc\s+thi|trien\s+khai|implement|sua|cap\s+nhat|them|update|modify|edit|patch)\b",
+    re.IGNORECASE,
+)
+
+
 def _is_file_review(folded: str, scannable: str) -> bool:
     """True when folded text aims a review verb at a named file.
 
@@ -2283,6 +2289,12 @@ def _is_file_review(folded: str, scannable: str) -> bool:
     stays silent; runtime names like ``Node.js`` never count as files).
     """
     if not _SOURCE_REVIEW_VERB_RE.search(folded):
+        return False
+    # "Hãy đọc file plan.md và implement/cập nhật vào X.py" is a CHANGE turn, not a FILE_REVIEW
+    if (not _SOURCE_STRONG_VERB_RE.search(folded)
+            and re.search(r"\b(?:doc|read)\b", folded, re.IGNORECASE)
+            and _READ_THEN_CHANGE_RE.search(folded)
+            and not re.search(r"\b(?:review|audit|inspect|soat|danh\s+gia|kiem\s+tra\s+loi|tim\s+loi|tim\s+bug)\b", folded, re.IGNORECASE)):
         return False
     return any(f for f in _files_in(scannable)
                if f.lower() not in _NON_FILE_NAMES)
@@ -2671,11 +2683,40 @@ _FILE_CREATE_RE = re.compile(
 )
 
 
+_CREATE_CLAUSE_SPLIT_RE = re.compile(
+    r"(?:\.(?=\s|$)|[!?;:\n]+|\b(?:sau\s+khi|sau\s+do|roi|tiep\s+theo|then|and\s+then|after\s+that)\b)",
+    re.IGNORECASE,
+)
+_EXISTING_TARGET_PREP_RE = re.compile(
+    r"\b(?:doc|read|open|xem|sua|edit|modify|update|refactor|patch|"
+    r"implement\b[^.!?;:\n]{0,60}?\b(?:vao|into|in)|vao|into|in|from|tu|theo)\s+(?:file\s+|tep\s+)?$",
+    re.IGNORECASE,
+)
+_PLAN_DOC_NAME_RE = re.compile(
+    r"(?:^|[/\\_-])(?:plan|todo|checklist|roadmap|spec|design)\.(?:md|txt|rst)$",
+    re.IGNORECASE,
+)
+
+
 def _created_files(scannable: str, folded: str) -> set:
     """File tokens exempt from the `uncovered` check (creation intent)."""
-    if not _FILE_CREATE_RE.search(folded):
+    if not _FILE_CREATE_RE.search(folded or ""):
         return set()
-    return {f.lower() for f in _files_in(scannable)}
+    out = set()
+    clauses = _CREATE_CLAUSE_SPLIT_RE.split(scannable or "")
+    for cl in clauses:
+        cl_folded = _fold_diacritics(cl)
+        if not _FILE_CREATE_RE.search(cl_folded):
+            continue
+        for f in _files_in(cl):
+            fl = f.lower()
+            if _PLAN_DOC_NAME_RE.search(fl):
+                continue
+            pos = cl_folded.lower().find(fl)
+            if pos > 0 and _EXISTING_TARGET_PREP_RE.search(cl_folded[:pos]):
+                continue
+            out.add(fl)
+    return out
 
 
 # A request to CHANGE the code (fix/implement/update/...), matched against
@@ -7339,11 +7380,19 @@ def _analyze(messages):
                 and _create_intent(ctx.folded, ctx.scannable, ctx.last) \
                 and (_named_files(ctx)
                      or _MERGE_RE.search((ctx.folded or "").lower())):
-            ctx.pattern = "CREATE"
             files = _named_files(ctx)
-            ctx.target = files[0] if files else ""
-            ctx.create_merge = bool(_MERGE_RE.search((ctx.folded or "").lower()))
-            ctx.dir_cands = _dir_cands(ctx.last)
+            created_set = T._created_files(ctx.scannable or "", ctx.folded or "")
+            is_merge = bool(_MERGE_RE.search((ctx.folded or "").lower()))
+            non_created = [f for f in files
+                           if f.lower() not in created_set
+                           and _base(f).lower() not in created_set]
+            if is_merge or (created_set and (ctx.pattern is None or not non_created)):
+                ctx.pattern = "CREATE"
+                target_cands = [f for f in files
+                                if f.lower() in created_set or _base(f).lower() in created_set]
+                ctx.target = (target_cands[0] if target_cands else (files[0] if files else ""))
+                ctx.create_merge = is_merge
+                ctx.dir_cands = _dir_cands(ctx.last)
         elif not ctx.pattern:
             folded = (ctx.folded or "").lower()
             idents = [s for s in re.findall(r"`([^`\n]+)`", ctx.last or "")
@@ -8908,11 +8957,19 @@ def _analyze(messages):
                     and (_named_files(ctx)
                          or _MERGE_RE.search(folded.lower()))):
                 files = _named_files(ctx)
-                ctx.pattern = "CREATE"
-                ctx.fix = False
-                ctx.target = files[0] if files else ""
-                ctx.create_merge = bool(_MERGE_RE.search(folded.lower()))
-                ctx.dir_cands = _dir_cands(ctx.last)
+                created_set = T._created_files(ctx.scannable or "", folded)
+                is_merge = bool(_MERGE_RE.search(folded.lower()))
+                non_created = [f for f in files
+                               if f.lower() not in created_set
+                               and _base(f).lower() not in created_set]
+                if is_merge or (created_set and not non_created):
+                    ctx.pattern = "CREATE"
+                    ctx.fix = False
+                    target_cands = [f for f in files
+                                    if f.lower() in created_set or _base(f).lower() in created_set]
+                    ctx.target = (target_cands[0] if target_cands else (files[0] if files else ""))
+                    ctx.create_merge = is_merge
+                    ctx.dir_cands = _dir_cands(ctx.last)
     except Exception as e:
         log(f"[fix4] analyze error: {e}")
     return ctx
@@ -9075,14 +9132,31 @@ def _ff4_truncations(ev):
 
 
 def _ff4_unfinished(ev):
-    """Truncations with no later *successful* read at or beyond their offset."""
+    """Truncations with no later *successful* read at or beyond their offset.
+    Also ignores bounded window re-reads (e.g. offset=30, limit=120) when the file
+    was already read past `nxt` earlier in `ev`.
+    """
     out = []
     for i, path, nxt in _ff4_truncations(ev):
         later = [_ff4_off(x["args"]) for x in ev[i + 1:]
                  if x["kind"] == "read" and _read_ok(x)
                  and T._path_seen(path, [_call_path(x["args"])])]
-        if not any(o >= nxt for o in later):
-            out.append((i, path, nxt))
+        if any(o >= nxt for o in later):
+            continue
+        # Check if this is a targeted window re-read of a file already read past `nxt`
+        earlier_max = max(
+            [_ff4_off(x["args"]) for x in ev[:i]
+             if x["kind"] == "read" and _read_ok(x)
+             and T._path_seen(path, [_call_path(x["args"])])] or [-1]
+        )
+        earlier_untouched = not any(
+            x["kind"] == "act" and _act_ok(x)
+            and T._path_seen(path, [_call_path(x["args"])])
+            for x in ev[:i]
+        )
+        if earlier_max >= nxt and earlier_untouched:
+            continue
+        out.append((i, path, nxt))
     return out
 
 
@@ -9105,6 +9179,14 @@ def _ff4_continuations(ev, okey):
         if n_reads > max_cont:
             continue
         args = dict(ev[i]["args"])
+        # Drop small explicit window limits (<= 500 lines) when continuing via offset
+        for lk in ("limit", "max_lines", "line_limit", "num_lines", "count", "n"):
+            if lk in args and lk != okey:
+                try:
+                    if int(args[lk]) <= 500:
+                        del args[lk]
+                except Exception:
+                    pass
         args[okey] = nxt
         out.append((path, {
             "id": f"call_{uuid.uuid4().hex[:8]}", "type": "function",
@@ -11624,6 +11706,17 @@ def _ff5_has_fresh_evidence_after_last_act(messages, path):
             if re.search(r"\bgit\s+(?:--no-pager\s+)?diff\b", cmd):
                 return True
 
+    # If the previous act(s) on `path` were surgical edits (oldString -> newString)
+    # and `_ff9_read_texts` still tracks the updated content of `path` in-place
+    # (with no failed test run since `last_act`), allow subsequent phase edits.
+    last_args = ev[last_act].get("args") or {}
+    has_old = any(isinstance(last_args.get(k), str) and last_args[k] for k in _OLD_KEYS)
+    has_new = any(isinstance(last_args.get(k), str) for k in _NEW_KEYS)
+    if has_old and has_new and "_ff9_read_texts" in globals():
+        tracked = _ff9_read_texts(messages)
+        if any(T._path_seen(path, [k]) for k in tracked):
+            return True
+
     return False
 
 
@@ -12792,7 +12885,22 @@ def _ff9_read_texts(messages):
             continue
         if e["kind"] == "act":
             if _act_ok(e):
+                args_a = e.get("args") or {}
+                okey_a = next((k for k in _OLD_KEYS
+                               if isinstance(args_a.get(k), str) and args_a[k]), None)
+                nkey_a = next((k for k in _NEW_KEYS
+                               if isinstance(args_a.get(k), str)), None)
                 for k in [k for k in texts if T._path_seen(p, [k])]:
+                    if okey_a and nkey_a is not None:
+                        old_s = _strip_linenos(args_a[okey_a].replace("\r\n", "\n"))
+                        new_s = _strip_linenos(args_a[nkey_a].replace("\r\n", "\n"))
+                        cur_t = texts[k].replace("\r\n", "\n")
+                        if old_s in cur_t:
+                            texts[k] = cur_t.replace(old_s, new_s, 1)
+                            continue
+                        if old_s.strip("\n") and old_s.strip("\n") in cur_t:
+                            texts[k] = cur_t.replace(old_s.strip("\n"), new_s.strip("\n"), 1)
+                            continue
                     del texts[k]
             continue
         if e["kind"] != "read" or not _read_ok(e):
@@ -16265,13 +16373,30 @@ def _ff6c_proven_new(path, messages):
         return False
 
 
+_CREATE_TEST_INTENT_RE = re.compile(
+    r"\b(?:tao|viet|them|create|write|add)\s+(?:file\s+|tep\s+|unit\s+)?test\b",
+    re.IGNORECASE,
+)
+
+
 def _ff12_user_creates(path, ctx, listing):
-    """Fix 19: the user said to create/write this file and no listing shows it."""
+    """Fix 19: the user or plan said to create/write this file and no listing shows it."""
     try:
-        base = _base(path).lower()
-        if base not in T._created_files(ctx.scannable, ctx.folded):
+        if listing and any(_ff12_same_file(path, f) for f in listing):
             return False
-        return not (listing and any(_ff12_same_file(path, f) for f in listing))
+        base = _base(path).lower()
+        norm_p = _norm(path).lower()
+        created = T._created_files(ctx.scannable, ctx.folded)
+        if base in created or norm_p in created:
+            return True
+        msgs = getattr(_ff8_tls, "messages", None)
+        if msgs is not None and "_ff16_plan_files" in globals():
+            plan_files = _ff16_plan_files(ctx, msgs, listing)
+            if any(_ff12_same_file(path, pf) for pf in plan_files):
+                return True
+        if _is_test_path(path) and _CREATE_TEST_INTENT_RE.search(ctx.folded or ""):
+            return True
+        return False
     except Exception:
         return False
 
@@ -17760,6 +17885,9 @@ def _ff15_label(ctx, pat):
     if review_pat:
         # plain "read / find where X is" is an explanation, not a bug report
         if not strong and not defect and (read or locate):
+            if "?" not in raw and (starts(_FF15_CHG_RE) or starts(_FF15_DOCWRITE_RE)
+                                   or T._is_change_request(f, clean_raw, raw)):
+                return "CHANGE"
             return "EXPLAIN"
         return None
     if howto:
@@ -18293,7 +18421,15 @@ def _plan_change(ctx, ev, tm, pat="CHANGE", total=5):
                 if s is not None:
                     return s
             listing = _listing_files(ev)
+            created_set = T._created_files(ctx.scannable or "", ctx.folded or "")
             resolved_plan = _existing([_resolve(f, listing) for f in plan_targets], listing)
+            if listing:
+                resolved_plan = [
+                    f for f in resolved_plan
+                    if any(_ff12_same_file(f, lf) for lf in listing)
+                    and _norm(f).lower() not in created_set
+                    and _base(f).lower() not in created_set
+                ]
             unread_plan = [f for f in resolved_plan if not T._path_seen(f, read_set)]
             if unread_plan and can_read:
                 return _read_step(
@@ -18375,10 +18511,16 @@ def _ff5_after_plan(step, messages, tm, ctx=None):
         if ctx is None:
             ctx = _analyze(messages)
         if tm is not None and not getattr(step, "drive", False) and step.kinds:
+            ev_now = _answered_calls(messages)
+            just_did_todo_only = (
+                getattr(step, "name", None) == "act"
+                and bool(ev_now)
+                and _ff16_is_todo_tool(ev_now[-1].get("name", ""))
+            )
             todo_tools = [
                 n for n in tm.by_kind.get("other", []) if _ff16_is_todo_tool(n)
             ]
-            if todo_tools:
+            if todo_tools and not just_did_todo_only:
                 step.kinds = _Ff16KindSet(set(step.kinds) | {"todo"})
                 for tn in todo_tools:
                     if tn not in step.tool_names:
@@ -18942,6 +19084,9 @@ _FF17_DEFAULTS = {
     "flow17_fuzzy_edit": True,
     "flow17_session_ledger": True,
     "flow17_session_cache_max": 128,
+    "flow17_plan_todo_act": True,
+    "flow17_act_context_pack": True,
+    "flow17_plan_max_acts": 12,
 }
 _FLOW_DEFAULTS.update(_FF17_DEFAULTS)
 _DEFAULTS.update(_FF17_DEFAULTS)
@@ -19179,8 +19324,14 @@ def _ff17_targeted_test_commands(names, ev):
         return []
 
     matched_tests = []
+    explicit_test_edits = []
     for p in edited_paths:
-        if _is_test_path(p) or _is_doc(p):
+        if _is_test_path(p) and p.lower().endswith(_SRC_EXT):
+            np = _norm(p)
+            if np not in explicit_test_edits:
+                explicit_test_edits.append(np)
+            continue
+        if _is_doc(p):
             continue
         stem = posixpath.splitext(_base(p))[0].lower()
         if len(stem) < 3 or stem == "__init__":
@@ -19192,7 +19343,14 @@ def _ff17_targeted_test_commands(names, ev):
                 if t not in matched_tests:
                     matched_tests.append(t)
 
-    if not matched_tests or len(matched_tests) == len(all_tests):
+    if matched_tests and explicit_test_edits:
+        for tp in explicit_test_edits:
+            if not any(_ff12_same_file(tp, mt) for mt in matched_tests):
+                matched_tests.insert(0, tp)
+    elif not matched_tests and explicit_test_edits and len(edited_paths) == len(explicit_test_edits):
+        matched_tests = list(explicit_test_edits)
+
+    if not matched_tests or len(matched_tests) >= len(all_tests):
         return []
 
     bases = {_base(n) for n in names}
@@ -19599,20 +19757,446 @@ def _ff17_large_file_structure_index(messages):
     return "\n\n".join(blocks)
 
 
+# --------------------------------------------------------------------------
+# 5. Multi-Phase Plan & TODO Completion Gate + Large-File Act Context Pack
+# --------------------------------------------------------------------------
+_FF17_PURE_TEST_TODO_RE = re.compile(
+    r"\b(?:chay|run|execute|perform|verify|kiem\s+tra|nghiem\s+thu)\b.*"
+    r"\b(?:unit\s+tests?|tests?|pytest|unittest|kiem\s+thu)\b"
+    r"|\b(?:unit\s+tests?|pytest|unittest)\b.*\b(?:chay|run|execute|nghiem\s+thu)\b",
+    re.IGNORECASE,
+)
+_FF17_WRITE_VERB_TODO_RE = re.compile(
+    r"\b(?:tao|viet|them|sua|cap\s+nhat|trien\s+khai|tich\s+hop|"
+    r"create|write|add|edit|modify|update|implement|integrate|refactor)\b",
+    re.IGNORECASE,
+)
+_FF17_STOP_IDENTS = {
+    "str", "int", "float", "bool", "list", "dict", "set", "tuple", "bytes",
+    "None", "True", "False", "self", "cls", "elif", "else", "return", "pass",
+    "GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH", "HTTP",
+    "json", "time", "sys", "os", "re", "math", "uuid", "threading", "socket",
+    "unittest", "mock", "pytest", "tests",
+}
+
+
+def _ff17_orig_read_corpus(ev) -> str:
+    """Concatenate all raw successful read outputs in `ev` (before edits)."""
+    parts = []
+    for e in ev or []:
+        if e.get("kind") == "read" and _read_ok(e):
+            p = _call_path(e.get("args") or {})
+            if p and not _ff16_is_plan_doc(p) and not _is_doc(p):
+                parts.append(_clean_file_text(e.get("result") or ""))
+    return "\n".join(parts)
+
+
+def _ff17_added_act_corpus(ok_acts) -> str:
+    """Concatenate all newString / content payloads from successful acts."""
+    parts = []
+    for e in ok_acts or []:
+        args_a = e.get("args") or {}
+        for nk in _NEW_KEYS:
+            if isinstance(args_a.get(nk), str) and args_a[nk]:
+                parts.append(args_a[nk])
+    return "\n".join(parts)
+
+
+def _ff17_extract_req_tokens(text: str, orig_corpus: str) -> list:
+    """Extract backticked function names, config keys, and API routes from `text`
+    that do NOT already exist in `orig_corpus` (i.e. new symbols to implement)."""
+    if not text:
+        return []
+    out = []
+    for sp in re.findall(r"`([^`\n]+)`", text):
+        sp_s = sp.strip()
+        token = None
+        m_fn = re.match(r"^([A-Za-z_]\w{3,})\s*\(", sp_s)
+        m_route = re.search(r"(/v\d+/[A-Za-z0-9_/-]+)", sp_s)
+        m_cfg = re.match(r"^[\"']([A-Za-z_]\w{3,})[\"']\s*:", sp_s)
+        m_var = re.match(r"^(_[A-Za-z_]\w{3,})\s*=", sp_s)
+        if m_fn:
+            token = m_fn.group(1)
+        elif m_route:
+            token = m_route.group(1)
+        elif m_cfg:
+            token = m_cfg.group(1)
+        elif m_var:
+            token = m_var.group(1)
+        if (token and token not in _FF17_STOP_IDENTS
+                and not token.startswith("test_")
+                and token not in (orig_corpus or "")
+                and token not in out):
+            out.append(token)
+    return out
+
+
+def _ff17_is_pure_test_todo(content: str, edited_paths: list) -> bool:
+    """True when a todo item is purely about running tests (and any test file it
+    names has already been created/edited)."""
+    folded = T._fold_diacritics(content or "").lower()
+    if not _FF17_PURE_TEST_TODO_RE.search(folded):
+        return False
+    td_files = [
+        f for f in T._files_in(content or "")
+        if f.lower() not in T._NON_FILE_NAMES and not _ff16_is_plan_doc(f) and not _is_doc(f)
+    ]
+    if any(not any(_ff12_same_file(tf, ep) for ep in edited_paths) for tf in td_files):
+        return False
+    if _FF17_WRITE_VERB_TODO_RE.search(folded) and not td_files:
+        if not any(_is_test_path(ep) for ep in edited_paths):
+            return False
+    return True
+
+
+def _ff17_remaining_plan_or_todo_work(ctx, ev, messages) -> dict:
+    """Inspect active `todowrite` state, read plan documents, and user prompt to
+    determine if `step 3/5 act` still has unfinished implementation items, symbols,
+    or test files to create before transitioning to `step 4/5 tests`."""
+    ok_acts = [e for e in (ev or []) if e.get("kind") == "act" and _act_ok(e)]
+    edited_paths = [_call_path(e.get("args") or {}) for e in ok_acts if _call_path(e.get("args") or {})]
+    orig_corpus = _ff17_orig_read_corpus(ev)
+    added_corpus = _ff17_added_act_corpus(ok_acts)
+    listing = _listing_files(ev or [])
+
+    # 1. Check active todowrite items
+    remaining_todos = []
+    todo_calls = [
+        e for e in (ev or [])
+        if _ff16_is_todo_tool(e.get("name", ""))
+        and isinstance((e.get("args") or {}).get("todos"), list)
+    ]
+    if todo_calls:
+        latest_todos = todo_calls[-1]["args"]["todos"]
+        done_count = 0
+        open_items = []
+        for td in latest_todos:
+            if not isinstance(td, dict):
+                continue
+            status = str(td.get("status") or "").strip().lower()
+            content = str(td.get("content") or td.get("title") or td.get("text") or "").strip()
+            if not content or status in ("cancelled", "canceled"):
+                continue
+            if _ff17_is_pure_test_todo(content, edited_paths):
+                continue
+            if status in ("completed", "done"):
+                done_count += 1
+            else:
+                open_items.append(content)
+        consumed_open = max(0, len(ok_acts) - done_count)
+        for idx, item_txt in enumerate(open_items):
+            td_files = [
+                f for f in T._files_in(item_txt)
+                if f.lower() not in T._NON_FILE_NAMES and not _ff16_is_plan_doc(f) and not _is_doc(f)
+            ]
+            uncreated_td = [
+                tf for tf in td_files
+                if not any(_ff12_same_file(tf, ep) for ep in edited_paths)
+            ]
+            td_reqs = _ff17_extract_req_tokens(item_txt, orig_corpus)
+            missing_td_reqs = [r for r in td_reqs if r not in added_corpus]
+            if uncreated_td or missing_td_reqs:
+                remaining_todos.append(item_txt)
+            elif td_reqs and not missing_td_reqs:
+                continue
+            elif idx >= consumed_open:
+                remaining_todos.append(item_txt)
+
+    # 2. Check required symbols/routes/config keys from read plan documents
+    plan_bodies = "\n".join(b for _p, b in _ff16_read_plan_bodies(messages or []))
+    plan_req_tokens = _ff17_extract_req_tokens(plan_bodies, orig_corpus) if plan_bodies else []
+    missing_plan_tokens = [tok for tok in plan_req_tokens if tok not in added_corpus]
+
+    # 3. Check uncreated files from plan document or user prompt (including test files)
+    uncreated_files = []
+    if messages is not None:
+        for pf in _ff16_plan_files(ctx, messages, listing):
+            if _is_doc(pf) or _ff16_is_plan_doc(pf):
+                continue
+            in_listing = bool(listing) and any(_ff12_same_file(pf, lf) for lf in listing)
+            if (not in_listing or _is_test_path(pf)) and not any(_ff12_same_file(pf, ep) for ep in edited_paths):
+                if pf not in uncreated_files:
+                    uncreated_files.append(pf)
+    for cf in sorted(T._created_files(getattr(ctx, "scannable", "") or "", getattr(ctx, "folded", "") or "")):
+        if not any(_ff12_same_file(cf, ep) for ep in edited_paths) and not any(_ff12_same_file(cf, uf) for uf in uncreated_files):
+            uncreated_files.append(cf)
+    if (not uncreated_files
+            and _CREATE_TEST_INTENT_RE.search(getattr(ctx, "folded", "") or "")
+            and not any(_is_test_path(ep) for ep in edited_paths)):
+        uncreated_files.append("tests/test_new_feature.py")
+
+    has_more = bool(remaining_todos or missing_plan_tokens or uncreated_files)
+    return {
+        "has_more": has_more,
+        "remaining_todos": remaining_todos,
+        "missing_plan_tokens": missing_plan_tokens,
+        "uncreated_files": uncreated_files,
+    }
+
+
+_ff17_prev_change_tail = _change_tail
+
+
+def _change_tail(pat, ctx, ev, tm, names_all, total, extra=""):
+    if _ff17_c("flow17_plan_todo_act") and tm.first("act"):
+        try:
+            msgs = getattr(_ff8_tls, "messages", None)
+            acts = [e for e in ev if e["kind"] == "act"]
+            plan_max_acts = max(int(_cfg("flow_max_acts")), int(_ff17_c("flow17_plan_max_acts", 12) or 12))
+            ok_acts = [e for e in acts if _act_ok(e)]
+            if (ok_acts and len(acts) < plan_max_acts and _act_ok(acts[-1])
+                    and not _tests_ran_after_act(ev)):
+                rem = _ff17_remaining_plan_or_todo_work(ctx, ev, msgs)
+                if rem["has_more"]:
+                    parts = ["Continue implementing the remaining plan/TODO steps before running tests."]
+                    if rem["remaining_todos"]:
+                        parts.append(
+                            f"Next pending TODO ({len(rem['remaining_todos'])} remaining): "
+                            f"{rem['remaining_todos'][0]}."
+                        )
+                    if rem["missing_plan_tokens"]:
+                        parts.append(
+                            "Still missing required symbols/keys/routes from the plan: "
+                            + ", ".join(f"`{t}`" for t in rem["missing_plan_tokens"][:6])
+                            + "."
+                        )
+                    if rem["uncreated_files"] and not rem["missing_plan_tokens"]:
+                        parts.append(
+                            "Create the required test/new file now using the write tool: "
+                            + ", ".join(f"`{u}`" for u in rem["uncreated_files"][:3])
+                            + "."
+                        )
+                    elif rem["uncreated_files"]:
+                        parts.append(
+                            "Pending file(s) to create after code edits: "
+                            + ", ".join(f"`{u}`" for u in rem["uncreated_files"][:3])
+                            + "."
+                        )
+                    parts.append(
+                        "Emit the next edit/write tool_call now (copying oldString "
+                        "verbatim from the file without line-number prefixes)."
+                    )
+                    return Step(
+                        pat, "act", 3, total, {"act"},
+                        " ".join(parts) + _DO_NOT_DESCRIBE + extra,
+                        None, False, tm.names({"act"})
+                    )
+        except Exception as ex:
+            log("[fix17] plan/todo act continuation error: %s" % ex)
+    return _ff17_prev_change_tail(pat, ctx, ev, tm, names_all, total, extra=extra)
+
+
+_ff17_prev_todo_ledger_outer = _ff16_todo_ledger
+
+
+def _ff16_todo_ledger(ctx, messages) -> str:
+    base_ledger = _ff17_prev_todo_ledger_outer(ctx, messages)
+    if not _ff16_c("flow16_plan_todo") or ctx is None:
+        return base_ledger
+    try:
+        ev = _answered_calls(messages or [])
+        ok_acts = [e for e in ev if e.get("kind") == "act" and _act_ok(e)]
+        orig_corpus = _ff17_orig_read_corpus(ev)
+        added_corpus = _ff17_added_act_corpus(ok_acts)
+        edited_files = sorted({_call_path(e["args"]) for e in ok_acts if _call_path(e.get("args") or {})})
+        tested = _tests_ran_after_act(ev) if edited_files else bool(_test_runs(ev))
+
+        todo_calls = [
+            e for e in ev
+            if _ff16_is_todo_tool(e.get("name", ""))
+            and isinstance((e.get("args") or {}).get("todos"), list)
+        ]
+        steps = _ff16_extract_todo_items(ctx, messages or [])
+        if todo_calls:
+            raw_todos = [
+                td for td in todo_calls[-1]["args"]["todos"]
+                if isinstance(td, dict) and str(td.get("content") or td.get("title") or "").strip()
+            ]
+            if raw_todos:
+                s_parts = []
+                rem_info = _ff17_remaining_plan_or_todo_work(ctx, ev, messages)
+                rem_set = {x.lower() for x in rem_info["remaining_todos"]}
+                for idx, td in enumerate(raw_todos[:8], 1):
+                    txt = str(td.get("content") or td.get("title") or "").strip()
+                    st_raw = str(td.get("status") or "").strip().lower()
+                    if _ff17_is_pure_test_todo(txt, edited_files):
+                        done = tested
+                    elif txt.lower() in rem_set:
+                        done = False
+                    elif st_raw in ("completed", "done"):
+                        done = True
+                    else:
+                        done = not bool(rem_set)
+                    s_parts.append(f"{idx}. {'[x]' if done else '[ ]'} {txt}")
+                lines = ["[Plan & TODO Progress]"]
+                if s_parts:
+                    lines.append("Steps: " + " | ".join(s_parts))
+                return "\n".join(lines)
+
+        if base_ledger and steps and orig_corpus:
+            s_parts = []
+            for idx, st in enumerate(steps[:8], 1):
+                st_reqs = _ff17_extract_req_tokens(st, orig_corpus)
+                st_files = [f for f in T._files_in(st) if f.lower() not in T._NON_FILE_NAMES]
+                if st_reqs:
+                    done = all(r in added_corpus for r in st_reqs)
+                elif st_files:
+                    done = all(
+                        any(_ff12_same_file(sf, ef) for ef in edited_files)
+                        or (_is_test_path(sf) and tested)
+                        for sf in st_files
+                    )
+                elif re.search(r"\b(?:test|unittest|pytest|verify|kiem\s+tra|nghiem\s+thu)\b", st, re.I):
+                    done = tested
+                else:
+                    done = False
+                s_parts.append(f"{idx}. {'[x]' if done else '[ ]'} {st}")
+            prefix_lines = [ln for ln in base_ledger.splitlines() if not ln.startswith("Steps: ")]
+            prefix_lines.append("Steps: " + " | ".join(s_parts))
+            return "\n".join(prefix_lines)
+    except Exception as ex:
+        log("[fix17] todo ledger refine error: %s" % ex)
+    return base_ledger
+
+
+def _ff17_act_context_pack(ctx, messages) -> str:
+    """When read tool results exceed 80 KB (so `_join_prompt_parts` truncates the
+    earlier chunks of a large file and/or the plan document), build a compact
+    verbatim context pack containing:
+      1. Any read plan document (`feature_implementation_plan.md`)
+      2. Unnumbered verbatim code windows from the current post-edit file text
+         (`_ff9_read_texts(messages)`) around every function/class/config/route
+         referenced by the plan or user request.
+    """
+    ev = _answered_calls(messages or [])
+    total_read_chars = sum(
+        len(e.get("result") or "") for e in ev
+        if e.get("kind") == "read" and _read_ok(e)
+    )
+    if total_read_chars < 80000:
+        return ""
+
+    out_blocks = []
+    plan_bodies = _ff16_read_plan_bodies(messages or [])
+    for p_path, p_body in plan_bodies[:2]:
+        if p_body:
+            out_blocks.append(
+                f"[Plan Document ({p_path}) -- preserved against prompt truncation:]\n"
+                + p_body[:12000]
+            )
+
+    plan_text = "\n".join(b for _p, b in plan_bodies)
+    req_text = (getattr(ctx, "request", "") or getattr(ctx, "last", "") or "") + "\n" + plan_text
+    cand_idents = set()
+    cand_routes = set()
+    for sp in re.findall(r"`([^`\n]+)`", req_text):
+        for m_rt in re.finditer(r"(/v\d+/[A-Za-z0-9_/-]+)", sp):
+            cand_routes.add(m_rt.group(1))
+        for m_id in re.finditer(r"\b([A-Za-z_]\w{2,})\b", sp):
+            tok = m_id.group(1)
+            if tok not in _FF17_STOP_IDENTS:
+                cand_idents.add(tok)
+    for kw in _keywords(getattr(ctx, "request", "") or ""):
+        if len(kw) >= 4 and kw not in _FF17_STOP_IDENTS:
+            cand_idents.add(kw)
+
+    tracked_texts = _ff9_read_texts(messages or [])
+    if not tracked_texts:
+        for v in _ff8_file_views(ev):
+            clean_s, _ = _ff17_strip_numbered_lines(v.get("text") or "")
+            if clean_s:
+                tracked_texts[v.get("path") or ""] = clean_s
+
+    budget_remaining = 32000
+    for fpath, full_src in tracked_texts.items():
+        if not full_src or len(full_src) < 60000 or _ff16_is_plan_doc(fpath) or _is_doc(fpath):
+            continue
+        clean_src, _ = _ff17_strip_numbered_lines(full_src)
+        src_lines = clean_src.splitlines()
+        windows = []
+        try:
+            tree = _ff5_ast.parse(clean_src)
+        except Exception:
+            tree = None
+
+        if tree is not None:
+            def _collect_ast_windows(stmts):
+                for node in stmts:
+                    if isinstance(node, (_ff5_ast.FunctionDef, _ff5_ast.AsyncFunctionDef)):
+                        if node.name in cand_idents or any(len(c) >= 5 and c.lower() == node.name.lower() for c in cand_idents):
+                            s_ln = max(1, node.lineno - 2)
+                            e_ln = min(len(src_lines), getattr(node, "end_lineno", node.lineno) + 2)
+                            windows.append((s_ln, e_ln, node.name))
+                    elif isinstance(node, _ff5_ast.ClassDef):
+                        if node.name in cand_idents and (getattr(node, "end_lineno", node.lineno) - node.lineno) <= 120:
+                            s_ln = max(1, node.lineno - 2)
+                            e_ln = min(len(src_lines), getattr(node, "end_lineno", node.lineno) + 2)
+                            windows.append((s_ln, e_ln, node.name))
+                        _collect_ast_windows(node.body)
+                    elif isinstance(node, _ff5_ast.Assign):
+                        for t in node.targets:
+                            if isinstance(t, _ff5_ast.Name) and t.id in cand_idents:
+                                s_ln = max(1, node.lineno - 2)
+                                e_ln = min(len(src_lines), getattr(node, "end_lineno", node.lineno) + 2)
+                                windows.append((s_ln, e_ln, t.id))
+
+            _collect_ast_windows(tree.body)
+
+        for idx_ln, ln_str in enumerate(src_lines, 1):
+            if any(rt in ln_str for rt in cand_routes):
+                windows.append((max(1, idx_ln - 8), min(len(src_lines), idx_ln + 15), "route"))
+
+        if not windows:
+            continue
+        windows.sort()
+        merged = []
+        for s_ln, e_ln, wname in windows:
+            if merged and s_ln <= merged[-1][1] + 5:
+                prev_s, prev_e, prev_n = merged[-1]
+                new_n = prev_n if wname in prev_n.split(",") else (prev_n + "," + wname)
+                merged[-1] = (prev_s, max(prev_e, e_ln), new_n)
+            else:
+                merged.append((s_ln, e_ln, wname))
+
+        file_excerpts = [
+            f"[Target Code Windows from {fpath} (current post-edit state, NO line numbers -- copy `oldString` verbatim from these blocks):]"
+        ]
+        for s_ln, e_ln, wnames in merged:
+            snippet = "\n".join(src_lines[s_ln - 1:e_ln])
+            if len(snippet) > budget_remaining and len(file_excerpts) > 1:
+                break
+            header = f"--- {fpath} lines {s_ln}-{e_ln} ({wnames}) ---"
+            file_excerpts.append(header + "\n" + snippet)
+            budget_remaining -= len(snippet)
+            if budget_remaining <= 0:
+                break
+        if len(file_excerpts) > 1:
+            out_blocks.append("\n\n".join(file_excerpts))
+
+    return "\n\n".join(out_blocks)
+
+
 _ff17_prev_after_plan = _ff5_after_plan
 
 
 def _ff5_after_plan(step, messages, tm, ctx=None):
     step = _ff17_prev_after_plan(step, messages, tm, ctx)
     try:
-        if (step is not None and getattr(step, "name", None) == "answer"
-                and getattr(step, "local_text", None) is None
-                and not _c5("flow6_lean_prompt")):
-            idx_block = _ff17_large_file_structure_index(messages)
-            if idx_block and "[Structure index for " not in (step.instruction or ""):
-                step.instruction = (step.instruction or "") + "\n\n" + idx_block
+        if step is not None and getattr(step, "local_text", None) is None and not _c5("flow6_lean_prompt"):
+            if getattr(step, "name", None) == "answer":
+                idx_block = _ff17_large_file_structure_index(messages)
+                if idx_block and "[Structure index for " not in (step.instruction or ""):
+                    step.instruction = (step.instruction or "") + "\n\n" + idx_block
+            elif (getattr(step, "name", None) == "act"
+                  and not getattr(step, "drive", False)
+                  and _ff17_c("flow17_act_context_pack")):
+                if ctx is None:
+                    ctx = _analyze(messages)
+                pack = _ff17_act_context_pack(ctx, messages)
+                if pack and "[Target Code Windows from " not in (step.instruction or "") and "[Plan Document (" not in (step.instruction or ""):
+                    step.instruction = (step.instruction or "") + "\n\n" + pack
     except Exception as e:
-        log(f"[fix17] structure index error: {e}")
+        log(f"[fix17] after_plan context/index error: {e}")
     return step
 
 

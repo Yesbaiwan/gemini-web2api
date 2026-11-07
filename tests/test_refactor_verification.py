@@ -104,6 +104,188 @@ class TestRefactorVerification(unittest.TestCase):
         M.CONFIG["flow15_server_hardening"] = True
 
 
+
+    def test_plan_implementation_with_create_test_clause_stays_change(self):
+        """User prompt: read feature_implementation_plan.md, implement into gemini_web2api.py,
+        then create test file -> must route as CHANGE (not CREATE) and not mark existing files as created."""
+        prompt = (
+            "Hãy đọc file feature_implementation_plan.md và thực thi từng bước trong "
+            "checklist để implement tính năng vào gemini_web2api.py. Sau khi hoàn thành, "
+            "hãy tạo file test và chạy unit test để nghiệm thu."
+        )
+        ctx = M._analyze([{"role": "user", "content": prompt}])
+        self.assertEqual("CHANGE", ctx.pattern)
+        created = M._created_files(ctx.scannable, ctx.folded)
+        self.assertNotIn("feature_implementation_plan.md", created)
+        self.assertNotIn("gemini_web2api.py", created)
+
+    def test_todowrite_and_plan_phases_keep_flow_in_act_until_complete(self):
+        """When todowrite has pending items or plan symbols/test files are not yet implemented,
+        _change_tail must stay in step 3/5 act instead of jumping to tests/answer after 1 edit."""
+        prompt = (
+            "Hãy đọc file feature_implementation_plan.md và thực thi từng bước trong "
+            "checklist để implement tính năng vào gemini_web2api.py. Sau khi hoàn thành, "
+            "hãy tạo file test và chạy unit test để nghiệm thu."
+        )
+        plan_doc = (
+            "# Plan\n"
+            "- [ ] **Step 1:** Update `DEFAULT_CONFIG` in `gemini_web2api.py` with `\"cookie_pool\": []`.\n"
+            "- [ ] **Step 2:** Implement `init_cookie_pool()`, `get_active_cookie_credentials()`, `mark_cookie_cooldown(path, reason)` in `gemini_web2api.py`.\n"
+            "- [ ] **Step 3:** Add `GET /v1/cookies/pool` in `do_GET()` of `gemini_web2api.py`.\n"
+            "- [ ] **Step 4:** Create `tests/test_cookie_pool.py` and run unit tests.\n"
+        )
+        msgs = [
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c_glob", "type": "function", "function": {
+                    "name": "glob", "arguments": json.dumps({"pattern": "**/*.py"})}}
+            ]},
+            {"role": "tool", "tool_call_id": "c_glob", "content": "gemini_web2api.py\ntests/test_server.py"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c_r1", "type": "function", "function": {
+                    "name": "read", "arguments": json.dumps({"filePath": "feature_implementation_plan.md"})}},
+                {"id": "c_r2", "type": "function", "function": {
+                    "name": "read", "arguments": json.dumps({"filePath": "gemini_web2api.py"})}},
+            ]},
+            {"role": "tool", "tool_call_id": "c_r1", "content": plan_doc},
+            {"role": "tool", "tool_call_id": "c_r2", "content": 'DEFAULT_CONFIG = {\n    "port": 8081,\n}\ndef load_cookie():\n    pass\ndef do_GET(self):\n    pass\n'},
+            # Turn 1 of act: model calls todowrite (1 completed, 3 pending) + 1st edit (DEFAULT_CONFIG)
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c_todo", "type": "function", "function": {
+                    "name": "todowrite",
+                    "arguments": json.dumps({"todos": [
+                        {"content": "Step 1: Update DEFAULT_CONFIG", "status": "completed"},
+                        {"content": "Step 2: Implement init_cookie_pool", "status": "in_progress"},
+                        {"content": "Step 3: Add GET /v1/cookies/pool", "status": "pending"},
+                        {"content": "Step 4: Write tests/test_cookie_pool.py and run tests", "status": "pending"},
+                    ]})
+                }},
+                {"id": "c_e1", "type": "function", "function": {
+                    "name": "edit",
+                    "arguments": json.dumps({
+                        "filePath": "gemini_web2api.py",
+                        "oldString": 'DEFAULT_CONFIG = {\n    "port": 8081,\n}',
+                        "newString": 'DEFAULT_CONFIG = {\n    "port": 8081,\n    "cookie_pool": [],\n}',
+                    })
+                }},
+            ]},
+            {"role": "tool", "tool_call_id": "c_todo", "content": "Todos updated: 1/4 completed"},
+            {"role": "tool", "tool_call_id": "c_e1", "content": "Edit applied successfully."},
+        ]
+        tm = M.ToolMap(
+            {"glob", "read", "edit", "write", "bash", "todowrite"},
+            {
+                "glob": {"pattern"},
+                "read": {"filePath", "offset", "limit"},
+                "edit": {"filePath", "oldString", "newString"},
+                "write": {"filePath", "content"},
+                "bash": {"command"},
+                "todowrite": {"todos"},
+            },
+            {},
+        )
+        step = M.plan_for(msgs, tm)
+        self.assertIsNotNone(step)
+        self.assertEqual("act", step.name)
+        self.assertIn("init_cookie_pool", step.instruction)
+
+        # Verify a second surgical edit on gemini_web2api.py is allowed by postfilter without re-reading
+        ctx = M._analyze(msgs)
+        tc_e2 = {"id": "c_e2", "type": "function", "function": {
+            "name": "edit",
+            "arguments": json.dumps({
+                "filePath": "gemini_web2api.py",
+                "oldString": "def load_cookie():\n    pass",
+                "newString": "def init_cookie_pool():\n    pass\ndef get_active_cookie_credentials():\n    pass\ndef mark_cookie_cooldown(p, r):\n    pass\ndef load_cookie():\n    pass",
+            })
+        }}
+        res_pf, nudge_pf = M._ff5_postfilter(("", [tc_e2]), msgs, ctx.perm, last=False, tm=tm, ctx=ctx)
+        self.assertIsNone(nudge_pf)
+        self.assertIsNotNone(res_pf)
+        self.assertEqual(1, len(res_pf[1]))
+
+        # Apply Step 2, Step 3, and Step 4 (write tests/test_cookie_pool.py) -> should then transition to tests
+        msgs += [
+            {"role": "assistant", "content": "", "tool_calls": [tc_e2]},
+            {"role": "tool", "tool_call_id": "c_e2", "content": "Edit applied successfully."},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c_e3", "type": "function", "function": {
+                    "name": "edit",
+                    "arguments": json.dumps({
+                        "filePath": "gemini_web2api.py",
+                        "oldString": "def do_GET(self):\n    pass",
+                        "newString": 'def do_GET(self):\n    if self.path == "/v1/cookies/pool": return\n',
+                    })
+                }}
+            ]},
+            {"role": "tool", "tool_call_id": "c_e3", "content": "Edit applied successfully."},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c_w1", "type": "function", "function": {
+                    "name": "write",
+                    "arguments": json.dumps({
+                        "filePath": "tests/test_cookie_pool.py",
+                        "content": "import unittest\nclass T(unittest.TestCase):\n    def test_ok(self): pass\n",
+                    })
+                }}
+            ]},
+            {"role": "tool", "tool_call_id": "c_w1", "content": "Wrote file successfully."},
+        ]
+        step_after_all = M.plan_for(msgs, tm)
+        self.assertIsNotNone(step_after_all)
+        self.assertIn(step_after_all.name, ("diff", "tests"))
+        if step_after_all.name == "diff":
+            msgs += [
+                {"role": "assistant", "content": "", "tool_calls": step_after_all.calls},
+                {"role": "tool", "tool_call_id": step_after_all.calls[0]["id"], "content": "diff --git a/gemini_web2api.py b/gemini_web2api.py"},
+            ]
+            step_tests = M.plan_for(msgs, tm)
+            self.assertIsNotNone(step_tests)
+            self.assertEqual("tests", step_tests.name)
+
+    def test_window_reread_on_already_read_file_does_not_trigger_continuations(self):
+        """A small window read (offset=30, limit=120) on a file already read past offset 150
+        must not be treated as an unfinished file read."""
+        ev = [
+            {"name": "read", "kind": "read", "args": {"filePath": "big.py"},
+             "result": "1: a\n[Output truncated. Continue reading with offset: 1201]"},
+            {"name": "read", "kind": "read", "args": {"filePath": "big.py", "offset": 1201},
+             "result": "1201: end of file"},
+            {"name": "read", "kind": "read", "args": {"filePath": "big.py", "offset": 30, "limit": 120},
+             "result": "30: window\n[Output truncated. Continue reading with offset: 150]"},
+        ]
+        self.assertEqual([], M._ff4_unfinished(ev))
+        self.assertEqual([], M._ff4_continuations(ev, "offset"))
+
+    def test_large_file_act_context_pack_injects_plan_and_verbatim_windows(self):
+        """When read outputs exceed 80 KB, _ff5_after_plan injects the plan doc and
+        unnumbered verbatim AST code windows into step.instruction during act."""
+        prompt = "Hãy đọc feature_implementation_plan.md và cập nhật `DEFAULT_CONFIG` cùng `load_cookie` trong `big.py`."
+        plan_doc = "Cập nhật `DEFAULT_CONFIG` và hàm `load_cookie()` trong `big.py`."
+        padding = "# padding line for large file\n" * 3200
+        big_code = (
+            'DEFAULT_CONFIG = {\n    "port": 8081,\n}\n'
+            + padding
+            + "def load_cookie():\n    return None\n"
+        )
+        msgs = [
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "r_plan", "type": "function", "function": {
+                    "name": "read", "arguments": json.dumps({"filePath": "feature_implementation_plan.md"})}},
+                {"id": "r_big", "type": "function", "function": {
+                    "name": "read", "arguments": json.dumps({"filePath": "big.py"})}},
+            ]},
+            {"role": "tool", "tool_call_id": "r_plan", "content": plan_doc},
+            {"role": "tool", "tool_call_id": "r_big", "content": big_code},
+        ]
+        tm = M.ToolMap({"read", "edit"}, {"read": {"filePath"}, "edit": {"filePath", "oldString", "newString"}}, {})
+        step = M.Step("CHANGE", "act", 3, 5, {"act"}, "Make the change.", None, False, ["edit"])
+        step = M._ff5_after_plan(step, msgs, tm, M._analyze(msgs))
+        self.assertIn("[Plan Document (feature_implementation_plan.md)", step.instruction)
+        self.assertIn("[Target Code Windows from big.py", step.instruction)
+        self.assertIn("def load_cookie():", step.instruction)
+
+
 if __name__ == "__main__":
     unittest.main()
 
