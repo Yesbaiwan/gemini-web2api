@@ -21,21 +21,34 @@ const TICKET_ROUTE_KEYS = {
   "8,4": "argon-medium"
 };
 
-function parseTicketHeader(headerVal) {
-  if (!headerVal || typeof headerVal !== "string") return null;
-  if (headerVal.length > 8192 || /[\r\n\0]/.test(headerVal)) return null;
-  try {
-    const arr = JSON.parse(headerVal);
-    if (!Array.isArray(arr)) return null;
-    if (!Number.isInteger(arr[14]) || !Number.isInteger(arr[15])) return null;
-    const key = TICKET_ROUTE_KEYS[`${arr[14]},${arr[15]}`];
-    if (!key) return null;
-    return { key, header: headerVal.trim() };
-  } catch {
-    return null;
+function ticketParseDetail(headerVal) {
+  if (!headerVal || typeof headerVal !== "string") {
+    return { ok: false, reason: "no-header" };
   }
+  if (headerVal.length > 8192) return { ok: false, reason: "too-long" };
+  if (/[\r\n\0]/.test(headerVal)) return { ok: false, reason: "bad-chars" };
+  let arr;
+  try {
+    arr = JSON.parse(headerVal);
+  } catch {
+    return { ok: false, reason: "bad-json" };
+  }
+  if (!Array.isArray(arr)) return { ok: false, reason: "not-array" };
+  const family = arr[14];
+  const variant = arr[15];
+  if (!Number.isInteger(family) || !Number.isInteger(variant)) {
+    return { ok: false, reason: `no-route(len=${arr.length})` };
+  }
+  const key = TICKET_ROUTE_KEYS[`${family},${variant}`];
+  if (!key) return { ok: false, reason: `unknown-route(${family},${variant})` };
+  return { ok: true, key, family, variant, header: headerVal.trim() };
+}
+
+function parseTicketHeader(headerVal) {
+  const detail = ticketParseDetail(headerVal);
+  return detail.ok ? { key: detail.key, header: detail.header } : null;
 }
 
 if (typeof module !== "undefined") {
-  module.exports = { TICKET_ROUTE_KEYS, parseTicketHeader };
+  module.exports = { TICKET_ROUTE_KEYS, parseTicketHeader, ticketParseDetail };
 }

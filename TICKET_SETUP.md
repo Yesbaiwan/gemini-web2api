@@ -266,6 +266,43 @@ level thấp hơn.
 
 ---
 
+## 5.4 Capture tự động bằng extension
+
+Extension bắt header `X-Goog-Ext-525001261-Jspb` theo hai đường: `webRequest`
+(chính) và hook `fetch`/`XMLHttpRequest` trong page (dự phòng). Làm đúng các
+bước sau:
+
+1. `chrome://extensions` → **Reload** extension (bắt buộc sau khi cập nhật
+   `ticket-map.js` / thêm content script).
+2. Mở `https://gemini.google.com` trong **đúng browser/profile** đang cài
+   extension, rồi refresh tab (content script chỉ inject khi trang load).
+3. Chọn đúng model + level trong UI và gửi một tin nhắn bình thường.
+4. Mở popup extension → **Inspect session**. Kiểm tra:
+
+```text
+model_tickets: N captured (flash, flash-medium, flash-thinking, ...)
+Ticket scan: X request(s), Y with Jspb header, Z mapped
+Last scan: <thời gian> | <reason> | <webRequest|page-hook> | <số ký tự>
+```
+
+Cách đọc dòng chẩn đoán:
+
+| Dòng | Ý nghĩa |
+|---|---|
+| `X = 0` | Không thấy request Gemini nào: sai browser/profile, tab chưa refresh, hoặc extension chưa reload |
+| `Y = 0` với `reason=no-header` | Có request nhưng header bị che/không có; thường do request phát từ service worker của page hoặc extension cũ |
+| `reason=no-route(len=...)` | Header có nhưng thiếu `(family, variant)` ở index 14/15 (header dạng ngắn) |
+| `reason=unknown-route(x,y)` | Route lạ, cần bổ sung vào `ticket-map.js` |
+| `Z > 0` và `model_tickets` có key | Capture thành công; extension sẽ push `/v1/cookies` |
+
+5. Nếu capture thành công, extension tự push ticket lên server. Có thể kiểm
+   tra lại bằng `python tools/check_tickets.py --all`.
+
+Nếu popup vẫn báo `none yet` dù `Ticket scan` có request và header, gửi lại
+dòng `Last scan` (che cookie/ticket value) để biết đang tắc ở đâu.
+
+---
+
 ## 6. Capture ticket thủ công
 
 1. Mở [https://gemini.google.com](https://gemini.google.com) và đăng nhập.

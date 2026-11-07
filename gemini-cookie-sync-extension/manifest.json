@@ -20,6 +20,19 @@
   "background": {
     "service_worker": "background.js"
   },
+  "content_scripts": [
+    {
+      "matches": ["https://gemini.google.com/*"],
+      "js": ["content-ticket-hook.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["https://gemini.google.com/*"],
+      "js": ["content-ticket-bridge.js"],
+      "run_at": "document_start"
+    }
+  ],
   "action": {
     "default_title": "Gemini Cookie Sync",
     "default_popup": "popup.html"

@@ -14,7 +14,7 @@
  * It exits 0 when everything passes and 1 otherwise. No network access needed.
  */
 
-const { TICKET_ROUTE_KEYS, parseTicketHeader } =
+const { TICKET_ROUTE_KEYS, parseTicketHeader, ticketParseDetail } =
   require("../gemini-cookie-sync-extension/ticket-map.js");
 
 const HIGH = '[1,null,null,null,"cf41b0e0dd7d53e5",null,"en",null,[4,33,22,5,6,8,16,19,20],null,null,null,null,null,6,2,"BED71B1C-F2D7-410A-913F-B1415D1452C6",["boq_gemini-web-uiserver_20261105.19_p0"],null,[[null,491200000],[1793982546,474000000],"Asia/Bangkok"]]';
@@ -77,6 +77,22 @@ check("too-short array -> null", parseTicketHeader('[1,null,null,null,"cf41b0e0d
 check("unknown route -> null", parseTicketHeader(withNullTicket(LOW).replace(",6,1,", ",6,9,")), null);
 check("non-string input -> null", parseTicketHeader(null), null);
 check("CRLF input -> null", parseTicketHeader(withNullTicket(LOW) + "\r\n"), null);
+
+// ticketParseDetail powers the popup diagnostics: it must name why a header
+// was rejected so "none captured" can be distinguished from "no request seen".
+check("detail: mapped header",
+      ticketParseDetail(withNullTicket(LOW)),
+      { ok: true, key: "lite", family: 6, variant: 1, header: withNullTicket(LOW) });
+check("detail: missing header", ticketParseDetail(null).reason, "no-header");
+check("detail: malformed JSON", ticketParseDetail("not json").reason, "bad-json");
+check("detail: non-array JSON", ticketParseDetail('{"14":6,"15":1}').reason, "not-array");
+check("detail: short array reports its length",
+      ticketParseDetail('[1,null,null,null,"cf41b0e0dd7d53e5"]').reason, "no-route(len=5)");
+check("detail: unknown route names the pair",
+      ticketParseDetail(withNullTicket(LOW).replace(",6,1,", ",6,9,")).reason,
+      "unknown-route(6,9)");
+check("detail: CRLF is rejected", ticketParseDetail(withNullTicket(LOW) + "\r\n").reason,
+      "bad-chars");
 
 console.info(failures === 0 ? "\nAll extension ticket checks passed."
                             : "\n" + failures + " check(s) failed.");

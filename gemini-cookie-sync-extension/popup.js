@@ -268,10 +268,11 @@ async function readStoredModelTickets() {
 }
 
 async function buildInspection() {
-  const [cookies, tabs, modelTickets] = await Promise.all([
+  const [cookies, tabs, modelTickets, scan] = await Promise.all([
     readGoogleCookies(),
     chrome.tabs.query({ url: "https://gemini.google.com/*" }),
-    readStoredModelTickets()
+    readStoredModelTickets(),
+    chrome.storage.local.get("ticket_scan").then((r) => r?.ticket_scan || {})
   ]);
 
   const selected = selectBestCookies(cookies);
@@ -291,7 +292,8 @@ async function buildInspection() {
     available,
     authUser,
     pageMetadata,
-    modelTickets
+    modelTickets,
+    ticketScan: scan
   };
 }
 
@@ -305,7 +307,8 @@ function inspectionMessage(info) {
     available,
     authUser,
     pageMetadata,
-    modelTickets
+    modelTickets,
+    ticketScan = {}
   } = info;
   const ticketKeys = Object.keys(modelTickets || {});
 
@@ -318,6 +321,8 @@ function inspectionMessage(info) {
     `gemini_bl / cfb2h: ${pageMetadata.geminiBl ? "present" : "missing"}`,
     `auth_user: ${authUser ?? "default account"}`,
     `model_tickets: ${ticketKeys.length > 0 ? `${ticketKeys.length} captured (${ticketKeys.join(", ")})` : "none yet (send 1 message in Gemini to capture)"}`,
+    `Ticket scan: ${ticketScan.requests || 0} request(s), ${ticketScan.withHeader || 0} with Jspb header, ${ticketScan.mapped || 0} mapped`,
+    `Last scan: ${ticketScan.lastAt || "-"} | ${ticketScan.lastReason || "none"} | ${ticketScan.lastSource || "-"}${ticketScan.lastLength ? ` | ${ticketScan.lastLength} chars` : ""}`,
     `Page data source: ${pageMetadata.source || "unavailable"}`,
     "",
     `Legacy present: ${legacyPresent.join(", ") || "none"}`,

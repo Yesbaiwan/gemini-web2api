@@ -105,6 +105,30 @@ function recordCapturedTicket(headerVal) {
     .catch(() => {});
 }
 
+// Diagnostics shown in the popup's "Inspect session": whether Gemini requests
+// were seen at all and, when a Jspb header arrived, why it was or wasn't
+// mapped. Stores only metadata (counts, reason, URL, header length), never the
+// ticket value.
+async function noteTicketScan(detail, url, source, headerLength) {
+  try {
+    const prev = (await chrome.storage.local.get("ticket_scan")).ticket_scan || {};
+    const next = {
+      requests: (prev.requests || 0) + 1,
+      withHeader: (prev.withHeader || 0) + (detail.reason === "no-header" ? 0 : 1),
+      mapped: (prev.mapped || 0) + (detail.ok ? 1 : 0),
+      lastAt: new Date().toISOString(),
+      lastSource: source || prev.lastSource || "",
+      lastUrl: String(url || prev.lastUrl || "").slice(0, 300),
+      lastReason: detail.reason || (detail.ok ? "mapped" : "unknown"),
+      lastLength: headerLength || prev.lastLength || 0
+    };
+    await chrome.storage.local.set({ ticket_scan: next });
+  } catch {
+    // Diagnostics must never affect capture or sync.
+  }
+}
+
+
 function normalizeDomain(domain = "") {
   return domain.replace(/^\./, "").toLowerCase();
 }
@@ -259,15 +283,29 @@ if (chrome.webRequest?.onBeforeSendHeaders) {
   chrome.webRequest.onBeforeSendHeaders.addListener(
     (details) => {
       const headers = details?.requestHeaders || [];
+      let headerVal = null;
       for (const h of headers) {
         if (h?.name && h.name.toLowerCase() === "x-goog-ext-525001261-jspb" && h.value) {
-          recordCapturedTicket(h.value);
+          headerVal = h.value;
           break;
         }
       }
+      const url = details?.url || "";
+      if (headerVal) {
+        const detail = ticketParseDetail(headerVal);
+        void noteTicketScan(detail, url, "webRequest", headerVal.length);
+        if (detail.ok) recordCapturedTicket(headerVal);
+      } else if (/StreamGenerate/i.test(url)) {
+        // A generation request with no visible Jspb header: the header is
+        // hidden from webRequest or the request shape changed.
+        void noteTicketScan({ ok: false, reason: "no-header" }, url, "webRequest", 0);
+      }
     },
-    { urls: ["https://gemini.google.com/*StreamGenerate*"] },
-    ["requestHeaders"]
+    // Observe every Gemini request, not just StreamGenerate: the header can
+    // appear on auxiliary endpoints too. Only requests with the header (or a
+    // StreamGenerate URL) are recorded by noteTicketScan.
+    { urls: ["https://gemini.google.com/*"] },
+    ["requestHeaders", "extraHeaders"]
   );
 }
 
@@ -282,6 +320,13 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
   if (msg?.type === "get-live-cookie") {
     void getLiveCookie().then((cookie) => sendResponse({ cookie }));
+    return true;
+  }
+  if (msg?.type === "captured-ticket" && typeof msg.value === "string") {
+    const detail = ticketParseDetail(msg.value);
+    void noteTicketScan(detail, "", "page-hook", msg.value.length);
+    if (detail.ok) recordCapturedTicket(msg.value);
+    sendResponse({ ok: detail.ok, reason: detail.reason });
     return true;
   }
   return false;

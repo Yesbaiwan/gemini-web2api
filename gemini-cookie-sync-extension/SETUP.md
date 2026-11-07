@@ -34,6 +34,30 @@ gemini_bl / cfb2h: present
 Session and XSRF are ready for export.
 ```
 
+## Capture model tickets
+
+Tickets are captured automatically from Gemini's own requests. After
+installing or updating the extension:
+
+1. Reload the extension in `chrome://extensions`.
+2. Refresh the `https://gemini.google.com` tab in the same browser/profile.
+3. Select the model and thinking level, then send a normal message.
+4. Open the extension popup → **Inspect session**, and check:
+
+```text
+model_tickets: N captured (flash, flash-thinking, ...)
+Ticket scan: X request(s), Y with Jspb header, Z mapped
+Last scan: <time> | <reason> | <webRequest|page-hook> | <length>
+```
+
+If `model_tickets` is still empty, read `Last scan`:
+
+- `no-header`: a Gemini request was seen but not the ticket header.
+- `no-route(len=...)`: the header is the short form without indexes 14/15.
+- `unknown-route(x,y)`: add that pair to `ticket-map.js`.
+
+Captured tickets are pushed to the local server via `POST /v1/cookies`.
+
 ## Apply it in `gemini-web2api`
 
 Move the exported file into the project:
