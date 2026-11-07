@@ -6690,7 +6690,8 @@ def install():
 
 
 # ==== fix_patch:begin (do fix_patch.py sinh ra; chạy lại script để cập nhật) ====
-_FX_DEFAULTS = {
+_FLOW_DEFAULTS = {
+    # Flow fix 1 defaults
     "fix_enabled": True,
     "fix_debug_flow": True,
     "fix_create_flow": True,
@@ -6699,12 +6700,74 @@ _FX_DEFAULTS = {
     "fix_read_related_tests": True,
     "fix_max_test_attempts": 3,
     "fix_write_shrink_ratio": 0.5,
+    # Flow fix 5 defaults
+    "flow5_enabled": True,
+    "flow5_classify": True,
+    "flow5_ps_fix": True,
+    "flow5_block_destructive": True,
+    "flow5_respect_no_edit": True,
+    "flow5_fail_closed_edits": True,
+    "flow5_guard_retries": 1,
+    "flow5_sticky": True,
+    "flow5_plan": True,
+    "flow5_scope_check": True,
+    "flow5_evidence_gate": True,
+    "flow5_auto_advance": True,
+    "flow5_canned_review": True,
+    "flow5_step_driven": True,
+    "flow5_lean_prompt": True,
+    "flow5_lean_evidence": True,
+    "flow5_lean_evidence_chars": 12000,
+    "flow5_cross_module": True,
+    # Flow fix 6 defaults
+    "flow6_context": True,
+    "flow6_lean_prompt": False,
+    "flow6_metrics": True,
+    "flow6_diff_step": True,
+    "flow6_scope_guard": True,
+    "flow6_universal_guard": True,
+    "flow6_cross_module": True,
+    "flow6_banner": True,
+    # Flow fix 8 defaults
+    "flow8_strict_shell": True,
+    "flow8_write_regate": True,
+    "flow8_absence_proof": True,
+    "flow8_independent_grants": True,
+    "flow8_lean_source": True,
+    "flow8_lean_source_chars": 24000,
+    "flow8_listing_cap": 100,
+    "flow8_bard_strict": True,
+    "flow8_destructive_wide": True,
+    "flow8_revert_needs_edit": True,
+    # Flow fix 10 defaults
+    "flow_tiebreak": True,
+    "flow_ask_on_ambiguity": True,
+    # Flow fix 12 defaults
+    "flow12_poll_max": 12,
+    # Flow fix 14 defaults
+    "flow14_compile": True,
+    "flow14_edit_ambiguity": False,
+    "flow14_explain_hops": True,
+    "flow14_explain_max_reads": 4,
+    # Flow fix 15 defaults
+    "flow15_route": True,
+    "flow15_keywords": True,
+    "flow15_trunc_legacy": True,
+    "flow15_runtime_strict": True,
+    "flow15_server_hardening": True,
 }
-_DEFAULTS.update(_FX_DEFAULTS)
+_FX_DEFAULTS = {k: v for k, v in _FLOW_DEFAULTS.items() if k.startswith("fix_")}
+_DEFAULTS.update(_FLOW_DEFAULTS)
 
 
-def _c(key):
-    return CONFIG.get(key, _FX_DEFAULTS[key])
+def _flow_c(key, default=None):
+    try:
+        return CONFIG.get(key, _FLOW_DEFAULTS.get(key, default))
+    except Exception:
+        return _FLOW_DEFAULTS.get(key, default)
+
+
+_c = _flow_c
 
 
 def _norm(p):
@@ -7019,7 +7082,8 @@ _CAUSE_RE = re.compile(
     r"|find out)\b")
 _FIX_RE = re.compile(r"\b(?:fix|repair|resolve|patch|sua|sua loi|khac phuc)\b")
 _WANT_CHANGE_RE = re.compile(
-    r"\b(?:implement|add|introduce|refactor|upgrade|migrate|rename|them|cap nhat)\b")
+    r"\b(?:implement|add|introduce|refactor|upgrade|migrate|rename|them|cap nhat"
+    r"|bo sung|cai dat|xay dung|trien khai|viet them|lam them|nang cap)\b")
 _REVIEW_RE = re.compile(r"\b(?:review|audit|danh gia|soat)\b")
 _TRACE_RE = re.compile(
     r"Traceback \(most recent call last\)|File \"[^\"\n]+\", line \d+"
@@ -7033,7 +7097,8 @@ _REVIEWV_RE = re.compile(
 _CHG_V_RE = re.compile(
     r"\b(?:fix|repair|implement|add|introduce|update|upgrade|change|modify|refactor"
     r"|remove|delete|drop|double|halve|increase|decrease|migrate|rename|sua|them"
-    r"|cap nhat)\b")
+    r"|cap nhat|bo sung|cai dat|chinh sua|xay dung|trien khai|viet them|lam them"
+    r"|nang cap|va loi)\b")
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_./-]*$")
 
 # "tạo file / viết script / gộp file": tools._CHANGE_VERB_RE không biết các động từ này.
@@ -8411,19 +8476,24 @@ def _plan_create(ctx, ev, tm):
 # 4. Refuse a stub write for a "merge files" request
 # --------------------------------------------------------------------------
 
+def _calc_read_source_total(messages):
+    total = 0
+    for e in _answered_calls(messages):
+        if e.get("kind") != "read" or not _read_ok(e):
+            continue
+        p = _call_path(e.get("args"))
+        if (p and not _is_doc(p) and not _is_test_path(p)
+                and p.lower().endswith(_SRC_EXT)):
+            total += len(_clean_file_text(e.get("result", "")))
+    return total
+
+
 def _ff2_stub_problems(calls, messages):
     ctx = _analyze(messages)
     if (ctx is None or getattr(ctx, "pattern", None) != "CREATE"
             or not getattr(ctx, "create_merge", False)):
         return []
-    total = 0
-    for e in _answered_calls(messages):
-        if e["kind"] != "read" or not _read_ok(e):
-            continue
-        p = _call_path(e["args"])
-        if (p and not _is_doc(p) and not _is_test_path(p)
-                and p.lower().endswith(_SRC_EXT)):
-            total += len(_clean_file_text(e["result"]))
+    total = _calc_read_source_total(messages)
     problems = []
     for tc in calls:
         fn = tc.get("function") or {}
@@ -8613,14 +8683,7 @@ def _ff3_stub_problems(calls, messages):
     if (ctx is None or getattr(ctx, "pattern", None) != "CREATE"
             or not getattr(ctx, "create_merge", False)):
         return []
-    total = 0
-    for e in _answered_calls(messages):
-        if e["kind"] != "read" or not _read_ok(e):
-            continue
-        p = _call_path(e["args"])
-        if (p and not _is_doc(p) and not _is_test_path(p)
-                and p.lower().endswith(_SRC_EXT)):
-            total += len(_clean_file_text(e["result"]))
+    total = _calc_read_source_total(messages)
     problems = []
     for tc in calls:
         fn = tc.get("function") or {}
@@ -8810,8 +8873,43 @@ def _ff4_extend_canned():
 # 3. Truncated reads: continue them, and never report them as fully read
 # --------------------------------------------------------------------------
 
-_FF4_TRUNC_RE = re.compile(
+_FF4_TRUNC_BASE = re.compile(
     r"\[[^\]\n]*truncated[^\]\n]*?offset:?\s*(\d+)[^\]\n]*\]", re.IGNORECASE)
+_FF9_TRUNC_PAREN = re.compile(
+    r"\([^()\n]*?(?:showing\s+lines|truncated|more\s+lines)[^()\n]*?"
+    r"\boffset\s*[=:]\s*(\d+)[^()\n]*\)", re.IGNORECASE)
+_FF15_TRUNC_LEGACY = re.compile(
+    r"\(\s*file\s+has\s+more\s+lines[^()\n]*?\bline\s+(\d+)[^()\n]*\)", re.I)
+
+
+class _Ff9Trunc:
+    """Drop-in for the compiled regex: findall / search / sub only."""
+
+    def __init__(self):
+        self._rxs = (_FF4_TRUNC_BASE, _FF9_TRUNC_PAREN, _FF15_TRUNC_LEGACY)
+
+    def findall(self, text):
+        hits = []
+        for rx in self._rxs:
+            for m in rx.finditer(text or ""):
+                hits.append((m.start(), m.group(1)))
+        return [v for _s, v in sorted(hits)]
+
+    def search(self, text):
+        for rx in self._rxs:
+            m = rx.search(text or "")
+            if m:
+                return m
+        return None
+
+    def sub(self, repl, text, count=0):
+        for rx in self._rxs:
+            text = rx.sub(repl, text, count=count)
+        return text
+
+
+_FF4_TRUNC_RE = _Ff9Trunc()
+_ff9_trunc_orig = _FF4_TRUNC_BASE
 _FF4_MAX_CONT = 8
 
 
@@ -9126,8 +9224,7 @@ _FF5_DEFAULTS = {
 }
 
 
-def _c5(key):
-    return CONFIG.get(key, _FF5_DEFAULTS[key])
+_c5 = _flow_c
 
 
 # One table drives the classifier catalog, the prompt banner, the step engine
@@ -9240,27 +9337,70 @@ class _Ff5Perm:
         return "Perm(edit=%s, run=%s, %s)" % (self.edit, self.run, self.reason)
 
 
+_FF6C_Q_LEAD = re.compile(
+    r"^(?:(?:ok|okay|so|hey|hi|and|also|then|vay|the|nhung|ma|oi)\b[\s,]*)?"
+    r"(?:how\s+(?:can|could|do|does|should|would|to)\b|should\s+(?:i|we)\b|"
+    r"what(?:'s|\s+is)\s+the\s+(?:best\s+)?way\s+to\b|lam\s+sao\b|"
+    r"lam\s+the\s+nao\b|cach\s+nao\b|huong\s+dan\b|chi\s+(?:minh\s+)?cach\b|"
+    r"nen\s+(?:sua|lam)\b)")
+_FF6C_IMPERATIVE = re.compile(
+    r"^(?:(?:please|pls|hay|vui\s+long|then|and|also|va|roi)\b[\s,]*)*"
+    r"(?:fix|implement|add|update|change|modify|refactor|create|write|make|"
+    r"remove|delete|apply|sua|them|viet|tao|cap\s+nhat|thuc\s+hien|xoa|"
+    r"ap\s+dung)\b")
+
+
+class _Ff6cHowto:
+    """Drop-in for the old regex object: only .search() is used."""
+
+    def search(self, text):
+        sents = [s.strip() for s in re.split(r"[.!?\n;]+", text or "") if s.strip()]
+        if not sents or not _FF6C_Q_LEAD.match(sents[0]):
+            return None
+        if any(_FF6C_IMPERATIVE.match(s) for s in sents[1:]):
+            return None
+        return True
+
+
+_FF5_HOWTO_RE = _Ff6cHowto()
+_FF8_RUN_GRANT_RE = re.compile(
+    r"\b(?:you\s+(?:may|can)\s+(?:now\s+)?(?:run|execute)"
+    r"|feel\s+free\s+to\s+(?:run|execute)"
+    r"|go\s+ahead\s+and\s+(?:run|execute)"
+    r"|(?:run|execute)\s+(?:it|them|the\s+(?:unit\s+)?(?:tests?|commands?))\s+(?:now|again)"
+    r"|cho\s+phep\s+chay|chay\s+luon|cu\s+chay)\b")
+
+
 def _ff5_permissions(messages, pattern=None, fix=False):
     """Permissions in force for the newest request.
 
-    Sticky: a "do not edit / do not run" from ANY earlier user turn stays in
-    force until a later turn grants it back. Guidance questions ("how can I
-    fix ...?") withhold write access for that turn only. ``run`` is three
-    levels: any / readonly / none -- "do not run commands" now really means
-    no command at all, not merely read-only commands.
+    Unified permissions logic combining independent grants, no-edit/no-run constraints,
+    guidance-question detection, and pattern defaulting to TOOL_DEMAND.
     """
+    pattern = pattern or "TOOL_DEMAND"
     texts = [T._stringify_content(m.get("content", "")) for m in messages or []
              if isinstance(m, dict) and m.get("role") == "user"]
     edit_ok = run_ok = True
     why = []
+    independent = _flow_c("flow8_independent_grants", True)
     for t in texts:
         f = _ff5_fold(t)
-        if _FF5_GRANT_RE.search(f):
-            edit_ok = run_ok = True
-        if _FF5_NOEDIT_RE.search(f):
-            edit_ok = False
-        if _FF5_NORUN_RE.search(f):
-            run_ok = False
+        if not independent:
+            if _FF5_GRANT_RE.search(f):
+                edit_ok = run_ok = True
+            if _FF5_NOEDIT_RE.search(f):
+                edit_ok = False
+            if _FF5_NORUN_RE.search(f):
+                run_ok = False
+        else:
+            if _FF5_GRANT_RE.search(f):
+                edit_ok = True
+            if _FF8_RUN_GRANT_RE.search(f):
+                run_ok = True
+            if _FF5_NOEDIT_RE.search(f):
+                edit_ok = False
+            if _FF5_NORUN_RE.search(f):
+                run_ok = False
     if not edit_ok:
         why.append("user forbade edits")
     if not run_ok:
@@ -9285,20 +9425,24 @@ def _ff5_permissions(messages, pattern=None, fix=False):
                     scope=None)
 
 
+_ff6c_prev_permissions = _ff8_prev_permissions = _ff9_prev_permissions = _ff5_permissions
+
+
 def _ff5_scope(ctx, messages):
     """Files this request may write. ``None`` = undecided, do not tighten;
     ``[]`` = an empty but known scope, i.e. NO write is allowed (fail closed).
-
-    Policy: a request that names files is limited to them. A request that names
-    none (a plain "fix the bug") is limited to files actually read this turn.
-    CREATE with neither a named file nor a resolved target gets ``[]`` -- an
-    unnamed "create a script" must ask for a filename, never write freely.
-    The proxy's own temporary merge helper is always allowed. REVERT/
-    TOOL_DEMAND are unrestricted because their writes are derived from the
-    conversation itself.
+    Unified scope resolution handling unnamed requests, create targets, and read test files.
     """
     pattern = _ff5_pat(getattr(ctx, "pattern", None))
-    if pattern in ("", "REVERT", "TOOL_DEMAND"):
+    if not pattern:
+        try:
+            named = list(_named_files(ctx)) if ctx is not None else []
+        except Exception:
+            named = []
+        reads = [_call_path(e["args"]) for e in _answered_calls(messages)
+                 if e["kind"] == "read" and _read_ok(e) and _call_path(e["args"])]
+        return (named + reads) or None
+    if pattern in ("REVERT", "TOOL_DEMAND"):
         return None
     named = [f for f in (_named_files(ctx) if ctx is not None else []) if f]
     if pattern == "CREATE":
@@ -9309,11 +9453,25 @@ def _ff5_scope(ctx, messages):
         return allowed          # [] = no write target yet: fail closed
     if pattern in ("CHANGE", "DEBUG"):
         if named:
-            return named
-        reads = [_call_path(e["args"]) for e in _answered_calls(messages)
-                 if e["kind"] == "read" and _read_ok(e) and _call_path(e["args"])]
-        return reads or None
+            scope = list(named)
+        else:
+            reads = [_call_path(e["args"]) for e in _answered_calls(messages)
+                     if e["kind"] == "read" and _read_ok(e) and _call_path(e["args"])]
+            scope = reads or None
+        if scope:
+            extra = []
+            for e in _answered_calls(messages):
+                p = _call_path(e["args"]) if e["kind"] == "read" and _read_ok(e) else None
+                if (p and _is_test_path(p) and not T._path_seen(p, list(scope))
+                        and p not in extra):
+                    extra.append(p)
+            if extra:
+                scope = list(scope) + extra
+        return scope
     return []          # this pattern must not write at all
+
+
+_ff6c_prev_scope = _ff14_prev_scope = _ff5_scope
 
 
 def _ff5_in_scope(path, scope):
@@ -9371,14 +9529,107 @@ _FF5_EXEC_FAIL_RE = re.compile(
     r"command not found|no such file)")
 
 
-def _ff5_cmd_readonly(cmd):
-    c = re.sub(r"\d?>&\d|\d?>\s*/dev/null|\d?>\s*nul\b", "", cmd or "", flags=re.I)
-    if ">" in c:
+_FF8_SAFE_REDIR_RE = re.compile(
+    r"\d?>&\d|\d?>>?\s*/dev/null(?![\w./-])|\d?>>?\s*nul(?![\w./-])", re.I)
+_FF8_UNSAFE_RE = re.compile(
+    r"[\r\n\x00\x0b\x0c\x85\u2028\u2029`]|\$\(|\$\{|<\(|>\(|(?<!&)&(?!&)")
+_FF8_FIND_BAD_RE = re.compile(
+    r"\s-(?:delete|exec|execdir|ok|okdir|fprint0?|fprintf|fls)\b")
+_FF8_BRANCH_SAFE = {
+    "-a", "-r", "-v", "-vv", "-l", "-i", "--list", "--all", "--remotes",
+    "--verbose", "--show-current", "--contains", "--no-contains", "--merged",
+    "--no-merged", "--points-at", "--sort", "--format", "--color", "--no-color",
+    "--column", "--no-column", "--ignore-case"}
+_FF8_BRANCH_LISTY = {"-l", "--list", "--contains", "--no-contains", "--merged",
+                     "--no-merged", "--points-at", "--sort", "--format"}
+
+
+def _ff8_git_safe(rest):
+    i = 0
+    while i < len(rest) and rest[i].startswith("-"):
+        o = rest[i]
+        if (o == "-c" or o.startswith(("--exec-path", "--config-env", "--git-dir",
+                                       "--work-tree"))):
+            return False
+        i += 1
+    if i >= len(rest):
+        return True
+    sub, args = rest[i], rest[i + 1:]
+    if any(a.startswith(("--output", "--ext-diff", "--textconv")) for a in args):
         return False
-    segs = [s for s in re.split(r"&&|\|\||;|\|", c) if s.strip()]
+    if sub == "branch":
+        flags = [a.split("=", 1)[0] for a in args if a.startswith("-")]
+        pos = [a for a in args if not a.startswith("-")]
+        if any(f not in _FF8_BRANCH_SAFE for f in flags):
+            return False
+        if pos and not any(f in _FF8_BRANCH_LISTY for f in flags):
+            return False
+    elif sub == "remote":
+        if args and not (all(a in ("-v", "--verbose") for a in args)
+                         or args[0] in ("show", "get-url")):
+            return False
+    return True
+
+
+def _ff8_seg_safe(seg):
+    toks = seg.split()
+    if not toks:
+        return True
+    cmd = toks[0].lower()
+    rest = [t.lower() for t in toks[1:]]
+    joined = " " + " ".join(rest)
+    if cmd == "find" and _FF8_FIND_BAD_RE.search(joined):
+        return False
+    if cmd == "sort":
+        for t in rest:
+            if t.startswith("--output") or t.startswith("--compress-program"):
+                return False
+            if t.startswith("-") and not t.startswith("--") and "o" in t[1:]:
+                return False
+    if cmd in ("rg", "grep") and any(
+            t.startswith(("--pre", "--hostname-bin")) for t in rest):
+        return False
+    if cmd == "git" and not _ff8_git_safe(rest):
+        return False
+    return True
+
+
+def _ff5_cmd_readonly(cmd):
+    try:
+        configured = (_cfg("flow_test_command") or "").strip()
+        if configured and (cmd or "").strip() == configured:
+            return True
+    except Exception:
+        pass
+    if not _flow_c("flow8_strict_shell", True):
+        c = cmd or ""
+        if "`" in c or "$(" in c:
+            return False
+        if (_FF6B_FIND_RE.search(c) or _FF6B_BRANCH_RE.search(c)
+                or _FF6B_REMOTE_RE.search(c) or _FF6B_OUTPUT_RE.search(c)):
+            return False
+        c_clean = re.sub(r"\d?>&\d|\d?>\s*/dev/null|\d?>\s*nul\b", "", c, flags=re.I)
+        if ">" in c_clean:
+            return False
+        segs = [s for s in re.split(r"&&|\|\||;|\|", c_clean) if s.strip()]
+        if not segs:
+            return False
+        return all(_FF5_RO_SEG_RE.match(s) or _FF5_TEST_SEG_RE.match(s) for s in segs)
+    if not isinstance(cmd, str) or not cmd.strip():
+        return False
+    c = _FF8_SAFE_REDIR_RE.sub(" ", cmd)
+    if _FF8_UNSAFE_RE.search(c) or ">" in c:
+        return False
+    segs = [s.strip() for s in re.split(r"&&|\|\||;|\|", c)]
+    segs = [s for s in segs if s]
     if not segs:
         return False
-    return all(_FF5_RO_SEG_RE.match(s) or _FF5_TEST_SEG_RE.match(s) for s in segs)
+    for s in segs:
+        if not (_FF5_RO_SEG_RE.match(s) or _FF5_TEST_SEG_RE.match(s)):
+            return False
+        if not _ff8_seg_safe(s):
+            return False
+    return True
 
 
 def _ff5_status(e):
@@ -11523,21 +11774,14 @@ def install():
 # ==== flowfix5:end ====
 
 # ==== flowfix6b:begin (generated by patch_flow_critical.py) ====
+# 4. default perm TOOL_DEMAND (unified into _ff5_postfilter)
 # Overrides (later definitions win: callers resolve these names at call time).
 _ff6b_prev_postfilter = _ff5_postfilter
 _ff6b_prev_cmd_readonly = _ff5_cmd_readonly
 _ff6b_prev_plan = _ff5_plan
 
 
-# 4. ctx None (tool_choice=required, analysis skipped) must not mean "no edit,
-#    read-only": honour only the limits the user actually wrote.
-def _ff5_postfilter(result, messages, perm=None, last=True, tm=None, ctx=None):
-    if perm is None:
-        perm = _ff5_permissions(messages, "TOOL_DEMAND")
-    return _ff6b_prev_postfilter(result, messages, perm, last, tm, ctx)
-
-
-# 3. tighter read-only check
+# 3. tighter read-only check (unified into _ff5_cmd_readonly)
 _FF6B_FIND_RE = re.compile(
     r"\bfind\b[^|;&]*\s-(?:delete|exec|execdir|ok|okdir|fprint\w*|fls)\b", re.I)
 _FF6B_BRANCH_RE = re.compile(
@@ -11547,16 +11791,6 @@ _FF6B_REMOTE_RE = re.compile(
     r"\bgit\s+(?:--no-pager\s+)?remote\s+(?:add|remove|rm|rename|set-url|"
     r"set-head|prune|update)\b", re.I)
 _FF6B_OUTPUT_RE = re.compile(r"\bgit\b[^|;&]*--output\b", re.I)
-
-
-def _ff5_cmd_readonly(cmd):
-    c = cmd or ""
-    if "`" in c or "$(" in c:
-        return False
-    if (_FF6B_FIND_RE.search(c) or _FF6B_BRANCH_RE.search(c)
-            or _FF6B_REMOTE_RE.search(c) or _FF6B_OUTPUT_RE.search(c)):
-        return False
-    return _ff6b_prev_cmd_readonly(c)
 
 
 # 2. REVERT deletes files with exec: it must obey the same no-edit permission.
@@ -11665,54 +11899,7 @@ _FF6C_NOTFOUND_RE = re.compile(
     r"cannot open|can'?t find")
 
 
-# --------------------------------------------------------------------------
-# 3. guidance only when the FIRST sentence is a how-to question
-# --------------------------------------------------------------------------
-_FF6C_Q_LEAD = re.compile(
-    r"^(?:(?:ok|okay|so|hey|hi|and|also|then|vay|the|nhung|ma|oi)\b[\s,]*)?"
-    r"(?:how\s+(?:can|could|do|does|should|would|to)\b|should\s+(?:i|we)\b|"
-    r"what(?:'s|\s+is)\s+the\s+(?:best\s+)?way\s+to\b|lam\s+sao\b|"
-    r"lam\s+the\s+nao\b|cach\s+nao\b|huong\s+dan\b|chi\s+(?:minh\s+)?cach\b|"
-    r"nen\s+(?:sua|lam)\b)")
-_FF6C_IMPERATIVE = re.compile(
-    r"^(?:(?:please|pls|hay|vui\s+long|then|and|also|va|roi)\b[\s,]*)*"
-    r"(?:fix|implement|add|update|change|modify|refactor|create|write|make|"
-    r"remove|delete|apply|sua|them|viet|tao|cap\s+nhat|thuc\s+hien|xoa|"
-    r"ap\s+dung)\b")
-
-
-class _Ff6cHowto:
-    """Drop-in for the old regex object: only .search() is used."""
-
-    def search(self, text):
-        sents = [s.strip() for s in re.split(r"[.!?\n;]+", text or "") if s.strip()]
-        if not sents or not _FF6C_Q_LEAD.match(sents[0]):
-            return None
-        if any(_FF6C_IMPERATIVE.match(s) for s in sents[1:]):
-            return None
-        return True
-
-
-_FF5_HOWTO_RE = _Ff6cHowto()
-
-
-# --------------------------------------------------------------------------
-# 2. pattern None: only the user's explicit limits apply
-# --------------------------------------------------------------------------
-def _ff5_permissions(messages, pattern=None, fix=False):
-    return _ff6c_prev_permissions(messages, pattern or "TOOL_DEMAND", fix)
-
-
-def _ff5_scope(ctx, messages):
-    if not _ff5_pat(getattr(ctx, "pattern", None)):
-        try:
-            named = list(_named_files(ctx)) if ctx is not None else []
-        except Exception:
-            named = []
-        reads = [_call_path(e["args"]) for e in _answered_calls(messages)
-                 if e["kind"] == "read" and _read_ok(e) and _call_path(e["args"])]
-        return (named + reads) or None
-    return _ff6c_prev_scope(ctx, messages)
+# 2 & 3. Guidance question & pattern None (unified into _ff5_permissions and _ff5_scope above)
 
 
 # --------------------------------------------------------------------------
@@ -11889,8 +12076,7 @@ for _k8, _v8 in _FF8_DEFAULTS.items():
     CONFIG.setdefault(_k8, _v8)
 
 
-def _c8(key):
-    return CONFIG.get(key, _FF8_DEFAULTS[key])
+_c8 = _flow_c
 
 
 _ff8_tls = _ff8_threading.local()
@@ -11902,146 +12088,11 @@ _ff8_tls = _ff8_threading.local()
 
 _ff8_prev_cmd_readonly = _ff5_cmd_readonly
 
-_FF8_SAFE_REDIR_RE = re.compile(
-    r"\d?>&\d|\d?>>?\s*/dev/null(?![\w./-])|\d?>>?\s*nul(?![\w./-])", re.I)
-_FF8_UNSAFE_RE = re.compile(
-    r"[\r\n\x00\x0b\x0c\x85\u2028\u2029`]|\$\(|\$\{|<\(|>\(|(?<!&)&(?!&)")
-_FF8_FIND_BAD_RE = re.compile(
-    r"\s-(?:delete|exec|execdir|ok|okdir|fprint0?|fprintf|fls)\b")
-_FF8_BRANCH_SAFE = {
-    "-a", "-r", "-v", "-vv", "-l", "-i", "--list", "--all", "--remotes",
-    "--verbose", "--show-current", "--contains", "--no-contains", "--merged",
-    "--no-merged", "--points-at", "--sort", "--format", "--color", "--no-color",
-    "--column", "--no-column", "--ignore-case"}
-_FF8_BRANCH_LISTY = {"-l", "--list", "--contains", "--no-contains", "--merged",
-                     "--no-merged", "--points-at", "--sort", "--format"}
+# (Shell safety check unified into _ff5_cmd_readonly above)
 
 
-def _ff8_git_safe(rest):
-    i = 0
-    while i < len(rest) and rest[i].startswith("-"):
-        o = rest[i]
-        if (o == "-c" or o.startswith(("--exec-path", "--config-env", "--git-dir",
-                                       "--work-tree"))):
-            return False
-        i += 1
-    if i >= len(rest):
-        return True
-    sub, args = rest[i], rest[i + 1:]
-    if any(a.startswith(("--output", "--ext-diff", "--textconv")) for a in args):
-        return False
-    if sub == "branch":
-        flags = [a.split("=", 1)[0] for a in args if a.startswith("-")]
-        pos = [a for a in args if not a.startswith("-")]
-        if any(f not in _FF8_BRANCH_SAFE for f in flags):
-            return False
-        if pos and not any(f in _FF8_BRANCH_LISTY for f in flags):
-            return False
-    elif sub == "remote":
-        if args and not (all(a in ("-v", "--verbose") for a in args)
-                         or args[0] in ("show", "get-url")):
-            return False
-    return True
-
-
-def _ff8_seg_safe(seg):
-    toks = seg.split()
-    if not toks:
-        return True
-    cmd = toks[0].lower()
-    rest = [t.lower() for t in toks[1:]]
-    joined = " " + " ".join(rest)
-    if cmd == "find" and _FF8_FIND_BAD_RE.search(joined):
-        return False
-    if cmd == "sort":
-        for t in rest:
-            if t.startswith("--output") or t.startswith("--compress-program"):
-                return False
-            if t.startswith("-") and not t.startswith("--") and "o" in t[1:]:
-                return False
-    if cmd in ("rg", "grep") and any(
-            t.startswith(("--pre", "--hostname-bin")) for t in rest):
-        return False
-    if cmd == "git" and not _ff8_git_safe(rest):
-        return False
-    return True
-
-
-def _ff5_cmd_readonly(cmd):
-    if not _c8("flow8_strict_shell"):
-        return _ff8_prev_cmd_readonly(cmd)
-    if not isinstance(cmd, str) or not cmd.strip():
-        return False
-    c = _FF8_SAFE_REDIR_RE.sub(" ", cmd)
-    if _FF8_UNSAFE_RE.search(c) or ">" in c:
-        return False
-    segs = [s.strip() for s in re.split(r"&&|\|\||;|\|", c)]
-    segs = [s for s in segs if s]
-    if not segs:
-        return False
-    for s in segs:
-        if not (_FF5_RO_SEG_RE.match(s) or _FF5_TEST_SEG_RE.match(s)):
-            return False
-        if not _ff8_seg_safe(s):
-            return False
-    return True
-
-
-# --------------------------------------------------------------------------
-# 4. Edit grant and run grant are independent
-# --------------------------------------------------------------------------
-
+# 4. Edit grant and run grant are independent (unified into _ff5_permissions above)
 _ff8_prev_permissions = _ff5_permissions
-_FF8_RUN_GRANT_RE = re.compile(
-    r"\b(?:you\s+(?:may|can)\s+(?:now\s+)?(?:run|execute)"
-    r"|feel\s+free\s+to\s+(?:run|execute)"
-    r"|go\s+ahead\s+and\s+(?:run|execute)"
-    r"|(?:run|execute)\s+(?:it|them|the\s+(?:unit\s+)?(?:tests?|commands?))\s+(?:now|again)"
-    r"|cho\s+phep\s+chay|chay\s+luon|cu\s+chay)\b")
-
-
-def _ff5_permissions(messages, pattern=None, fix=False):
-    """Like the original, but a grant of edit rights never lifts a ban on
-    running commands (and the other way round). Bans win over grants made in
-    the same message; a generic "go ahead" grants edit only (fail closed)."""
-    if not _c8("flow8_independent_grants"):
-        return _ff8_prev_permissions(messages, pattern, fix)
-    texts = [T._stringify_content(m.get("content", "")) for m in messages or []
-             if isinstance(m, dict) and m.get("role") == "user"]
-    edit_ok = run_ok = True
-    why = []
-    for t in texts:
-        f = _ff5_fold(t)
-        if _FF5_GRANT_RE.search(f):
-            edit_ok = True
-        if _FF8_RUN_GRANT_RE.search(f):
-            run_ok = True
-        if _FF5_NOEDIT_RE.search(f):
-            edit_ok = False
-        if _FF5_NORUN_RE.search(f):
-            run_ok = False
-    if not edit_ok:
-        why.append("user forbade edits")
-    if not run_ok:
-        why.append("user forbade running commands")
-    guidance = False
-    if texts:
-        f = _ff5_fold(texts[-1])
-        guidance = bool(_FF5_HOWTO_RE.search(f)) and not _FF5_GRANT_RE.search(f)
-        if guidance:
-            why.append("guidance question")
-    spec_edit = _ff5_spec_edit(pattern, fix)
-    spec_run = _ff5_spec_run(pattern)
-    can_edit = bool(spec_edit and edit_ok and not guidance)
-    if not run_ok:
-        run = "none"
-    elif spec_run == "any" and not (guidance and pattern == "EXPLAIN"):
-        run = "any"
-    else:
-        run = "readonly"
-    restricted = (can_edit != spec_edit) or (run != spec_run)
-    return _Ff5Perm(can_edit, run, "; ".join(why) or "default", restricted,
-                    scope=None)
 
 
 # --------------------------------------------------------------------------
@@ -12569,10 +12620,7 @@ _ff9_prev_detect = _ff5_detect
 _ff9_prev_apply_label = _ff5_apply_label
 
 
-# 1. flowfix8 re-implemented _ff5_permissions and lost the rule flowfix6c added:
-#    with no detected pattern only the limits the user wrote apply (edit allowed).
-def _ff5_permissions(messages, pattern=None, fix=False):
-    return _ff9_prev_permissions(messages, pattern or "TOOL_DEMAND", fix)
+# 1. flowfix8 permissions rule (unified into _ff5_permissions above)
 
 
 # 2. "do not run X" / "dung chay X" must not become a run-type pattern.
@@ -12787,40 +12835,7 @@ def _change_tail(pat, ctx, ev, tm, names_all, total, extra=""):
     return step
 
 
-# 7. More truncation markers: "(Showing lines 1-2000 of N. Use offset=2001 ...)".
-_ff9_trunc_orig = _FF4_TRUNC_RE
-_FF9_TRUNC_PAREN = re.compile(
-    r"\([^()\n]*?(?:showing\s+lines|truncated|more\s+lines)[^()\n]*?"
-    r"\boffset\s*[=:]\s*(\d+)[^()\n]*\)", re.IGNORECASE)
-
-
-class _Ff9Trunc:
-    """Drop-in for the compiled regex: findall / search / sub only."""
-
-    def __init__(self):
-        self._rxs = (_ff9_trunc_orig, _FF9_TRUNC_PAREN)
-
-    def findall(self, text):
-        hits = []
-        for rx in self._rxs:
-            for m in rx.finditer(text or ""):
-                hits.append((m.start(), m.group(1)))
-        return [v for _s, v in sorted(hits)]
-
-    def search(self, text):
-        for rx in self._rxs:
-            m = rx.search(text or "")
-            if m:
-                return m
-        return None
-
-    def sub(self, repl, text, count=0):
-        for rx in self._rxs:
-            text = rx.sub(repl, text, count=count)
-        return text
-
-
-_FF4_TRUNC_RE = _Ff9Trunc()
+# 7. More truncation markers (unified into _Ff9Trunc above).
 # ==== flowfix9:end ====
 
 # ==== flowfix10:begin (ambiguity-aware pattern routing) ====
@@ -12841,8 +12856,7 @@ _FF10_DEFAULTS = {
 }
 
 
-def _c10(key):
-    return CONFIG.get(key, _FF10_DEFAULTS[key])
+_c10 = _flow_c
 
 
 # Previous definitions, captured before this section overrides them. The file
@@ -12873,10 +12887,7 @@ _FF10_REVIEW_LABELS = ("GENERIC_REVIEW", "FILE_REVIEW")
 _FF10_OTHER_LABELS = ("EXPLAIN", "CHANGE", "TOOL_DEMAND")
 
 
-def _ff10_scrub(folded):
-    """Apply the flowfix4 noise scrub when that layer is present."""
-    scrub = globals().get("_ff4_scrub")
-    return scrub(folded or "") if scrub else (folded or "")
+_ff10_scrub = _ff4_scrub
 
 
 def _ff10_is_source_review(folded):
@@ -12913,11 +12924,7 @@ T._is_file_review = _is_file_review
 
 
 def _ff10_last_user(messages):
-    last = None
-    for msg in messages or []:
-        if isinstance(msg, dict) and msg.get("role") == "user":
-            last = T._stringify_content(msg.get("content", ""))
-    return last
+    return _ff5_last_user_text(messages) or None
 
 
 def _ff10_message_text(messages):
@@ -13100,6 +13107,7 @@ def _ff10_tiebreak(ctx, messages, cands):
         log("[flow10] model says OTHER -> free run (no forced flow)")
         return _ff10_apply_pattern(ctx, messages, "OTHER")
     if label:
+        ctx.model_choice = label
         return _ff10_apply_pattern(ctx, messages, label)
     log("[flow10] tie-break unavailable -> keeping deterministic pattern %s"
         % (getattr(ctx, "pattern", None) or "NONE"))
@@ -13149,6 +13157,12 @@ def _ff10_clarify_text(text):
 
 
 def clarification_text(messages):
+    try:
+        last = messages[-1] if messages else None
+        if not (isinstance(last, dict) and last.get("role") == "user"):
+            return None
+    except Exception:
+        return None
     if _c10("flow_ask_on_ambiguity") and messages:
         try:
             ctx = _analyze(messages)
@@ -13255,13 +13269,33 @@ ERR_RATE_LIMIT = "rate_limit_error"
 ERR_API = "api_error"
 
 
-def _is_loopback(ip_str: str) -> bool:
+def _base_is_loopback(host: str) -> bool:
     try:
-        addr = ipaddress.ip_address(ip_str)
-        mapped = getattr(addr, "ipv4_mapped", None)
-        return addr.is_loopback or bool(mapped and mapped.is_loopback)
+        return ipaddress.ip_address(host).is_loopback
+    except (ValueError, TypeError):
+        return host in ("localhost", "127.0.0.1", "::1")
+
+
+def _is_loopback(host) -> bool:
+    """True when the address is a loopback address or cannot be reached from another machine."""
+    if not _flow_c("flow15_server_hardening", True):
+        return _base_is_loopback(host)
+    if not isinstance(host, str):
+        return False
+    v = host.strip().strip("[]").split("%")[0].lower()
+    if not v:
+        return False
+    if v == "localhost":
+        return True
+    try:
+        addr = ipaddress.ip_address(v)
     except (ValueError, TypeError):
         return False
+    mapped = getattr(addr, "ipv4_mapped", None)
+    return bool(addr.is_loopback or (mapped is not None and mapped.is_loopback))
+
+
+_rf_prev_is_loopback = _ff15_prev_is_loopback = _base_is_loopback
 
 # Gap between SSE keep-alive comments while a buffered turn still works
 # upstream. Must stay well under every client's idle/chunk timeout (OpenCode
@@ -15554,14 +15588,6 @@ from gemini_web2api import __version__
 _LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
 
 
-def _is_loopback(host) -> bool:
-    """True when the bind address cannot be reached from another machine."""
-    if not isinstance(host, str) or not host:
-        return False
-    value = host.strip().lower().strip("[]")
-    return value in _LOOPBACK_HOSTS or value.startswith("127.")
-
-
 def _guard_bind(host, allow_insecure: bool) -> None:
     """Refuse an exposed bind with no API keys unless explicitly opted in.
 
@@ -15856,31 +15882,11 @@ if not getattr(ToolMap.adapt, "_ff12", False):
 # --------------------------------------------------------------------------
 _ff12_prev_clarification = clarification_text
 
-
-def clarification_text(messages):
-    try:
-        last = messages[-1] if messages else None
-        if not (isinstance(last, dict) and last.get("role") == "user"):
-            return None
-    except Exception:
-        return None
-    return _ff12_prev_clarification(messages)
-
-
 # --------------------------------------------------------------------------
 # 3. The operator's own flow_test_command is read-only by definition
+#    (Unified into _ff5_cmd_readonly above)
 # --------------------------------------------------------------------------
 _ff12_prev_cmd_readonly = _ff5_cmd_readonly
-
-
-def _ff5_cmd_readonly(cmd):
-    if _ff12_prev_cmd_readonly(cmd):
-        return True
-    try:
-        configured = (_cfg("flow_test_command") or "").strip()
-        return bool(configured) and (cmd or "").strip() == configured
-    except Exception:
-        return False
 
 
 # --------------------------------------------------------------------------
@@ -16749,10 +16755,75 @@ _RF_ASK_RE = re.compile(
     r"\b(?:giai\s+thich|hoat\s+dong|the\s+nao|la\s+gi|tai\s+sao|vi\s+sao|how|what|why|"
     r"does|explain|review|audit|danh\s+gia|kiem\s+tra|check)\b|\?", re.I)
 
+_EXPLAIN_LEAD_RE = re.compile(
+    r"^(?:giai\s+thich(?:\s+(?:tai\s+sao|vi\s+sao|giup(?:\s+minh|\s+toi)?))?|tai\s+sao|vi\s+sao|explain(?:\s+why)?|why)\b",
+    re.IGNORECASE)
+
+_PASTE_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+_PASTE_PRICE_RE = re.compile(
+    r"[¥$€£₫]|(?:\b(?:vnd|usd|jpy|eur|gbp)\b)|/\s*(?:month|thang|year|nam)\b",
+    re.IGNORECASE)
+_PASTE_UI_RE = re.compile(
+    r"^\s*(?:cac\s+khoan\s+phi|ngay\s+bat\s+dau|dang\s+ky\s+tren|huy\s+bat\s+ky|"
+    r"muc\s+phi\s+phai\s+thanh\s+toan|ban\s+dang\s+xoa|hom\s+nay|bao\s+gom\s+thue|"
+    r"subtotal|total|pricing|billing)\b",
+    re.IGNORECASE)
+_PASTE_LOG_RE = re.compile(
+    r"^\s*(?:(?:Traceback\s+\(most\s+recent\s+call\s+last\)|File\s+\"[^\"]+\",\s+line\s+\d+|"
+    r"(?:\d{4}-\d{2}-\d{2}|\d{2}:\d{2}:\d{2})\b|"
+    r"\[?(?:DEBUG|INFO|WARNING|WARN|ERROR|FATAL|CRITICAL)\]?[:\s]|\bat\s+\S+\s+\([^)\n]*:\d+:\d+\)).*)",
+    re.IGNORECASE)
+
+
+def _strip_pasted_content(text: str) -> str:
+    """Remove URLs, price/currency lines, stack traces/logs, and UI tables from text."""
+    if not isinstance(text, str) or not text:
+        return ""
+    text = _PASTE_URL_RE.sub(" ", text)
+    lines = text.splitlines()
+    clean_lines = []
+    for line in lines:
+        s = line.strip()
+        if not s:
+            clean_lines.append("")
+            continue
+        if _PASTE_PRICE_RE.search(s) or _PASTE_UI_RE.search(s) or _PASTE_LOG_RE.search(s):
+            continue
+        clean_lines.append(line)
+    return "\n".join(clean_lines)
+
+
+def _ff_first_clause(text: str) -> str:
+    if not text:
+        return ""
+    clean = _strip_pasted_content(text)
+    f = " ".join(T._fold_diacritics(clean).lower().split())
+    parts = re.split(r"[.!?;:\n]+|,|\s+(?:roi|sau\s+do|then|and\s+then)\s+", f)
+    for p in parts:
+        c = re.sub(
+            r"^\W*(?:(?:hay|vui\s+long|lam\s+on|giup(?:\s+(?:toi|minh|em))?|ban|nho|please|pls|"
+            r"can\s+you|could\s+you|would\s+you|toi\s+muon|minh\s+muon|toi\s+can|minh\s+can|"
+            r"cho\s+toi|cho\s+minh|hey|ok|oke)\s+)+", "", p.strip()).strip()
+        if c:
+            return c
+    return ""
+
+
 _rf_prev_is_change_request = _is_change_request
 
 
 def _is_change_request(folded, scannable, raw=""):
+    raw_text = raw or scannable or folded or ""
+    clean_raw = _strip_pasted_content(raw_text)
+    if clean_raw != raw_text:
+        scannable = T._strip_code_spans(clean_raw)
+        folded = re.sub(r"\s+", " ", T._fold_diacritics(scannable)).strip()
+        raw = clean_raw
+
+    c0 = _ff_first_clause(raw_text)
+    if c0 and _EXPLAIN_LEAD_RE.match(c0) and not (_CHANGE_ACT_RE.search(c0) or _FF5_GRANT_RE.search(folded)):
+        return False
+
     if _rf_prev_is_change_request(folded, scannable, raw):
         return True
     try:
@@ -16763,25 +16834,11 @@ def _is_change_request(folded, scannable, raw=""):
         return False
 
 
-_WANT_CHANGE_RE = re.compile(
-    r"\b(?:implement|add|introduce|refactor|upgrade|migrate|rename|them|cap nhat"
-    r"|bo sung|cai dat|xay dung|trien khai|viet them|lam them|nang cap)\b")
-_CHG_V_RE = re.compile(
-    r"\b(?:fix|repair|implement|add|introduce|update|upgrade|change|modify|refactor"
-    r"|remove|delete|drop|double|halve|increase|decrease|migrate|rename|sua|them"
-    r"|cap nhat|bo sung|cai dat|chinh sua|xay dung|trien khai|viet them|lam them"
-    r"|nang cap|va loi)\b")
 
 # --------------------------------------------------------------------------
-# 4. _is_loopback nhận ::ffff:127.0.0.1
+# 4. _is_loopback nhận ::ffff:127.0.0.1 (unified into canonical _is_loopback)
 # --------------------------------------------------------------------------
 _rf_prev_is_loopback = _is_loopback
-
-
-def _is_loopback(host):
-    if isinstance(host, str) and host.strip().lower().startswith("::ffff:"):
-        host = host.strip()[7:]
-    return _rf_prev_is_loopback(host)
 
 # --------------------------------------------------------------------------
 # 3. Kiểm tra proxy bằng trạng thái đang chạy
@@ -16962,11 +17019,7 @@ _FF14_DEFAULTS = {
 }
 
 
-def _ff14_c(key):
-    try:
-        return CONFIG.get(key, _FF14_DEFAULTS[key])
-    except Exception:
-        return _FF14_DEFAULTS[key]
+_ff14_c = _flow_c
 
 
 # --------------------------------------------------------------------------
@@ -16992,27 +17045,8 @@ def _ff5_git_cmd(m):
     return " ".join(["git", "--no-pager", sub] + flags)
 
 
-# --------------------------------------------------------------------------
-# 2. write scope: test files read this turn
-# --------------------------------------------------------------------------
+# 2. write scope: test files read this turn (unified into _ff5_scope above)
 _ff14_prev_scope = _ff5_scope
-
-
-def _ff5_scope(ctx, messages):
-    scope = _ff14_prev_scope(ctx, messages)
-    try:
-        if scope and _ff5_pat(getattr(ctx, "pattern", None)) in ("CHANGE", "DEBUG"):
-            extra = []
-            for e in _answered_calls(messages):
-                p = _call_path(e["args"]) if e["kind"] == "read" and _read_ok(e) else None
-                if (p and _is_test_path(p) and not T._path_seen(p, list(scope))
-                        and p not in extra):
-                    extra.append(p)
-            if extra:
-                scope = list(scope) + extra
-    except Exception as ex:
-        log("[fix14] scope error: %s" % ex)
-    return scope
 
 
 # --------------------------------------------------------------------------
@@ -17385,11 +17419,7 @@ _FF15_DEFAULTS = {
 }
 
 
-def _ff15_c(key):
-    try:
-        return CONFIG.get(key, _FF15_DEFAULTS[key])
-    except Exception:
-        return _FF15_DEFAULTS[key]
+_ff15_c = _flow_c
 
 
 # --------------------------------------------------------------------------
@@ -17438,27 +17468,10 @@ def _keywords(text, limit=6):
 
 
 # --------------------------------------------------------------------------
-# 2. legacy opencode truncation marker
+# 2. legacy opencode truncation marker (unified into _Ff9Trunc)
 # --------------------------------------------------------------------------
-_FF15_TRUNC_LEGACY = re.compile(
-    r"\(\s*file\s+has\s+more\s+lines[^()\n]*?\bline\s+(\d+)[^()\n]*\)", re.I)
-
-
 def _ff15_patch_trunc():
-    rx = globals().get("_FF4_TRUNC_RE")
-    rxs = getattr(rx, "_rxs", None)
-    if rxs is None:
-        return False
-    if any(r is _FF15_TRUNC_LEGACY for r in rxs):
-        return True
-    rx._rxs = tuple(rxs) + (_FF15_TRUNC_LEGACY,)
     return True
-
-
-try:
-    _ff15_patch_trunc()
-except Exception as _ff15_ex:
-    log("[fix15] trunc patch error: %s" % _ff15_ex)
 
 
 # --------------------------------------------------------------------------
@@ -17533,12 +17546,19 @@ def _ff15_clauses(folded):
 def _ff15_label(ctx, pat):
     """New pattern label for this request, or None to keep ``pat``."""
     raw = str(getattr(ctx, "scannable", "") or getattr(ctx, "last", "") or "")[:1500]
-    f = " ".join(T._fold_diacritics(raw).lower().split())
+    clean_raw = _strip_pasted_content(raw)
+    f = " ".join(T._fold_diacritics(clean_raw).lower().split())
     if len(f) < 4:
         return None
     clauses = _ff15_clauses(f)
     if not clauses:
         return None
+
+    # Priority rule: first clause starts with explain/why/giai thich/tai sao/vi sao -> EXPLAIN
+    c0 = clauses[0]
+    if _EXPLAIN_LEAD_RE.match(c0) and not (_CHANGE_ACT_RE.search(c0) or _FF5_GRANT_RE.search(f)):
+        return "EXPLAIN"
+
     review_pat = pat in ("GENERIC_REVIEW", "FILE_REVIEW")
     if pat and not review_pat:
         return None
@@ -17592,7 +17612,7 @@ def _analyze(messages):
     if ctx is None or not _ff15_c("flow15_route"):
         return ctx
     try:
-        if getattr(ctx, "ask_user", False) or getattr(ctx, "free_run", False):
+        if getattr(ctx, "ask_user", False) or getattr(ctx, "free_run", False) or getattr(ctx, "model_choice", None):
             return ctx
         if _clarified(messages, getattr(ctx, "idx", -1)):
             return ctx
@@ -17633,27 +17653,9 @@ def _rf_runtime_question(messages):
 
 
 # --------------------------------------------------------------------------
-# 5. _is_loopback: one definition
+# 5. _is_loopback: one definition (unified into canonical _is_loopback)
 # --------------------------------------------------------------------------
 _ff15_prev_is_loopback = _is_loopback
-
-
-def _is_loopback(host):
-    if not _ff15_c("flow15_server_hardening"):
-        return _ff15_prev_is_loopback(host)
-    if not isinstance(host, str):
-        return False
-    v = host.strip().strip("[]").split("%")[0].lower()
-    if not v:
-        return False
-    if v == "localhost":
-        return True
-    try:
-        addr = ipaddress.ip_address(v)
-    except ValueError:
-        return False
-    mapped = getattr(addr, "ipv4_mapped", None)
-    return bool(addr.is_loopback or (mapped is not None and mapped.is_loopback))
 
 
 # --------------------------------------------------------------------------
