@@ -25,6 +25,7 @@ from gemini_web2api.gemini import (
 from gemini_web2api.models import (
     EXPECTED_TICKET_ROUTES,
     TICKET_HEADER,
+    _TICKET_FALLBACK_LOGGED,
     _lite_effort_model,
     _reasoning_effort,
     resolve_model,
@@ -186,9 +187,20 @@ class ModelRoutingTests(unittest.TestCase):
             "gemini-3.7-flash": (1, 1),
             "gemini-3.6-flash": (1, 1),
             "gemini-3.5-flash": (1, 1),
+            "gemini-3.8-flash": (1, 1),
+            "gemini-3.8-flash-low": (1, 1),
+            "gemini-3.8-flash-medium": (1, 4),
+            "gemini-3.8-flash-high": (1, 2),
             "gemini-3.5-flash-thinking": (2, 2),
             "gemini-3.1-pro": (3, 1),
+            "gemini-3.1-pro-low": (3, 1),
+            "gemini-3.1-pro-medium": (3, 4),
+            "gemini-3.1-pro-high": (3, 2),
             "gemini-3.1-pro-enhanced": (3, 3),
+            "gemini-4-argon": (8, 1),
+            "gemini-4-argon-low": (8, 1),
+            "gemini-4-argon-medium": (8, 4),
+            "gemini-4-argon-high": (8, 2),
             "gemini-auto": (4, 1),
             "gemini-3.5-flash-thinking-lite": (5, 2),
             "gemini-flash-lite": (6, 1),
@@ -250,9 +262,13 @@ class ModelTicketTests(unittest.TestCase):
         self.assertEqual(
             ticket_for("gemini-3.5-flash-thinking-lite"),
             CONFIG["model_tickets"]["lite-thinking"])
-        # No ticket configured (or no ticket at all for the model).
-        self.assertIsNone(ticket_for("gemini-3.1-pro"))
+        # No pro ticket here, but a lower-family flash ticket exists: the
+        # account-safe fallback routes Pro to Flash instead of returning None.
+        self.assertEqual(
+            ticket_for("gemini-3.1-pro"), CONFIG["model_tickets"]["flash"])
+        # Models that intentionally define no ticket still return None.
         self.assertIsNone(ticket_for("gemini-auto"))
+        self.assertIsNone(ticket_for("gemini-3.1-pro-enhanced"))
 
     def test_ticket_embeds_family_variant(self):
         flash = json.loads(CONFIG["model_tickets"]["flash"])
@@ -315,6 +331,93 @@ class ModelTicketTests(unittest.TestCase):
         self.assertEqual(
             _lite_effort_model("gemini-3.6-flash", "high"),
             "gemini-3.6-flash")
+
+    def test_effort_reroutes_every_supported_base(self):
+        cases = {
+            "gemini-3.8-flash": "gemini-3.8-flash-high",
+            "gemini-3.1-pro": "gemini-3.1-pro-high",
+            "gemini-4-argon": "gemini-4-argon-high",
+            "gemini-3.5-flash-lite": "gemini-3.5-flash-lite-high",
+            "gemini-flash-lite": "gemini-3.5-flash-lite-high",
+        }
+        for base, expected in cases.items():
+            with self.subTest(base=base):
+                self.assertEqual(_lite_effort_model(base, "high"), expected)
+        self.assertEqual(
+            _lite_effort_model("gemini-3.1-pro", "medium"),
+            "gemini-3.1-pro-medium")
+        self.assertEqual(
+            _lite_effort_model("gemini-4-argon", "minimal"),
+            "gemini-4-argon-low")
+
+    def test_ticket_fallback_same_family(self):
+        CONFIG["model_tickets"] = {
+            "argon-medium": self.MEDIUM_TICKET,
+        }
+        self.assertEqual(
+            ticket_for("gemini-4-argon-high"), self.MEDIUM_TICKET)
+
+    def test_ticket_fallback_cross_family(self):
+        CONFIG["model_tickets"] = {
+            "flash-thinking": self.HIGH_TICKET,
+        }
+        self.assertEqual(
+            ticket_for("gemini-4-argon-high"), self.HIGH_TICKET)
+
+    def test_ticket_fallback_none_when_chain_is_empty(self):
+        CONFIG["model_tickets"] = {}
+        self.assertIsNone(ticket_for("gemini-4-argon-high"))
+        self.assertIsNone(ticket_for("gemini-3.1-pro"))
+
+    def test_ticket_fallback_logs_once(self):
+        _TICKET_FALLBACK_LOGGED.clear()
+        CONFIG["model_tickets"] = {"pro-medium": self.MEDIUM_TICKET}
+        with mock.patch("gemini_web2api.gemini.log") as logger:
+            self.assertEqual(
+                ticket_for("gemini-4-argon-high"), self.MEDIUM_TICKET)
+            ticket_for("gemini-4-argon-high")
+        messages = [c.args[0] for c in logger.call_args_list]
+        fallbacks = [m for m in messages if "ticket fallback" in m]
+        self.assertEqual(len(fallbacks), 1)
+        self.assertIn("gemini-4-argon-high", fallbacks[0])
+        self.assertIn("requested=high (argon-high)", fallbacks[0])
+        self.assertIn("used=medium (pro-medium)", fallbacks[0])
+
+    def test_expected_ticket_routes_has_paid_routes(self):
+        self.assertEqual(EXPECTED_TICKET_ROUTES["flash-medium"], (1, 4))
+        self.assertEqual(EXPECTED_TICKET_ROUTES["pro-medium"], (3, 4))
+        self.assertEqual(EXPECTED_TICKET_ROUTES["argon"], (8, 1))
+        self.assertEqual(EXPECTED_TICKET_ROUTES["argon-medium"], (8, 4))
+        self.assertEqual(EXPECTED_TICKET_ROUTES["argon-high"], (8, 2))
+
+    def test_handler_logs_effective_selection(self):
+        CONFIG["model_tickets"] = {
+            "flash-thinking": self.HIGH_TICKET,
+        }
+        handler = object.__new__(GeminiHandler)
+        with mock.patch("gemini_web2api.gemini.log") as logger:
+            resolved = handler._resolve_request_model({
+                "model": "gemini-3.8-flash",
+                "reasoning_effort": "high",
+            })
+        self.assertEqual(resolved[1], "gemini-3.8-flash-high")
+        messages = [c.args[0] for c in logger.call_args_list]
+        self.assertTrue(any(
+            m.startswith("[model] reasoning_effort=high -> ") for m in messages))
+        effective = [m for m in messages if m.startswith("[model] requested=")]
+        self.assertEqual(len(effective), 1)
+        self.assertIn("gemini-3.8-flash-high", effective[0])
+        self.assertIn("family=1", effective[0])
+        self.assertIn("variant=2", effective[0])
+        self.assertIn("ticket=flash-thinking", effective[0])
+
+    def test_low_fallback_hint_covers_other_families(self):
+        raw = self._raw_echo("Argon", 8, 1)
+        with mock.patch("gemini_web2api.gemini.log") as logger:
+            check_routing(raw, model_id=8, extra_fields={80: 2})
+        messages = [c.args[0] for c in logger.call_args_list]
+        self.assertTrue(any("fell back to Argon low (8,1)" in m
+                            for m in messages))
 
     def test_reasoning_effort_sources(self):
         self.assertEqual(

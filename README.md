@@ -91,10 +91,18 @@ Supports Google native API endpoints:
 | Model | Description | Output |
 |-------|-------------|--------|
 | `gemini-3.6-flash` | All-around model (latest) | ~12k chars |
+| `gemini-3.8-flash` / `-low` | Latest Flash, low thinking | ~12k chars |
+| `gemini-3.8-flash-medium` | Flash medium thinking | ~12k chars |
+| `gemini-3.8-flash-high` | Flash high thinking | **~20k chars** |
 | `gemini-3.5-flash` | Alias for gemini-3.6-flash | ~12k chars |
 | `gemini-3.5-flash-thinking` | Extended thinking, longest output | **~20k chars** |
 | `gemini-3.5-flash-thinking-lite` | Adaptive thinking depth | ~15k chars |
-| `gemini-3.1-pro` | Advanced math & code (needs cookie) | ~12k chars |
+| `gemini-3.1-pro` / `-low` | Advanced math & code (needs cookie) | ~12k chars |
+| `gemini-3.1-pro-medium` | Pro medium thinking | ~12k chars |
+| `gemini-3.1-pro-high` | Pro high thinking | **~20k chars** |
+| `gemini-4-argon` / `-low` | Argon model, low thinking (paid route) | ~12k chars |
+| `gemini-4-argon-medium` | Argon medium thinking | ~12k chars |
+| `gemini-4-argon-high` | Argon high thinking | **~20k chars** |
 | `gemini-auto` | Auto model selection | varies |
 | `gemini-flash-lite` | Fastest answers, lightweight | ~10k chars |
 
@@ -116,20 +124,30 @@ The upstream does **not** route on the model name. It routes on the
 Without a ticket the upstream **ignores the requested model and answers with
 the account default** (3.1 Pro), so every model silently becomes Pro.
 
-Gemini 3.5 Flash-Lite has three thinking levels, each routed by the
+Each UI model has three thinking levels, each routed by the
 `(family, variant)` pair embedded in its ticket (indexes 14/15):
 
 | Model | Route | Ticket key |
 | --- | --- | --- |
+| `gemini-3.8-flash-low` (also `gemini-3.8-flash`) | (1, 1) | `flash` |
+| `gemini-3.8-flash-medium` | (1, 4) | `flash-medium` |
+| `gemini-3.8-flash-high` | (1, 2) | `flash-thinking` |
+| `gemini-3.1-pro-low` (also `gemini-3.1-pro`) | (3, 1) | `pro` |
+| `gemini-3.1-pro-medium` | (3, 4) | `pro-medium` |
+| `gemini-3.1-pro-high` | (3, 2) | `pro-thinking` |
+| `gemini-4-argon-low` (also `gemini-4-argon`) | (8, 1) | `argon` |
+| `gemini-4-argon-medium` | (8, 4) | `argon-medium` |
+| `gemini-4-argon-high` | (8, 2) | `argon-high` |
 | `gemini-3.5-flash-lite-low` (also `gemini-3.5-flash-lite`) | (6, 1) | `lite` |
 | `gemini-3.5-flash-lite-medium` | (6, 4) | `lite-medium` |
 | `gemini-3.5-flash-lite-high` (also `gemini-3.5-flash-thinking-lite`) | (6, 2) | `lite-thinking` |
 
-Instead of switching between the three model ids, clients can select the base
-`gemini-3.5-flash-lite` model and send an OpenAI-style `reasoning_effort` (or
-`reasoning.effort`): `minimal`/`low` -> low `(6,1)`, `medium` -> medium
-`(6,4)`, `high` -> high `(6,2)`. For example, an OpenCode V2 model config can
-expose the levels as variants:
+Instead of switching between the level-specific model ids, clients can select
+a base model and send an OpenAI-style `reasoning_effort` (or
+`reasoning.effort`): `minimal`/`low` -> `-low`, `medium` -> `-medium`,
+`high` -> `-high`. This works for `gemini-3.8-flash`, `gemini-3.1-pro`,
+`gemini-4-argon`, `gemini-3.5-flash-lite`, and `gemini-flash-lite`. For example,
+an OpenCode V2 model config can expose the levels as variants:
 
 ```jsonc
 "gemini-3.5-flash-lite": {
@@ -144,21 +162,26 @@ expose the levels as variants:
 
 Select the base model, then the variant. `minimal` counts as low. Explicit
 `-low`/`-medium`/`-high` model names still work and are never overridden by
-`reasoning_effort`; only the lite models react to it, and other model families
-ignore it.
+`reasoning_effort`; models without a level alias ignore it.
 
-Put one captured ticket per family in `config.json`:
+Put one captured ticket per level in `config.json` (only the keys your account
+can actually use are required):
 
 ```json
 {
   "model_tickets": {
     "flash": "[1,null,null,null,\"fbb127bbb056c959\",...]",
+    "flash-medium": "...",
     "flash-thinking": "...",
     "lite": "...",
     "lite-medium": "...",
     "lite-thinking": "...",
     "pro": "...",
-    "pro-thinking": "..."
+    "pro-medium": "...",
+    "pro-thinking": "...",
+    "argon": "...",
+    "argon-medium": "...",
+    "argon-high": "..."
   }
 }
 ```
@@ -166,6 +189,26 @@ Put one captured ticket per family in `config.json`:
 The ticket is the full `X-Goog-Ext-525001261-Jspb` header value. Index 4 is
 optional metadata: most real captures carry `null` there. Routing reads the
 `(family, variant)` pair at indexes 14/15, so a ticket with `[4]=null` is valid.
+Index 4 must never be used to identify a route.
+
+### Free-account ticket fallback
+
+A free Google account usually only carries a subset of these tickets. When the
+exact key for a level is missing, the server tries lower levels in the same
+family, then lower families (`argon -> pro -> flash -> lite`). For example,
+`gemini-4-argon-high` falls back to `argon-medium`, then `argon`, then
+`pro-thinking`/`pro-medium`/`pro`, then `flash-thinking`/`flash-medium`/`flash`,
+then the lite levels. The request still runs on a real model instead of
+silently becoming the account default, and the log reports the downgrade once:
+
+```
+[model] ticket fallback: gemini-4-argon-high requested=high (argon-high) -> used=medium (pro-medium)
+[model] requested=gemini-4-argon-high effort=default -> gemini-4-argon-high (family=8 variant=2 ticket=argon-high)
+```
+
+If no key in the chain exists, `ticket_for()` returns `None` and the upstream
+falls back to the body fields / account default as before. `gemini-auto` and
+`gemini-3.1-pro-enhanced` intentionally define no ticket and never fall back.
 
 To capture one: open [gemini.google.com](https://gemini.google.com), pick the
 model in the UI, send a message, then in DevTools → Network select the
@@ -193,6 +236,18 @@ runtime. They only survive a restart when `cookie_file` points at a writable
 JSON file (for example `"cookie_file": "gemini-auth.json"`); otherwise the next
 startup has no tickets and the upstream serves the account default.
 
+**Switching Google accounts?** Tickets are session-bound, so tickets captured
+on the old account are stale on the new one. Clear the old `model_tickets` from
+both `config.json` and `gemini-auth.json` (or delete the auth file), then
+recapture from the browser on the new account. Otherwise every request may keep
+routing to a model the new account cannot use and the logs will show
+`Routing mismatch` until you do.
+
+`cookie_file` must point at a JSON auth file such as `gemini-auth.json`, never
+at `config.json`, `gemini_web2api.py`, or any other source file: the server
+writes cookie/ticket state back to it, which would corrupt real source or
+config.
+
 Re-capture the ticket for that family; nothing else needs changing.
 
 For a step-by-step capture/verification guide (including how to add a new
@@ -203,8 +258,12 @@ model family), see [TICKET_SETUP.md](TICKET_SETUP.md).
 Anonymous access works for all models, but `gemini-3.1-pro` routes to Flash without authentication. To get real Pro routing, you need a **Gemini Advanced (paid subscription)** account cookie:
 
 ```bash
-python -m gemini_web2api --cookie-file cookie.txt
+python -m gemini_web2api --cookie-file gemini-auth.json
 ```
+
+`--cookie-file` / `"cookie_file"` must always point at a JSON auth file. Never
+point it at `gemini_web2api.py`, `config.json`, or another source/config file:
+the server writes cookie and ticket state back to it and would corrupt the file.
 
 ### How to get cookies
 
@@ -517,7 +576,7 @@ resp = client.chat.completions.create(
 - **Single-turn only**: Each request is an independent conversation. Multi-turn context is simulated by including previous messages in the prompt.
 - **Rate limits**: Google may throttle high-frequency requests. The server retries automatically but sustained heavy use may be blocked.
 - **Token usage is an estimate**: `usage` is computed as `len(text) // 4`. This is a rough heuristic and can be noticeably off for Vietnamese/Chinese text and for code.
-- **Ignored request parameters**: `temperature`, `top_p`, `seed`, `logprobs`, `parallel_tool_calls`, `service_tier`, `store`, `metadata`, `input_audio`/`file` content parts, and the legacy `functions`/`function` role are accepted and echoed where the spec requires them, but have no effect on generation — Gemini's web endpoint exposes none of them. `reasoning_effort` is the exception: it selects the Flash-Lite thinking level (low/medium/high) as described under "Model routing tickets"; other model families still ignore it.
+- **Ignored request parameters**: `temperature`, `top_p`, `seed`, `logprobs`, `parallel_tool_calls`, `service_tier`, `store`, `metadata`, `input_audio`/`file` content parts, and the legacy `functions`/`function` role are accepted and echoed where the spec requires them, but have no effect on generation — Gemini's web endpoint exposes none of them. `reasoning_effort` is the exception: it selects the thinking level (low/medium/high) for the base `gemini-3.8-flash`, `gemini-3.1-pro`, `gemini-4-argon`, and Flash-Lite ids as described under "Model routing tickets"; other model families still ignore it.
 - **Only `type: "function"` tools**: other tool types (`custom`, `local_shell`, `apply_patch`, hosted tools) are dropped with a log line, so a client that depends on them sees no calls.
 - **Unsupported methods answer in JSON**: `PUT`/`PATCH` return `405 method_not_allowed`, `DELETE /v1/responses/{id}` and `GET /v1/responses/{id}` return `404 response_not_found` (nothing is stored). Unimplemented paths keep the OpenAI error shape instead of the stdlib's plain-text `501`.
 - **Upstream failures return `503`**: the status codes the spec declares for `/chat/completions` (400/401/403/404/429/500/503) and `/responses` (400/404/429/503) — never `502`, which the spec documents only for the audio endpoints.

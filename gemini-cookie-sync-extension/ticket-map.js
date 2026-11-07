@@ -7,13 +7,18 @@
 const TICKET_ROUTE_KEYS = {
   "1,1": "flash",
   "1,2": "flash-thinking",
+  "1,4": "flash-medium",
   "3,1": "pro",
   "3,2": "pro-thinking",
+  "3,4": "pro-medium",
   "5,1": "lite-thinking",
   "5,2": "lite-thinking",
   "6,1": "lite",
   "6,2": "lite-thinking",
-  "6,4": "lite-medium"
+  "6,4": "lite-medium",
+  "8,1": "argon",
+  "8,2": "argon-high",
+  "8,4": "argon-medium"
 };
 
 function parseTicketHeader(headerVal) {

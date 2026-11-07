@@ -22,6 +22,9 @@ const MEDIUM = '[1,null,null,null,"cf41b0e0dd7d53e5",null,"en",null,[4,33,22,5,6
 const LOW = '[1,null,null,null,"cf41b0e0dd7d53e5",null,"en",null,[4,33,22,5,6,8,16,19,20],null,null,null,null,null,6,1,"BED71B1C-F2D7-410A-913F-B1415D1452C6",["boq_gemini-web-uiserver_20261105.19_p0"],null,[[null,496900000],[1793982856,15000000],"Asia/Bangkok"]]';
 
 const withNullTicket = (ticket) => ticket.replace('"cf41b0e0dd7d53e5"', "null");
+// Same captured shape, re-labelled with another (family, variant) pair.
+const paidTicket = (family, variant) =>
+  LOW.replace(",6,1,", `,${family},${variant},`);
 
 let failures = 0;
 const check = (name, actual, expected) => {
@@ -36,6 +39,25 @@ check("route table has lite low/medium/high",
       ["lite", "lite-medium", "lite-thinking"]);
 check("legacy (5,1) still maps to lite-thinking",
       TICKET_ROUTE_KEYS["5,1"], "lite-thinking");
+
+check("route table has paid flash/pro/argon levels",
+      [TICKET_ROUTE_KEYS["1,4"], TICKET_ROUTE_KEYS["3,4"],
+       TICKET_ROUTE_KEYS["8,1"], TICKET_ROUTE_KEYS["8,2"], TICKET_ROUTE_KEYS["8,4"]],
+      ["flash-medium", "pro-medium", "argon", "argon-high", "argon-medium"]);
+check("null index 4 + (1,4) -> flash-medium",
+      parseTicketHeader(withNullTicket(paidTicket(1, 4))).key, "flash-medium");
+check("null index 4 + (3,4) -> pro-medium",
+      parseTicketHeader(withNullTicket(paidTicket(3, 4))).key, "pro-medium");
+check("null index 4 + (8,1) -> argon",
+      parseTicketHeader(withNullTicket(paidTicket(8, 1))).key, "argon");
+check("null index 4 + (8,2) -> argon-high",
+      parseTicketHeader(withNullTicket(paidTicket(8, 2))).key, "argon-high");
+check("null index 4 + (8,4) -> argon-medium",
+      parseTicketHeader(withNullTicket(paidTicket(8, 4))).key, "argon-medium");
+check("index 4 does not affect the (8,2) mapping",
+      [parseTicketHeader(paidTicket(8, 2)).key,
+       parseTicketHeader(withNullTicket(paidTicket(8, 2))).key],
+      ["argon-high", "argon-high"]);
 
 check("null index 4 + (6,1) -> lite",
       parseTicketHeader(withNullTicket(LOW)).key, "lite");

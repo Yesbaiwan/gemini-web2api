@@ -15,7 +15,10 @@ Khi được yêu cầu "cấu hình ticket", "kiểm tra routing" hoặc "sửa
    `Dockerfile` copy nó thành `config.json`; ticket sẽ bị bake vào image.
 3. Đọc `config.json` và `gemini-auth.json`, nhưng chỉ in **tên key/route**, không
    in value của cookie hoặc ticket.
-4. Đảm bảo `cookie_file` trỏ tới `gemini-auth.json` (hoặc file auth tương ứng).
+4. Đảm bảo `cookie_file` trỏ tới `gemini-auth.json` (hoặc file auth JSON tương
+   ứng). **Tuyệt đối không** trỏ `cookie_file` vào `gemini_web2api.py`,
+   `config.json` hay bất kỳ source file nào: server ghi cookie/ticket trở lại
+   file đó và sẽ làm hỏng source/config thật.
 5. Đảm bảo `model_tickets` có đủ 3 key cho Flash-Lite:
    `lite` → `(6,1)`, `lite-medium` → `(6,4)`, `lite-thinking` → `(6,2)`.
 6. Nếu thiếu ticket: **hướng dẫn user capture từ browser**, không tự bịa giá trị.
@@ -68,8 +71,19 @@ index `14` và `15` trong ticket. Tên model chỉ là label.
 | `gemini-3.7-flash` | 1 | 4 | 1 | `flash` | `(1,1)` |
 | `gemini-3.6-flash` | 1 | 4 | 1 | `flash` | `(1,1)` |
 | `gemini-3.5-flash` | 1 | 4 | 1 | `flash` | `(1,1)` |
+| `gemini-3.8-flash` | 1 | 4 | 1 | `flash` | `(1,1)` |
+| `gemini-3.8-flash-low` | 1 | 4 | 1 | `flash` | `(1,1)` |
+| `gemini-3.8-flash-medium` | 1 | 4 | 4 | `flash-medium` | `(1,4)` |
+| `gemini-3.8-flash-high` | 1 | 4 | 2 | `flash-thinking` | `(1,2)` |
 | `gemini-3.5-flash-thinking` | 2 | 1 | 2 | `flash-thinking` | `(1,2)` |
 | `gemini-3.1-pro` | 3 | 4 | 1 | `pro` | `(3,1)` |
+| `gemini-3.1-pro-low` | 3 | 4 | 1 | `pro` | `(3,1)` |
+| `gemini-3.1-pro-medium` | 3 | 4 | 4 | `pro-medium` | `(3,4)` |
+| `gemini-3.1-pro-high` | 3 | 4 | 2 | `pro-thinking` | `(3,2)` |
+| `gemini-4-argon` | 8 | 4 | 1 | `argon` | `(8,1)` |
+| `gemini-4-argon-low` | 8 | 4 | 1 | `argon` | `(8,1)` |
+| `gemini-4-argon-medium` | 8 | 4 | 4 | `argon-medium` | `(8,4)` |
+| `gemini-4-argon-high` | 8 | 4 | 2 | `argon-high` | `(8,2)` |
 | `gemini-flash-lite` | 6 | 4 | 1 | `lite` | `(6,1)` |
 | `gemini-3.5-flash-lite` | 6 | 4 | 1 | `lite` | `(6,1)` |
 | `gemini-3.5-flash-lite-low` | 6 | 4 | 1 | `lite` | `(6,1)` |
@@ -80,7 +94,8 @@ index `14` và `15` trong ticket. Tên model chỉ là label.
 Ghi chú:
 
 - Index `4` của ticket có thể là `null`; điều đó **hợp lệ**. Routing đọc
-  `[14]`/`[15]`.
+  `[14]`/`[15]`. **Index 4 không bao giờ tham gia mapping** (ví dụ
+  `95a4c0abcba24364` chỉ là session metadata).
 - `gemini-3.5-flash-thinking-lite` là alias legacy: body gửi mode 5/variant 2,
   nhưng ticket `lite-thinking` vẫn route `(6,2)`.
 - Extension cũng map `(5,1)` và `(5,2)` về `lite-thinking` để tương thích
@@ -88,30 +103,81 @@ Ghi chú:
   `(6,2)`.
 - `gemini-3.1-pro-enhanced` và `gemini-auto` **cố ý không có ticket**: chúng
   dùng body fields (`extra[80]`) hoặc để upstream tự chọn. Đừng thêm ticket
-  cho hai model này nếu không có lý do rõ ràng.
+  cho hai model này nếu không có lý do rõ ràng. Hai model này không tham gia
+  fallback và luôn trả `None` khi không có ticket.
+
+### 3.1 Fallback cho account free
+
+Account free thường chỉ có một phần ticket. Khi key chính xác không có,
+`ticket_for()` tự hạ cấp theo chuỗi (giữ nguyên thứ tự):
+
+```text
+argon-high:   argon-high -> argon-medium -> argon
+              -> pro-thinking -> pro-medium -> pro
+              -> flash-thinking -> flash-medium -> flash
+              -> lite-thinking -> lite-medium -> lite
+argon-medium: argon-medium -> argon -> pro-medium -> pro
+              -> flash-medium -> flash -> lite-medium -> lite
+argon:        argon -> pro -> flash -> lite
+pro-thinking: pro-thinking -> pro-medium -> pro
+              -> flash-thinking -> flash-medium -> flash
+              -> lite-thinking -> lite-medium -> lite
+pro-medium:   pro-medium -> pro -> flash-medium -> flash
+              -> lite-medium -> lite
+pro:          pro -> flash -> lite
+flash-thinking: flash-thinking -> flash-medium -> flash
+                -> lite-thinking -> lite-medium -> lite
+flash-medium: flash-medium -> flash -> lite-medium -> lite
+flash:        flash -> lite
+lite-thinking: lite-thinking -> lite-medium -> lite
+lite-medium:  lite-medium -> lite
+lite:         lite
+```
+
+Mỗi lần fallback được dùng, log ghi **một lần** cho mỗi cặp
+`(model, requested key, used key)`:
+
+```text
+[model] ticket fallback: gemini-4-argon-high requested=high (argon-high) -> used=medium (pro-medium)
+```
+
+Nếu **không** key nào trong chuỗi tồn tại, hàm trả `None` như cũ; upstream sẽ
+dùng body fields hoặc model mặc định của account.
 
 ---
 
 ## 4. `reasoning_effort` (OpenCode variants)
 
-Chỉ hai model gốc sau phản ứng với `reasoning_effort` / `reasoning.effort`:
+Các model gốc sau phản ứng với `reasoning_effort` / `reasoning.effort`:
 
+- `gemini-3.8-flash`
+- `gemini-3.1-pro`
+- `gemini-4-argon`
 - `gemini-3.5-flash-lite`
 - `gemini-flash-lite`
 
 Mapping:
 
-| Effort | Model được chọn |
+| Effort | Hậu tố được chọn |
 |---|---|
-| `minimal`, `low` | `gemini-3.5-flash-lite-low` → `(6,1)` |
-| `medium` | `gemini-3.5-flash-lite-medium` → `(6,4)` |
-| `high` | `gemini-3.5-flash-lite-high` → `(6,2)` |
+| `minimal`, `low` | `-low` |
+| `medium` | `-medium` |
+| `high` | `-high` |
+
+Ví dụ: `gemini-3.8-flash` + `high` → `gemini-3.8-flash-high` → ticket
+`flash-thinking` → `(1,2)`; `gemini-3.1-pro` + `medium` →
+`gemini-3.1-pro-medium` → ticket `pro-medium` → `(3,4)`; `gemini-4-argon` +
+`low` → `gemini-4-argon-low` → ticket `argon` → `(8,1)`. Hai model lite vẫn
+map về `gemini-3.5-flash-lite-low/medium/high`.
 
 Quy tắc:
 
 - Tên model có hậu tố `-low`/`-medium`/`-high` **luôn thắng** `reasoning_effort`.
 - Hậu tố `@think=` vẫn được giữ.
-- Các family khác (flash, pro, ...) bỏ qua `reasoning_effort`.
+- Các model khác (ví dụ `gemini-3.6-flash`) bỏ qua `reasoning_effort`.
+- Mỗi request log dòng `[model] requested=... effort=... -> ... (family=...
+  variant=... ticket=...)`; fallback ticket có thêm dòng `[model] ticket
+  fallback: ...`.
 
 Ví dụ config OpenCode V2:
 
@@ -157,7 +223,9 @@ python gemini_web2api.py --cookie-file gemini-auth.json
 ```
 
 Lưu ý: `--cookie-file` **không được lưu** vào config. Lần sau chạy lại phải
-truyền lại, nếu không server sẽ chạy anonymous.
+truyền lại, nếu không server sẽ chạy anonymous. `--cookie-file` chỉ nhận file
+JSON auth (`gemini-auth.json`), **không bao giờ** nhận file source như
+`gemini_web2api.py` — server sẽ ghi đè và làm hỏng file.
 
 ### `--cookie-file` có tự tải ticket không?
 
@@ -183,6 +251,19 @@ Cách tránh:
 - Patch thêm `load_cookie()` ở đầu `_resolve_request_model` / trước
   `serve_forever`.
 
+### Đổi account Google (free ↔ paid)
+
+Ticket gắn với session/account. Sau khi đổi account:
+
+1. **Xóa ticket cũ** khỏi `config.json` và `gemini-auth.json` (hoặc xóa hẳn
+   `gemini-auth.json`).
+2. Capture lại ticket trên account mới.
+3. Chạy `python tools/check_tickets.py --all` để xem key nào có route đúng.
+
+Không xóa ticket cũ thì request có thể vẫn route theo model mà account mới
+không dùng được; log sẽ liên tục báo `Routing mismatch` hoặc fallback xuống
+level thấp hơn.
+
 ---
 
 ## 6. Capture ticket thủ công
@@ -199,12 +280,24 @@ Cách tránh:
 ```json
 {
   "model_tickets": {
+    "flash": "[1,null,...]",
+    "flash-medium": "[1,null,...]",
+    "flash-thinking": "[1,null,...]",
     "lite": "[1,null,...]",
     "lite-medium": "[1,null,...]",
-    "lite-thinking": "[1,null,...]"
+    "lite-thinking": "[1,null,...]",
+    "pro": "[1,null,...]",
+    "pro-medium": "[1,null,...]",
+    "pro-thinking": "[1,null,...]",
+    "argon": "[1,null,...]",
+    "argon-medium": "[1,null,...]",
+    "argon-high": "[1,null,...]"
   }
 }
 ```
+
+Chỉ cần các key account của bạn thực sự có; thiếu key sẽ tự fallback theo
+chuỗi ở mục 3.1.
 
 Giá trị là một JSON array, nhưng trong `config.json` nó là **string**. Giữ
 nguyên dấu ngoặc kép đã escape.
@@ -242,7 +335,8 @@ RESULT: required lite tickets are ready.
 ```
 
 Script chỉ trả exit code `1` khi 3 key Flash-Lite thiếu/sai. Dùng `--all` để
-xem thêm `flash`, `flash-thinking`, `pro`, `pro-thinking`; thiếu các key này
+xem thêm `flash`, `flash-medium`, `flash-thinking`, `pro`, `pro-medium`,
+`pro-thinking`, `argon`, `argon-medium`, `argon-high`; thiếu các key này
 không bị coi là lỗi.
 
 ### 7.2 Kiểm tra server
@@ -268,6 +362,17 @@ curl.exe -s http://127.0.0.1:8081/v1/models
 Phải thấy:
 
 ```text
+gemini-3.8-flash
+gemini-3.8-flash-low
+gemini-3.8-flash-medium
+gemini-3.8-flash-high
+gemini-3.1-pro-low
+gemini-3.1-pro-medium
+gemini-3.1-pro-high
+gemini-4-argon
+gemini-4-argon-low
+gemini-4-argon-medium
+gemini-4-argon-high
 gemini-3.5-flash-lite
 gemini-3.5-flash-lite-low
 gemini-3.5-flash-lite-medium
@@ -279,10 +384,15 @@ gemini-3.5-flash-lite-high
 Gửi 1 request cho mỗi level và xem log:
 
 ```text
-[model] reasoning_effort=low -> gemini-3.5-flash-lite-low
-[model] reasoning_effort=medium -> gemini-3.5-flash-lite-medium
-[model] reasoning_effort=high -> gemini-3.5-flash-lite-high
+[model] reasoning_effort=low -> gemini-3.8-flash-low
+[model] reasoning_effort=medium -> gemini-3.8-flash-medium
+[model] reasoning_effort=high -> gemini-3.8-flash-high
+[model] requested=gemini-3.8-flash effort=high -> gemini-3.8-flash-high (family=1 variant=2 ticket=flash-thinking)
+[model] ticket fallback: gemini-3.8-flash-high requested=high (flash-thinking) -> used=medium (lite-medium)
 ```
+
+Dòng `requested=...` xuất hiện cho **mọi** request. Dòng `ticket fallback`
+chỉ xuất hiện khi key chính xác thiếu và một key khác trong chuỗi được dùng.
 
 ---
 
@@ -291,7 +401,8 @@ Gửi 1 request cho mỗi level và xem log:
 | Triệu chứng | Nguyên nhân | Cách sửa |
 |---|---|---|
 | `Routing mismatch ...` | Ticket thiếu, hết hạn hoặc sai `(family,variant)` | Capture lại ticket; kiểm tra `[14]/[15]` |
-| `Routing hint: ... fell back to Flash-Lite low` | Anonymous hoặc hết quota | Dùng account có quota; low là mặc định an toàn |
+| `Routing hint: ... fell back to <family> low` | Anonymous, hết quota, hoặc account không có ticket medium/high | Dùng account có quota; low là mặc định an toàn |
+| `[model] ticket fallback: ... requested=... -> used=...` | Key chính xác thiếu; server đang hạ cấp trong chuỗi fallback | Bình thường với account free; capture key cao hơn nếu muốn đúng level |
 | `Unknown model ... falling back` | Tên model không có trong `MODELS` | Dùng tên đã hỗ trợ hoặc thêm mapping |
 | `401` / `403` | Cookie hết hạn hoặc bị Google từ chối | Đăng nhập lại, để extension sync cookie mới |
 | Request đầu sau restart thiếu ticket | Ticket chỉ có trong `gemini-auth.json`, resolve trước `load_cookie` | Giữ `model_tickets` trong `config.json` hoặc patch load sớm |
@@ -302,12 +413,13 @@ Gửi 1 request cho mỗi level và xem log:
 
 ## 9. Thêm model / family mới (khi Google đổi)
 
-Model mới **không tự xuất hiện**. Routing đang hardcode ở 4 nơi:
+Model mới **không tự xuất hiện**. Routing đang hardcode ở các nơi:
 
 1. `MODELS` trong `gemini_web2api.py`
-2. `EXPECTED_TICKET_ROUTES` trong `gemini_web2api.py`
+2. `EXPECTED_TICKET_ROUTES` + `_TICKET_FALLBACKS` trong `gemini_web2api.py`
 3. `TICKET_ROUTE_KEYS` trong `gemini-cookie-sync-extension/ticket-map.js`
-4. `MODELS` + ticket table trong `cloudflare/worker.js` (nếu dùng worker)
+4. `MODELS` + `TICKET_FALLBACKS` trong `cloudflare/worker.js` (nếu dùng worker)
+5. `EXPECTED` trong `tools/check_tickets.py`
 
 Các bước:
 

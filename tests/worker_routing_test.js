@@ -124,6 +124,49 @@ function echoLine(label, family, variant) {
         [unknown.modelName, unknown.variant, unknown.ticket],
         ['some-client-model', 1, TICKETS.lite]);
 
+  // ── captured paid routes: 3.8 Flash / 3.1 Pro / 4 Argon ──────────────────
+  const flash38High = api.resolveModel('gemini-3.8-flash-high', 'gemini-3.6-flash', cfg);
+  check('3.8 Flash high resolves to (1,2) with the flash-thinking ticket',
+        [flash38High.modelId, flash38High.variant, flash38High.ticket],
+        [1, 2, TICKETS['flash-thinking']]);
+
+  const flash38Medium = api.resolveModel('gemini-3.8-flash-medium', 'gemini-3.6-flash', cfg);
+  check('3.8 Flash medium resolves to (1,4) and falls back to flash',
+        [flash38Medium.modelId, flash38Medium.variant, flash38Medium.ticket],
+        [1, 4, TICKETS.flash]);
+
+  const proMedium = api.resolveModel('gemini-3.1-pro-medium', 'gemini-3.6-flash', cfg);
+  check('3.1 Pro medium resolves to (3,4) and falls back to flash',
+        [proMedium.modelId, proMedium.variant, proMedium.ticket],
+        [3, 4, TICKETS.flash]);
+
+  const argon = api.resolveModel('gemini-4-argon', 'gemini-3.6-flash', cfg);
+  check('4 Argon resolves to (8,1) and falls back to flash',
+        [argon.modelId, argon.variant, argon.ticket],
+        [8, 1, TICKETS.flash]);
+
+  const argonHigh = api.resolveModel('gemini-4-argon-high', 'gemini-3.6-flash', cfg);
+  check('4 Argon high resolves to (8,2) and falls back to flash-thinking',
+        [argonHigh.modelId, argonHigh.variant, argonHigh.ticket],
+        [8, 2, TICKETS['flash-thinking']]);
+
+  // ── ticket fallback chains mirror the Python server ──────────────────────
+  check('argon-high tries argon-medium before lower families',
+        api.ticketFor('gemini-4-argon-high',
+                      { modelTickets: { 'argon-medium': TICKETS.lite } }),
+        TICKETS.lite);
+  check('argon-high falls back across families to flash-thinking',
+        api.ticketFor('gemini-4-argon-high',
+                      { modelTickets: { 'flash-thinking': TICKETS['flash-thinking'] } }),
+        TICKETS['flash-thinking']);
+  check('argon-high returns null when no ticket in the chain exists',
+        api.ticketFor('gemini-4-argon-high', { modelTickets: {} }), null);
+  check('pro falls back to flash', api.ticketFor('gemini-3.1-pro',
+        { modelTickets: { flash: TICKETS.flash } }), TICKETS.flash);
+  check('explicit level names still resolve their own ticket key',
+        api.resolveModel('gemini-3.1-pro-high', 'gemini-3.6-flash', cfg).ticket,
+        TICKETS['flash-thinking']);
+
   // ── buildPayload: inner[79] family + inner[80] variant ───────────────────
   check('payload carries family and variant',
         (() => { const i = decodePayload(api.buildPayload('hi', 5, 1, {}, 2)); return [i[79], i[80]]; })(),

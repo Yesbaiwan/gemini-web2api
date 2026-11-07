@@ -203,7 +203,11 @@ var DEFAULT_CONFIG = {
 
   // ---- 模型票据（决定上游真正使用哪个模型）----
   // 键名对应 MODELS 里每个模型的 ticket 字段：
-  //   flash / flash-thinking / lite / lite-medium / lite-thinking / pro / pro-thinking
+  //   flash / flash-medium / flash-thinking
+  //   lite / lite-medium / lite-thinking
+  //   pro / pro-medium / pro-thinking
+  //   argon / argon-medium / argon-high
+  // 缺 key 时 ticketFor() 会按 TICKET_FALLBACKS 逐级降级。
   // 值是从浏览器 StreamGenerate 请求头 X-Goog-Ext-525001261-Jspb
   // 原样复制的整串 JSON。抓取方法：
   //   1. 打开 https://gemini.google.com 并选择要抓取的模型
@@ -479,6 +483,34 @@ var MODELS = {
     ticket: 'flash',
     desc: 'Alias for gemini-3.6-flash (backend upgraded)',
   },
+  'gemini-3.8-flash': {
+    mode: 1,        // FAST
+    think: 4,       // AUTO
+    variant: 1,     // inner[80] - low (family 1 variant 1)
+    ticket: 'flash',
+    desc: 'Latest Flash, low thinking (family 1 variant 1)',
+  },
+  'gemini-3.8-flash-low': {
+    mode: 1,
+    think: 4,
+    variant: 1,
+    ticket: 'flash',
+    desc: 'Flash low thinking (family 1 variant 1)',
+  },
+  'gemini-3.8-flash-medium': {
+    mode: 1,
+    think: 4,
+    variant: 4,
+    ticket: 'flash-medium',
+    desc: 'Flash medium thinking (family 1 variant 4)',
+  },
+  'gemini-3.8-flash-high': {
+    mode: 1,
+    think: 4,
+    variant: 2,
+    ticket: 'flash-thinking',
+    desc: 'Flash high thinking (family 1 variant 2)',
+  },
   'gemini-3.5-flash-thinking': {
     mode: 2,        // THINKING - 深度思考模式
     think: 1,       // Extended（实测比 0 输出更长）
@@ -492,6 +524,55 @@ var MODELS = {
     variant: 1,     // inner[80] - 标准版
     ticket: 'pro',
     desc: 'Pro model (requires cookie for real routing)',
+  },
+  'gemini-3.1-pro-low': {
+    mode: 3,
+    think: 4,
+    variant: 1,
+    ticket: 'pro',
+    desc: 'Pro low thinking (family 3 variant 1)',
+  },
+  'gemini-3.1-pro-medium': {
+    mode: 3,
+    think: 4,
+    variant: 4,
+    ticket: 'pro-medium',
+    desc: 'Pro medium thinking (family 3 variant 4)',
+  },
+  'gemini-3.1-pro-high': {
+    mode: 3,
+    think: 4,
+    variant: 2,
+    ticket: 'pro-thinking',
+    desc: 'Pro high thinking (family 3 variant 2)',
+  },
+  'gemini-4-argon': {
+    mode: 8,        // ARGON - captured from a paid account (2026-11-07)
+    think: 4,
+    variant: 1,
+    ticket: 'argon',
+    desc: 'Argon model, low thinking (family 8 variant 1)',
+  },
+  'gemini-4-argon-low': {
+    mode: 8,
+    think: 4,
+    variant: 1,
+    ticket: 'argon',
+    desc: 'Argon low thinking (family 8 variant 1)',
+  },
+  'gemini-4-argon-medium': {
+    mode: 8,
+    think: 4,
+    variant: 4,
+    ticket: 'argon-medium',
+    desc: 'Argon medium thinking (family 8 variant 4)',
+  },
+  'gemini-4-argon-high': {
+    mode: 8,
+    think: 4,
+    variant: 2,
+    ticket: 'argon-high',
+    desc: 'Argon high thinking (family 8 variant 2)',
   },
   'gemini-auto': {
     mode: 4,        // AUTO - 自动模型选择
@@ -542,8 +623,39 @@ var MODELS = {
 // 票据内嵌时间戳会过期，过期后上游退回账号默认模型（见上方说明）。
 var TICKET_HEADER = 'X-Goog-Ext-525001261-Jspb';
 
+// 免费账号通常只有部分 ticket：先试请求的 key，再试同 family 的低 level，
+// 最后试更低的 family（argon -> pro -> flash -> lite）。链与 Python 端一致。
+var TICKET_FALLBACKS = {
+  'argon-high': ['argon-high', 'argon-medium', 'argon',
+    'pro-thinking', 'pro-medium', 'pro',
+    'flash-thinking', 'flash-medium', 'flash',
+    'lite-thinking', 'lite-medium', 'lite'],
+  'argon-medium': ['argon-medium', 'argon',
+    'pro-medium', 'pro',
+    'flash-medium', 'flash',
+    'lite-medium', 'lite'],
+  'argon': ['argon', 'pro', 'flash', 'lite'],
+  'pro-thinking': ['pro-thinking', 'pro-medium', 'pro',
+    'flash-thinking', 'flash-medium', 'flash',
+    'lite-thinking', 'lite-medium', 'lite'],
+  'pro-medium': ['pro-medium', 'pro',
+    'flash-medium', 'flash',
+    'lite-medium', 'lite'],
+  'pro': ['pro', 'flash', 'lite'],
+  'flash-thinking': ['flash-thinking', 'flash-medium', 'flash',
+    'lite-thinking', 'lite-medium', 'lite'],
+  'flash-medium': ['flash-medium', 'flash', 'lite-medium', 'lite'],
+  'flash': ['flash', 'lite'],
+  'lite-thinking': ['lite-thinking', 'lite-medium', 'lite'],
+  'lite-medium': ['lite-medium', 'lite'],
+  'lite': ['lite'],
+};
+
 /**
  * 根据模型名查出该模型的票据值
+ *
+ * 没有完全匹配的 ticket 时按 TICKET_FALLBACKS 逐级降级；一个都没有则
+ * 返回 null（与旧行为一致：由 body 字段/账号默认模型兜底）。
  *
  * @param {string} modelName - 模型名称（不含 @think= 参数）
  * @param {Object} config - 请求级配置对象（含 modelTickets）
@@ -553,7 +665,11 @@ function ticketFor(modelName, config) {
   var cfg = MODELS[modelName];
   if (!cfg || !cfg.ticket) return null;
   var tickets = (config && config.modelTickets) || {};
-  return tickets[cfg.ticket] || null;
+  var chain = TICKET_FALLBACKS[cfg.ticket] || [cfg.ticket];
+  for (var i = 0; i < chain.length; i++) {
+    if (tickets[chain[i]]) return tickets[chain[i]];
+  }
+  return null;
 }
 
 /**

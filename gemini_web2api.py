@@ -195,6 +195,7 @@ import json
 
 # MODE_CATEGORY enum from 028-6eb337387583.js:
 #   1=FAST, 2=THINKING, 3=PRO, 4=AUTO, 5=FAST_DYNAMIC_THINKING, 6=FLASH_LITE
+#   8=ARGON (captured 2026-11-07 from a paid account; the ticket still wins)
 
 TICKET_HEADER = "X-Goog-Ext-525001261-Jspb"
 
@@ -215,6 +216,22 @@ MODELS = {
         "mode": 1, "think": 4, "variant": 1, "ticket": "flash",
         "desc": "Alias for gemini-3.6-flash (backend upgraded)",
     },
+    "gemini-3.8-flash": {
+        "mode": 1, "think": 4, "variant": 1, "ticket": "flash",
+        "desc": "Latest Flash, low thinking (family 1 variant 1)",
+    },
+    "gemini-3.8-flash-low": {
+        "mode": 1, "think": 4, "variant": 1, "ticket": "flash",
+        "desc": "Flash low thinking (family 1 variant 1)",
+    },
+    "gemini-3.8-flash-medium": {
+        "mode": 1, "think": 4, "variant": 4, "ticket": "flash-medium",
+        "desc": "Flash medium thinking (family 1 variant 4)",
+    },
+    "gemini-3.8-flash-high": {
+        "mode": 1, "think": 4, "variant": 2, "ticket": "flash-thinking",
+        "desc": "Flash high thinking (family 1 variant 2)",
+    },
     "gemini-3.5-flash-thinking": {
         # think=1 (Extended), not 0: live checks showed 1 produces the longer
         # thinking answer, 0 the shorter one.
@@ -224,6 +241,34 @@ MODELS = {
     "gemini-3.1-pro": {
         "mode": 3, "think": 4, "variant": 1, "ticket": "pro",
         "desc": "Pro model (requires cookie for real routing)",
+    },
+    "gemini-3.1-pro-low": {
+        "mode": 3, "think": 4, "variant": 1, "ticket": "pro",
+        "desc": "Pro low thinking (family 3 variant 1)",
+    },
+    "gemini-3.1-pro-medium": {
+        "mode": 3, "think": 4, "variant": 4, "ticket": "pro-medium",
+        "desc": "Pro medium thinking (family 3 variant 4)",
+    },
+    "gemini-3.1-pro-high": {
+        "mode": 3, "think": 4, "variant": 2, "ticket": "pro-thinking",
+        "desc": "Pro high thinking (family 3 variant 2)",
+    },
+    "gemini-4-argon": {
+        "mode": 8, "think": 4, "variant": 1, "ticket": "argon",
+        "desc": "Argon model, low thinking (family 8 variant 1)",
+    },
+    "gemini-4-argon-low": {
+        "mode": 8, "think": 4, "variant": 1, "ticket": "argon",
+        "desc": "Argon low thinking (family 8 variant 1)",
+    },
+    "gemini-4-argon-medium": {
+        "mode": 8, "think": 4, "variant": 4, "ticket": "argon-medium",
+        "desc": "Argon medium thinking (family 8 variant 4)",
+    },
+    "gemini-4-argon-high": {
+        "mode": 8, "think": 4, "variant": 2, "ticket": "argon-high",
+        "desc": "Argon high thinking (family 8 variant 2)",
     },
     "gemini-3.1-pro-enhanced": {
         # No ticket: a ticket wins over the body, which would throw away the
@@ -276,12 +321,17 @@ MODELS = {
 # browser session.
 EXPECTED_TICKET_ROUTES = {
     "flash": (1, 1),
+    "flash-medium": (1, 4),
     "flash-thinking": (1, 2),
     "lite": (6, 1),
     "lite-medium": (6, 4),
     "lite-thinking": (6, 2),
     "pro": (3, 1),
+    "pro-medium": (3, 4),
     "pro-thinking": (3, 2),
+    "argon": (8, 1),
+    "argon-medium": (8, 4),
+    "argon-high": (8, 2),
 }
 
 
@@ -317,6 +367,101 @@ def ticket_warnings() -> list:
     return warnings
 
 
+# Thinking level each ticket key represents. Used only for the fallback log so
+# an operator can see which level was requested and which one actually routed.
+_TICKET_KEY_LEVEL = {
+    "flash": "low",
+    "flash-medium": "medium",
+    "flash-thinking": "high",
+    "lite": "low",
+    "lite-medium": "medium",
+    "lite-thinking": "high",
+    "pro": "low",
+    "pro-medium": "medium",
+    "pro-thinking": "high",
+    "argon": "low",
+    "argon-medium": "medium",
+    "argon-high": "high",
+}
+
+# Account-safe ticket fallback. A free Google account usually only has a subset
+# of the paid routes, so try the requested key first, then lower levels in the
+# same family, then lower families (argon -> pro -> flash -> lite). Each chain
+# is explicit (not computed) so it can be reviewed at a glance.
+_TICKET_FALLBACKS = {
+    "argon-high": (
+        "argon-high", "argon-medium", "argon",
+        "pro-thinking", "pro-medium", "pro",
+        "flash-thinking", "flash-medium", "flash",
+        "lite-thinking", "lite-medium", "lite",
+    ),
+    "argon-medium": (
+        "argon-medium", "argon",
+        "pro-medium", "pro",
+        "flash-medium", "flash",
+        "lite-medium", "lite",
+    ),
+    "argon": ("argon", "pro", "flash", "lite"),
+    "pro-thinking": (
+        "pro-thinking", "pro-medium", "pro",
+        "flash-thinking", "flash-medium", "flash",
+        "lite-thinking", "lite-medium", "lite",
+    ),
+    "pro-medium": (
+        "pro-medium", "pro",
+        "flash-medium", "flash",
+        "lite-medium", "lite",
+    ),
+    "pro": ("pro", "flash", "lite"),
+    "flash-thinking": (
+        "flash-thinking", "flash-medium", "flash",
+        "lite-thinking", "lite-medium", "lite",
+    ),
+    "flash-medium": ("flash-medium", "flash", "lite-medium", "lite"),
+    "flash": ("flash", "lite"),
+    "lite-thinking": ("lite-thinking", "lite-medium", "lite"),
+    "lite-medium": ("lite-medium", "lite"),
+    "lite": ("lite",),
+}
+
+# (model_name, requested_key, used_key) triples already logged, so one request
+# burst reports each downgrade once instead of per turn.
+_TICKET_FALLBACK_LOGGED = set()
+
+
+def _resolve_ticket(model_name: str):
+    """Return ``(requested_key, used_key, value)`` for a model.
+
+    ``requested_key`` is the key named by :data:`MODELS`; ``used_key`` is the
+    key whose ticket was actually selected (it differs when the account lacks
+    the exact level/family). ``value`` is ``None`` when no key in the chain
+    exists. This helper exists so the request log can show both keys instead
+    of claiming the requested ticket was used after a fallback.
+    """
+    from gemini_web2api.config import CONFIG
+    cfg = MODELS.get(model_name) or {}
+    key = cfg.get("ticket")
+    if not key:
+        return None, None, None
+    tickets = CONFIG.get("model_tickets") or {}
+    for alt in _TICKET_FALLBACKS.get(key, (key,)):
+        value = tickets.get(alt)
+        if not value:
+            continue
+        if alt != key:
+            marker = (model_name, key, alt)
+            if marker not in _TICKET_FALLBACK_LOGGED:
+                _TICKET_FALLBACK_LOGGED.add(marker)
+                from gemini_web2api.gemini import log
+                requested = _TICKET_KEY_LEVEL.get(key, key)
+                used = _TICKET_KEY_LEVEL.get(alt, alt)
+                log(f"[model] ticket fallback: {model_name} "
+                    f"requested={requested} ({key}) -> "
+                    f"used={used} ({alt})")
+        return key, alt, value
+    return key, None, None
+
+
 def ticket_for(model_name: str):
     """Return the upstream ticket header value for a model, or None.
 
@@ -324,13 +469,12 @@ def ticket_for(model_name: str):
     real browser session and expire: an absent or stale key degrades to the
     body fields rather than erroring, and ``gemini.check_routing`` warns when
     the upstream then answers with a different model.
+
+    When the exact ticket key is missing (common on a free account) the
+    fallback chain for that level/family is used instead, so the request still
+    routes to a real model rather than silently becoming the account default.
     """
-    from gemini_web2api.config import CONFIG
-    cfg = MODELS.get(model_name) or {}
-    key = cfg.get("ticket")
-    if not key:
-        return None
-    return (CONFIG.get("model_tickets") or {}).get(key)
+    return _resolve_ticket(model_name)[2]
 
 
 def resolve_model(model_name: str, default: str = "gemini-3.6-flash"):
@@ -366,20 +510,28 @@ def resolve_model(model_name: str, default: str = "gemini-3.6-flash"):
     return model_name, mode_id, think_mode, None, extra or None
 
 
-# Flash-Lite thinking level selected by the OpenAI-style `reasoning_effort`
-# request field. Only the two base lite ids are re-routed: an explicit
-# -low/-medium/-high model name always wins, and other families ignore it.
-_LITE_EFFORT_MODELS = {
-    "minimal": "gemini-3.5-flash-lite-low",
-    "low": "gemini-3.5-flash-lite-low",
-    "medium": "gemini-3.5-flash-lite-medium",
-    "high": "gemini-3.5-flash-lite-high",
+# Thinking level selected by the OpenAI-style `reasoning_effort` request field.
+# Any base id in ``_EFFORT_BASE_MODELS`` is re-routed to its -low/-medium/-high
+# alias; an explicit level name always wins, and other models ignore effort.
+_EFFORT_SUFFIX = {
+    "minimal": "-low",
+    "low": "-low",
+    "medium": "-medium",
+    "high": "-high",
 }
-_LITE_BASE_MODELS = {"gemini-3.5-flash-lite", "gemini-flash-lite"}
+# Base id -> prefix used to build the level-specific alias. Both lite ids map
+# to the versioned 3.5 Flash-Lite names (the canonical entries).
+_EFFORT_BASE_MODELS = {
+    "gemini-3.5-flash-lite": "gemini-3.5-flash-lite",
+    "gemini-flash-lite": "gemini-3.5-flash-lite",
+    "gemini-3.8-flash": "gemini-3.8-flash",
+    "gemini-3.1-pro": "gemini-3.1-pro",
+    "gemini-4-argon": "gemini-4-argon",
+}
 
 
 def _reasoning_effort(req):
-    """Return a normalized lite effort from a request body, or None.
+    """Return a normalized effort from a request body, or None.
 
     Accepts the top-level ``reasoning_effort`` string, or the Responses-style
     ``reasoning.effort`` nested object. Unknown values are ignored.
@@ -393,13 +545,19 @@ def _reasoning_effort(req):
     if not isinstance(effort, str):
         return None
     effort = effort.strip().lower()
-    return effort if effort in _LITE_EFFORT_MODELS else None
+    return effort if effort in _EFFORT_SUFFIX else None
 
 
 def _lite_effort_model(model_name, effort):
-    """Map a base Flash-Lite model id to its effort-specific alias."""
-    if model_name in _LITE_BASE_MODELS and effort in _LITE_EFFORT_MODELS:
-        return _LITE_EFFORT_MODELS[effort]
+    """Map a base model id to its effort-specific alias.
+
+    Kept under the historical name because callers/tests import it, but this
+    now covers every base id that accepts ``reasoning_effort``.
+    """
+    prefix = _EFFORT_BASE_MODELS.get(model_name)
+    suffix = _EFFORT_SUFFIX.get(effort)
+    if prefix and suffix:
+        return prefix + suffix
     return model_name
 
 
@@ -4468,10 +4626,16 @@ def check_routing(raw: str, model_id: int, extra_fields: dict = None, ticket: st
             f"but upstream served {echo[0]!r} (family={fam} variant={var}); "
             f"the model ticket in CONFIG['model_tickets'] may be missing or "
             f"expired -- refresh it from a fresh browser capture")
-        if (want_fam, want_var) in ((6, 2), (6, 4)) and (fam, var) == (6, 1):
-            log("Routing hint: upstream fell back to Flash-Lite low (6,1); "
-                "anonymous sessions or exhausted quota cannot use medium/high "
-                "tickets")
+        # Generalize the low-fallback hint beyond Flash-Lite: any family that
+        # requested medium/high but was served variant 1 is the same symptom.
+        if fam == want_fam and want_var in (2, 4) and var == 1:
+            family_names = {
+                1: "Flash", 3: "Pro", 6: "Flash-Lite", 8: "Argon",
+            }
+            family = family_names.get(fam, f"family {fam}")
+            log(f"Routing hint: upstream fell back to {family} low "
+                f"({fam},{var}); anonymous sessions or exhausted quota "
+                f"cannot use medium/high tickets")
         if ticket is None:
             try:
                 from gemini_web2api.models import MODELS
@@ -13905,7 +14069,20 @@ class GeminiHandler(BaseHTTPRequestHandler):
             from gemini_web2api.gemini import log
             log(f"[model] reasoning_effort={effort} -> {alias}")
         # The ticket is what upstream routes on; [79]/[80] alone are ignored.
-        return echo, model_name, model_id, think_mode, extra, ticket_for(model_name)
+        # Resolve it once so the log can name the requested and used keys.
+        requested_key, used_key, ticket = _resolve_ticket(model_name)
+        cfg = MODELS.get(model_name) or {}
+        variant = (extra or {}).get(80, cfg.get("variant"))
+        level = _TICKET_KEY_LEVEL.get(used_key or requested_key, "unknown")
+        if requested_key and used_key and used_key != requested_key:
+            ticket_desc = f"{requested_key}->{used_key}"
+        else:
+            ticket_desc = requested_key or "none"
+        from gemini_web2api.gemini import log
+        log(f"[model] requested={echo} effort={effort or 'default'} -> "
+            f"{model_name} (family={model_id} variant={variant} "
+            f"level={level} ticket={ticket_desc})")
+        return echo, model_name, model_id, think_mode, extra, ticket
 
     def do_POST(self):
         try:

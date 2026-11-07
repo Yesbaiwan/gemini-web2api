@@ -20,12 +20,17 @@ import os
 import sys
 
 EXPECTED = {
+    "argon": (8, 1),
+    "argon-high": (8, 2),
+    "argon-medium": (8, 4),
     "flash": (1, 1),
+    "flash-medium": (1, 4),
     "flash-thinking": (1, 2),
     "lite": (6, 1),
     "lite-medium": (6, 4),
     "lite-thinking": (6, 2),
     "pro": (3, 1),
+    "pro-medium": (3, 4),
     "pro-thinking": (3, 2),
 }
 
