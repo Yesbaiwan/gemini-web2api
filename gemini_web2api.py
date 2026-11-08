@@ -110,6 +110,10 @@ DEFAULT_CONFIG = {
     # turn without a call. Set False for the old soft behaviour (a loop is
     # worse than one prose turn -- fall back to the plain-text answer).
     "required_tool_fail_on_duplicate": True,
+    # Enable automatic Plan & TODO progress tracking and live todowrite
+    # tool_call synchronization for agent clients (e.g. OpenCode).
+    "flow16_plan_todo": True,
+    "flow17_plan_todo_act": True,
     # Rewrite the bare word "workspace" to "project" in the prompt sent
     # upstream. The word routes a request to Gemini's Workspace extension,
     # which an anonymous / no-Gmail session answers with "I can't use
@@ -4440,7 +4444,20 @@ def _account_prefix() -> str:
     return f"/u/{auth_user}"
 
 
+_FF11_AUTH = {"ts": 0.0, "logged": False}
+
+
+def _ff11_cookie_map(cookie_str):
+    out = {}
+    for part in re.split(r";\s*", cookie_str or ""):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
 def _build_headers(ticket: str = None) -> dict:
+    """Build request headers for Gemini upstream (Authorization SAPISIDHASH is opt-in)."""
     account_prefix = _account_prefix()
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
@@ -4451,14 +4468,34 @@ def _build_headers(ticket: str = None) -> dict:
     }
     if account_prefix:
         headers["X-Goog-AuthUser"] = str(CONFIG["auth_user"])
-    cookie_str, sapisid = load_cookie()
+    cookie_str, json_sapisid = load_cookie()
+    cookie_str = (cookie_str or "").replace("\r", "").replace("\n", "").strip()
+    cmap = _ff11_cookie_map(cookie_str)
     if cookie_str:
         headers["Cookie"] = cookie_str
-    if sapisid:
-        headers["Authorization"] = make_sapisidhash(sapisid)
+        if not _FF11_AUTH["logged"]:
+            _FF11_AUTH["logged"] = True
+            log("[fix11] cookie names sent: " + ", ".join(sorted(cmap)) if cmap
+                else "[fix11] cookie string has no name=value pairs")
+            if "__Secure-1PSID" not in cmap and "__Secure-3PSID" not in cmap \
+                    and "SID" not in cmap:
+                log("[fix11] WARNING: no __Secure-1PSID/SID cookie -- the session "
+                    "is not logged in, Google will answer 401/400")
+            if "__Secure-1PSIDTS" not in cmap:
+                log("[fix11] WARNING: no __Secure-1PSIDTS cookie (re-export cookies)")
+    else:
+        if not _FF11_AUTH["logged"]:
+            _FF11_AUTH["logged"] = True
+            log("[fix11] WARNING: no cookie loaded (cookie_file=%r exists=%s)" % (
+                CONFIG.get("cookie_file"),
+                bool(CONFIG.get("cookie_file")
+                     and os.path.exists(CONFIG["cookie_file"]))))
+    if CONFIG.get("send_sapisidhash", False):
+        sapisid = (cmap.get("SAPISID") or cmap.get("__Secure-3PAPISID")
+                   or json_sapisid)
+        if sapisid:
+            headers["Authorization"] = make_sapisidhash(sapisid)
     if ticket:
-        # The per-family ticket is what the upstream actually routes on; the
-        # f.req [79]/[80] fields are advisory without it.
         from gemini_web2api.models import TICKET_HEADER
         headers[TICKET_HEADER] = ticket
     return headers
@@ -6778,9 +6815,13 @@ def install():
                     return report, None
             return call((step_prompt or prompt) + "\n\n" + step.directive())
         if step.drive and _cfg("flow_drive"):
-            return "", step.calls
+            d_calls = list(step.calls or [])
+            if "_ff17_attach_todowrite" in globals():
+                d_calls = _ff17_attach_todowrite(ctx, messages, tm, step, d_calls)
+            return "", d_calls
 
         nudge, last = "", None
+        saved_todo_calls = []
         max_retries = max(0, int(_cfg("flow_max_retries"))) + (1 if step.name == "act" else 0)
         step_allowed = (
             {n for n in step.tool_names if not (step.name == "act" and "_ff16_is_todo_tool" in globals() and _ff16_is_todo_tool(n))}
@@ -6805,21 +6846,43 @@ def install():
                   if tool_kind((tc.get("function") or {}).get("name")) in step.kinds]
             if ok and step.name == "act":
                 if not any(tool_kind((tc.get("function") or {}).get("name")) == "act" for tc in ok):
+                    saved_todo_calls = [
+                        tc for tc in ok
+                        if "_ff16_is_todo_tool" in globals()
+                        and _ff16_is_todo_tool((tc.get("function") or {}).get("name"))
+                    ]
+                    last = (text, None)
                     ok = []
                     nudge = (" You only called todowrite; you MUST emit an edit or write "
-                             f"tool_call ({', '.join(step_allowed or step.tool_names)}) "
+                             f"tool_call ({', '.join(sorted(step_allowed or step.tool_names))}) "
                              "to modify the target file in this step.")
                     continue
                 ok, problems = _gate_act_calls(ok, messages)
                 if problems:
                     log("[flow] edit gate: " + " | ".join(problems))
+                    last = (text, None)
                     if attempt < max_retries:
-                        nudge = (" Your edit was rejected before sending: "
-                                 + " | ".join(problems) + " Copy oldString "
-                                 "EXACTLY from the file you read, without "
-                                 "line-number prefixes.")
+                        if all("no-op edit" in p for p in problems):
+                            nudge = (" Your edit was rejected before sending: "
+                                     + " | ".join(problems)
+                                     + " Do NOT repeat the already-applied block; emit an "
+                                     "edit or write tool_call for the NEXT unimplemented "
+                                     "requirement in the plan now.")
+                        else:
+                            nudge = (" Your edit was rejected before sending: "
+                                     + " | ".join(problems) + " Copy oldString "
+                                     "EXACTLY from the file you read, without "
+                                     "line-number prefixes.")
                         continue
             if ok:
+                if saved_todo_calls and not any(
+                    "_ff16_is_todo_tool" in globals()
+                    and _ff16_is_todo_tool((tc.get("function") or {}).get("name"))
+                    for tc in ok
+                ):
+                    ok = saved_todo_calls + list(ok)
+                elif "_ff17_attach_todowrite" in globals():
+                    ok = _ff17_attach_todowrite(ctx, messages, tm, step, ok)
                 return "", ok
             bad = ", ".join((tc.get("function") or {}).get("name", "?")
                             for tc in (calls or [])) or "none"
@@ -14313,6 +14376,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         return path not in ("/", "/health")
 
     def do_OPTIONS(self):
+        path = self._route_path()
         if self._route_path() == "/v1/cookies":
             origin = self.headers.get("Origin", "")
             if not origin.startswith("chrome-extension://"):
@@ -16037,74 +16101,13 @@ def main():
 
 
 # ==== flowfix11:begin (401 cookie/auth fix; patch.py) ====
-_FF11_AUTH = {"ts": 0.0, "logged": False}
 _ff11_prev_status_error = _status_error
 _ff11_prev_classify5 = _ff5_classify
 _ff11_prev_classify10 = _ff10_classify
 
 
-def _ff11_cookie_map(cookie_str):
-    out = {}
-    for part in re.split(r";\s*", cookie_str or ""):
-        if "=" in part:
-            k, v = part.split("=", 1)
-            out[k.strip()] = v.strip()
-    return out
-
-
 def _ff11_auth_recent():
     return time.time() - _FF11_AUTH["ts"] < 60
-
-
-def _build_headers(ticket: str = None) -> dict:
-    """Same as before, but: Authorization (SAPISIDHASH) is opt-in.
-
-    The browser sends only cookies + the `at` token to StreamGenerate. A stale
-    `sapisid` from the cookie-file JSON produced a wrong hash -> HTTP 401 even
-    with valid cookies. Set CONFIG["send_sapisidhash"] = true to restore it
-    (the SAPISID is then taken from the cookie string itself).
-    """
-    account_prefix = _account_prefix()
-    headers = {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Origin": "https://gemini.google.com",
-        "Referer": f"https://gemini.google.com{account_prefix}/app",
-        "X-Same-Domain": "1",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    }
-    if account_prefix:
-        headers["X-Goog-AuthUser"] = str(CONFIG["auth_user"])
-    cookie_str, json_sapisid = load_cookie()
-    cookie_str = (cookie_str or "").replace("\r", "").replace("\n", "").strip()
-    cmap = _ff11_cookie_map(cookie_str)
-    if cookie_str:
-        headers["Cookie"] = cookie_str
-        if not _FF11_AUTH["logged"]:
-            _FF11_AUTH["logged"] = True
-            log("[fix11] cookie names sent: " + ", ".join(sorted(cmap)) if cmap
-                else "[fix11] cookie string has no name=value pairs")
-            if "__Secure-1PSID" not in cmap and "__Secure-3PSID" not in cmap \
-                    and "SID" not in cmap:
-                log("[fix11] WARNING: no __Secure-1PSID/SID cookie -- the session "
-                    "is not logged in, Google will answer 401/400")
-            if "__Secure-1PSIDTS" not in cmap:
-                log("[fix11] WARNING: no __Secure-1PSIDTS cookie (re-export cookies)")
-    else:
-        if not _FF11_AUTH["logged"]:
-            _FF11_AUTH["logged"] = True
-            log("[fix11] WARNING: no cookie loaded (cookie_file=%r exists=%s)" % (
-                CONFIG.get("cookie_file"),
-                bool(CONFIG.get("cookie_file")
-                     and os.path.exists(CONFIG["cookie_file"]))))
-    if CONFIG.get("send_sapisidhash", False):
-        sapisid = (cmap.get("SAPISID") or cmap.get("__Secure-3PAPISID")
-                   or json_sapisid)
-        if sapisid:
-            headers["Authorization"] = make_sapisidhash(sapisid)
-    if ticket:
-        from gemini_web2api.models import TICKET_HEADER
-        headers[TICKET_HEADER] = ticket
-    return headers
 
 
 def _status_error(status):
@@ -18366,16 +18369,21 @@ def _ff16_extract_todo_blocks(ctx, messages) -> list:
     for blob in blobs:
         lines = blob.splitlines()
         has_checkbox = any(_FF16_CHECKBOX_LINE_RE.match(ln) for ln in lines)
+        current_heading = ""
         i = 0
         while i < len(lines):
             ln = lines[i]
+            if ln.lstrip().startswith("#"):
+                current_heading = ln.strip()
+                i += 1
+                continue
             m = _FF16_CHECKBOX_LINE_RE.match(ln) if has_checkbox else _FF16_STEP_LINE_RE.match(ln)
             if not m:
                 i += 1
                 continue
             step_txt = " ".join(m.group(1).strip().split())[:140]
             base_indent = len(ln) - len(ln.lstrip())
-            sub_lines = [ln]
+            sub_lines = [current_heading, ln] if current_heading else [ln]
             j = i + 1
             while j < len(lines):
                 nxt_ln = lines[j]
@@ -20169,12 +20177,17 @@ _ff17_prev_base_gate = _base_gate_act_calls
 def _base_gate_act_calls(calls, messages):
     """Enhanced edit gate:
     1. Reject no-op edits (`oldString == newString`) immediately with guidance.
-    2. Repair `defuse_extension_words` substitutions and pure-anchor append/prepend edits.
-    3. When `oldString` does not match, include a verbatim multi-line snippet around the
-       closest matching line in `hay` so the model can copy `oldString` on the next attempt."""
+    2. Reject edits that introduce duplicate method definitions (`def <m>(self...)`)
+       when the method already exists in the class, showing the existing method lines.
+    3. Repair `defuse_extension_words` substitutions and pure-anchor append/prepend edits.
+    4. When `oldString` does not match, include a verbatim multi-line snippet around the
+       closest matching line in `hay` (or around the target section/anchor when `oldString`
+       invented a non-existent `def <fn>(`)."""
     texts = _ff9_read_texts(messages)
     repaired_calls = []
     noop_problems = []
+    dup_method_problems = []
+    nonexistent_fn_map = {}
     for tc in calls:
         fn = (tc or {}).get("function") or {}
         if tool_kind(fn.get("name")) != "act":
@@ -20198,6 +20211,40 @@ def _base_gate_act_calls(calls, messages):
             src_t = texts.get(tk) if tk else None
             if src_t is not None:
                 hay = src_t.replace("\r\n", "\n")
+                # Check for duplicate class method definitions (e.g. prepending a second
+                # `def do_GET(self):` or `def do_OPTIONS(self):` onto `GeminiHandler`)
+                if (path or "").lower().endswith(".py") and not re.search(r"(?m)^[ \t]*class\s+\w+", new_v):
+                    dup_found = False
+                    for m_meth in re.finditer(r"(?m)^([ \t]*)def\s+([A-Za-z_]\w*)\s*\(\s*self\b", new_v):
+                        m_name = m_meth.group(2)
+                        if m_name.startswith("__"):
+                            continue
+                        rx_m = re.compile(rf"(?m)^[ \t]*def\s+{re.escape(m_name)}\s*\(\s*self\b")
+                        c_old = len(rx_m.findall(old_v))
+                        c_new = len(rx_m.findall(new_v))
+                        c_hay = len(rx_m.findall(hay))
+                        if c_new > c_old and c_hay > c_old:
+                            hay_lines = hay.split("\n")
+                            hit_idx = next((i for i, hl in enumerate(hay_lines) if rx_m.match(hl)), None)
+                            snippet_msg = ""
+                            if hit_idx is not None:
+                                s_i = max(0, hit_idx - 2)
+                                e_i = min(len(hay_lines), hit_idx + 25)
+                                snippet = "\n".join(hay_lines[s_i:e_i])
+                                snippet_msg = (
+                                    f" Here are the exact verbatim lines {s_i + 1}-{e_i} of `def {m_name}` "
+                                    f"from {path} (copy oldString verbatim from this block):\n{snippet}"
+                                )
+                            dup_method_problems.append(
+                                f"{path}: newString defines a duplicate `def {m_name}(self...)`, "
+                                f"which already exists in {path}. Edit the existing `def {m_name}(self...)` "
+                                f"in place instead of adding a second definition.{snippet_msg}"
+                            )
+                            dup_found = True
+                            break
+                    if dup_found:
+                        continue
+
                 if old_v not in hay and old_v.strip("\n") not in hay:
                     actual_u, _nu = _ff14_find_unique(old_v, hay)
                     if actual_u is None:
@@ -20211,13 +20258,21 @@ def _base_gate_act_calls(calls, messages):
                                 args[okey], args[nkey] = anchor_fix
                                 log(f"[fix17] edit gate: anchored pure insertion in {path}")
                                 tc = {**tc, "function": {**fn, "arguments": json.dumps(args, ensure_ascii=False)}}
+                            else:
+                                first_old_ln = next((ln.strip() for ln in old_v.split("\n") if ln.strip()), "")
+                                m_new_fn = re.match(r"^(?:async\s+)?def\s+([A-Za-z_]\w*)\s*\(", first_old_ln)
+                                if m_new_fn:
+                                    fn_cand = m_new_fn.group(1)
+                                    if not re.search(rf"(?m)^[ \t]*(?:async\s+)?def\s+{re.escape(fn_cand)}\s*\(", hay):
+                                        nonexistent_fn_map[path] = fn_cand
         repaired_calls.append(tc)
 
-    if noop_problems and not repaired_calls:
-        return [], noop_problems
+    early_problems = noop_problems + dup_method_problems
+    if early_problems and not repaired_calls:
+        return [], early_problems
 
     out, problems = _ff17_prev_base_gate(repaired_calls, messages)
-    problems = noop_problems + list(problems)
+    problems = early_problems + list(problems)
     if not problems:
         return out, problems
 
@@ -20232,17 +20287,37 @@ def _base_gate_act_calls(calls, messages):
             bad_paths.add(p_err)
             near_ln = m_close.group(2)
             tk = _ff17_find_key(texts, p_err)
-            if near_ln and tk and texts.get(tk):
+            if tk and texts.get(tk):
                 hay_lines = texts[tk].replace("\r\n", "\n").split("\n")
-                hit_idx = next((i for i, hl in enumerate(hay_lines) if hl.strip() == near_ln.strip()), None)
-                if hit_idx is not None:
-                    s_i = max(0, hit_idx - 3)
-                    e_i = min(len(hay_lines), hit_idx + 8)
-                    snippet = "\n".join(hay_lines[s_i:e_i])
+                missing_fn = nonexistent_fn_map.get(p_err)
+                if missing_fn:
+                    lc_body = _ff17_extract_func_body("load_cookie", texts[tk])
+                    if lc_body:
+                        snippet = "\n".join(lc_body.split("\n")[:15])
+                        s_i, e_i = 0, len(snippet.split("\n"))
+                    else:
+                        anchor_idx = next(
+                            (i for i, hl in enumerate(hay_lines) if re.match(r"^#\s*Section:\s*gemini\.py", hl.strip(), re.I)), 0
+                        )
+                        s_i = max(0, anchor_idx)
+                        e_i = min(len(hay_lines), anchor_idx + 10)
+                        snippet = "\n".join(hay_lines[s_i:e_i])
                     pr = (
-                        f"{pr}. Here are the exact verbatim lines {s_i + 1}-{e_i} from {p_err} "
-                        f"(copy oldString verbatim from this block):\n{snippet}"
+                        f"{p_err}: `def {missing_fn}(...)` does not exist in {p_err} yet -- "
+                        f"do NOT invent `def {missing_fn}(): pass` as oldString. Copy an existing "
+                        f"block from {p_err} (such as lines {s_i + 1}-{e_i} below) as oldString and "
+                        f"include both that block and your new `def {missing_fn}(...)` in newString:\n{snippet}"
                     )
+                elif near_ln:
+                    hit_idx = next((i for i, hl in enumerate(hay_lines) if hl.strip() == near_ln.strip()), None)
+                    if hit_idx is not None:
+                        s_i = max(0, hit_idx - 3)
+                        e_i = min(len(hay_lines), hit_idx + 8)
+                        snippet = "\n".join(hay_lines[s_i:e_i])
+                        pr = (
+                            f"{pr}. Here are the exact verbatim lines {s_i + 1}-{e_i} from {p_err} "
+                            f"(copy oldString verbatim from this block):\n{snippet}"
+                        )
         enriched.append(pr)
     if bad_paths:
         out = [
@@ -20250,8 +20325,6 @@ def _base_gate_act_calls(calls, messages):
             if _call_path(T._tool_arguments_dict((tc or {}).get("function") or {})) not in bad_paths
         ]
     return out, enriched
-
-
 
 
 def _ff17_orig_read_corpus(ev) -> str:
@@ -20285,33 +20358,130 @@ def _ff17_added_act_corpus(ok_acts, include_tests=False) -> str:
     return "\n".join(parts)
 
 
+def _ff17_token_defined_in_corpus(token: str, kind: str, corpus: str) -> bool:
+    """Check whether `token` is actually defined as a function, variable, config key,
+    or route in `corpus` (ignoring mere substring mentions inside comments or string literals)."""
+    if not token or not corpus:
+        return False
+    if kind == "fn":
+        return bool(re.search(rf"(?m)^[ \t]*(?:async\s+)?def\s+{re.escape(token)}\s*\(", corpus))
+    if kind == "var":
+        return bool(re.search(rf"(?m)^[ \t]*{re.escape(token)}\s*(?::[^=\n]+)?=", corpus))
+    if kind == "cfg":
+        return bool(re.search(r"[\x22\x27]" + re.escape(token) + r"[\x22\x27]\s*:", corpus))
+    if kind == "route":
+        return token in corpus
+    return token in corpus
+
+
 def _ff17_extract_req_tokens(text: str, orig_corpus: str) -> list:
     """Extract backticked function names, config keys, variables, and API routes from `text`
-    that do NOT already exist in `orig_corpus` (i.e. new symbols to implement)."""
+    that are NOT already defined in `orig_corpus` (i.e. new symbols to implement)."""
     if not text:
         return []
     out = []
     for sp in re.findall(r"`([^`\n]+)`", text):
         sp_s = sp.strip()
-        token = None
-        m_fn = re.match(r"^(?:def\s+)?([A-Za-z_]\w{3,})\s*\(", sp_s)
+        token, tkind = None, None
+        m_fn = re.match(r"^(?:def\s+)?([A-Za-z_]\w{2,})\s*\(", sp_s)
         m_route = re.search(r"(/v\d+(?:beta)?/[A-Za-z0-9_/-]+)", sp_s)
-        m_cfg = re.match(r"^[\"']([A-Za-z_]\w{3,})[\"']\s*:", sp_s)
-        m_var = re.match(r"^(_[A-Za-z_]\w{3,})(?:\s*=.*)?$", sp_s)
+        m_cfg = re.match(r"^[\"']([A-Za-z_]\w{2,})[\"']\s*:", sp_s)
+        m_var = re.match(r"^(_[A-Za-z_]\w{2,})(?:\s*=.*)?$", sp_s)
         if m_fn:
-            token = m_fn.group(1)
+            token, tkind = m_fn.group(1), "fn"
         elif m_route:
-            token = m_route.group(1)
+            token, tkind = m_route.group(1), "route"
         elif m_cfg:
-            token = m_cfg.group(1)
+            token, tkind = m_cfg.group(1), "cfg"
         elif m_var:
-            token = m_var.group(1)
+            token, tkind = m_var.group(1), "var"
         if (token and token not in _FF17_STOP_IDENTS
                 and not token.startswith("test_")
-                and token not in (orig_corpus or "")
+                and not _ff17_token_defined_in_corpus(token, tkind, orig_corpus or "")
                 and token not in out):
             out.append(token)
     return out
+
+
+def _ff17_extract_existing_fn_targets(text: str, orig_corpus: str) -> list:
+    """Extract backticked function/method names (`foo(...)`) from `text` that DO already
+    exist as `def foo(` in `orig_corpus` (representing existing functions to update)."""
+    if not text or not orig_corpus:
+        return []
+    out = []
+    for sp in re.findall(r"`([^`\n]+)`", text):
+        sp_s = sp.strip()
+        m_fn = re.match(r"^(?:def\s+)?([A-Za-z_]\w{2,})\s*\(", sp_s)
+        if m_fn:
+            fn_name = m_fn.group(1)
+            if (fn_name not in _FF17_STOP_IDENTS
+                    and not fn_name.startswith("test_")
+                    and _ff17_token_defined_in_corpus(fn_name, "fn", orig_corpus)
+                    and fn_name not in out):
+                out.append(fn_name)
+    return out
+
+
+def _ff17_extract_func_body(fn_name: str, src_text: str) -> str:
+    """Extract the lines of `def <fn_name>(...):` from `src_text`."""
+    if not fn_name or not src_text:
+        return ""
+    lines = src_text.replace("\r\n", "\n").split("\n")
+    rx = re.compile(rf"^([ \t]*)(?:async\s+)?def\s+{re.escape(fn_name)}\s*\(")
+    for idx, ln in enumerate(lines):
+        m = rx.match(ln)
+        if not m:
+            continue
+        base_ind = len(m.group(1))
+        end_idx = len(lines)
+        for k in range(idx + 1, min(len(lines), idx + 260)):
+            s_ln = lines[k]
+            if not s_ln.strip() or s_ln.lstrip().startswith("#"):
+                continue
+            cur_ind = len(s_ln) - len(s_ln.lstrip())
+            if cur_ind <= base_ind and re.match(r"^(?:def |async def |class |@[A-Za-z_]|[A-Za-z_]\w*\s*=|if\s+__name__)", s_ln.lstrip()):
+                end_idx = k
+                break
+        return "\n".join(lines[idx:end_idx]).strip()
+    return ""
+
+
+def _ff17_was_func_modified(fn_name: str, orig_corpus: str, tracked_src: str, ok_acts: list) -> bool:
+    """Return True if the existing function `fn_name` in `orig_corpus` was modified in `tracked_src`
+    or by any non-test edit in `ok_acts`."""
+    orig_body = _ff17_extract_func_body(fn_name, orig_corpus)
+    cur_body = _ff17_extract_func_body(fn_name, tracked_src)
+    if orig_body and cur_body and orig_body != cur_body:
+        return True
+    rx_def = re.compile(rf"(?m)^[ \t]*(?:async\s+)?def\s+{re.escape(fn_name)}\s*\(")
+    for e in ok_acts or []:
+        args_a = e.get("args") or {}
+        p = _call_path(args_a) or ""
+        if p and _is_test_path(p):
+            continue
+        old_s = ""
+        new_s = ""
+        for ok_k in _OLD_KEYS:
+            if isinstance(args_a.get(ok_k), str) and args_a[ok_k]:
+                old_s = _strip_linenos(args_a[ok_k].replace("\r\n", "\n"))
+                break
+        for nk_k in _NEW_KEYS:
+            if isinstance(args_a.get(nk_k), str):
+                new_s = _strip_linenos(args_a[nk_k].replace("\r\n", "\n"))
+                break
+        if not old_s or old_s.strip() == new_s.strip():
+            continue
+        if rx_def.search(new_s):
+            old_fn = _ff17_extract_func_body(fn_name, old_s)
+            new_fn = _ff17_extract_func_body(fn_name, new_s)
+            if new_fn and new_fn != old_fn:
+                return True
+        if orig_body:
+            for oln in old_s.split("\n"):
+                s_oln = oln.strip()
+                if len(s_oln) >= 12 and not s_oln.startswith(("def ", "async def ", "#")) and s_oln in orig_body:
+                    return True
+    return False
 
 
 def _ff17_is_pure_test_todo(content: str, edited_paths: list) -> bool:
@@ -20332,10 +20502,100 @@ def _ff17_is_pure_test_todo(content: str, edited_paths: list) -> bool:
     return True
 
 
+def _ff17_evaluate_plan_steps(ctx, ev, messages, pending_calls=None, step_name=None) -> list:
+    """Evaluate all checklist steps from `_ff16_extract_todo_blocks(ctx, messages)` against
+    the current conversation evidence (plus optional `pending_calls` about to be returned).
+    Returns a list of step dicts with `index`, `title`, `full`, `done`, `is_test_run`,
+    `is_test_step`, `missing_tokens`, `unmodified_fns`, and `uncreated_files`."""
+    if ctx is None:
+        return []
+    step_blocks = _ff16_extract_todo_blocks(ctx, messages or [])
+    if not step_blocks:
+        return []
+    ev_list = list(ev or [])
+    if pending_calls:
+        for tc in pending_calls:
+            fn = (tc or {}).get("function") or {}
+            name = fn.get("name") or ""
+            if tool_kind(name) == "act":
+                ev_list.append({
+                    "kind": "act",
+                    "name": name,
+                    "args": T._tool_arguments_dict(fn),
+                    "result": "Edit applied successfully.",
+                })
+    ok_acts = [e for e in ev_list if e.get("kind") == "act" and _act_ok(e)]
+    edited_files = sorted({_call_path(e.get("args") or {}) for e in ok_acts if _call_path(e.get("args") or {})})
+    orig_corpus = _ff17_orig_read_corpus(ev_list)
+    src_added_corpus = _ff17_added_act_corpus(ok_acts, include_tests=False)
+    all_added_corpus = _ff17_added_act_corpus(ok_acts, include_tests=True)
+
+    tracked_map = _ff9_read_texts(ev_list)
+    tracked_src = "\n".join(
+        txt for p, txt in tracked_map.items()
+        if txt and not _ff16_is_plan_doc(p) and not _is_doc(p) and not _is_test_path(p)
+    )
+    tested = (
+        True if step_name == "tests"
+        else (_tests_ran_after_act(ev_list) if edited_files else bool(_test_runs(ev_list)))
+    )
+
+    out = []
+    for idx, (st_title, st_full) in enumerate(step_blocks[:12], 1):
+        body_without_heading = "\n".join(
+            ln for ln in st_full.splitlines() if not ln.lstrip().startswith("#")
+        )
+        st_reqs = _ff17_extract_req_tokens(body_without_heading, orig_corpus)
+        st_existing_fns = _ff17_extract_existing_fn_targets(st_title, orig_corpus)
+        st_files = [
+            f for f in T._files_in(T._strip_fences(body_without_heading))
+            if f.lower() not in T._NON_FILE_NAMES and not _ff16_is_plan_doc(f) and not _is_doc(f)
+            and f.lower().endswith(_SRC_EXT)
+        ]
+        is_test_step = any(_is_test_path(sf) for sf in st_files)
+        is_pure_test = (not is_test_step and not st_reqs and not st_existing_fns
+                        and (_ff17_is_pure_test_todo(st_title, edited_files)
+                             or bool(re.search(r"\b(?:test|unittest|pytest|verify|kiem\s+tra|nghiem\s+thu)\b", st_title, re.I))))
+        target_corpus = all_added_corpus if is_test_step else src_added_corpus
+        missing_reqs = [r for r in st_reqs if r not in target_corpus]
+        unmodified_fns = (
+            [] if is_test_step else [
+                fn for fn in st_existing_fns
+                if not _ff17_was_func_modified(fn, orig_corpus, tracked_src, ok_acts)
+            ]
+        )
+        uncreated_st_files = [
+            sf for sf in st_files
+            if not any(_ff12_same_file(sf, ef) for ef in edited_files)
+        ]
+        if is_test_step:
+            done = len(uncreated_st_files) == 0 and len(missing_reqs) == 0
+        elif st_reqs or st_existing_fns:
+            done = len(missing_reqs) == 0 and len(unmodified_fns) == 0
+        elif st_files:
+            done = len(uncreated_st_files) == 0
+        elif is_pure_test:
+            done = bool(tested)
+        else:
+            done = False
+        out.append({
+            "index": idx,
+            "title": st_title,
+            "full": st_full,
+            "done": done,
+            "is_test_run": is_pure_test,
+            "is_test_step": is_test_step,
+            "missing_tokens": missing_reqs,
+            "unmodified_fns": unmodified_fns,
+            "uncreated_files": uncreated_st_files,
+        })
+    return out
+
+
 def _ff17_remaining_plan_or_todo_work(ctx, ev, messages) -> dict:
     """Inspect active `todowrite` state, read plan documents, and user prompt to
     determine if `step 3/5 act` still has unfinished implementation items, symbols,
-    or test files to create before transitioning to `step 4/5 tests`."""
+    existing functions to update, or test files to create before transitioning to `step 4/5 tests`."""
     ok_acts = [e for e in (ev or []) if e.get("kind") == "act" and _act_ok(e)]
     edited_paths = [_call_path(e.get("args") or {}) for e in ok_acts if _call_path(e.get("args") or {})]
     src_edited_paths = [p for p in edited_paths if not _is_test_path(p)]
@@ -20344,19 +20604,29 @@ def _ff17_remaining_plan_or_todo_work(ctx, ev, messages) -> dict:
     all_added_corpus = _ff17_added_act_corpus(ok_acts, include_tests=True)
     listing = _listing_files(ev or [])
 
-    # 1. Check required symbols/routes/config keys from read plan documents against NON-TEST edits
+    # 1. Check required symbols/routes/config keys and existing function updates from read plan documents
     plan_bodies = "\n".join(b for _p, b in _ff16_read_plan_bodies(messages or []))
     plan_req_tokens = _ff17_extract_req_tokens(plan_bodies, orig_corpus) if plan_bodies else []
     missing_plan_tokens = [tok for tok in plan_req_tokens if tok not in src_added_corpus]
 
-    # 2. Check active todowrite items
     remaining_todos = []
+    eval_steps = _ff17_evaluate_plan_steps(ctx, ev, messages) if plan_bodies else []
+    for st_info in eval_steps:
+        if st_info["is_test_run"] or st_info["done"]:
+            continue
+        for tok in st_info["missing_tokens"] + st_info["unmodified_fns"]:
+            if not st_info["is_test_step"] and tok not in missing_plan_tokens:
+                missing_plan_tokens.append(tok)
+        if st_info["title"] not in remaining_todos:
+            remaining_todos.append(st_info["title"])
+
+    # 2. Check active todowrite items
     todo_calls = [
         e for e in (ev or [])
         if _ff16_is_todo_tool(e.get("name", ""))
         and isinstance((e.get("args") or {}).get("todos"), list)
     ]
-    if todo_calls:
+    if todo_calls and not eval_steps:
         latest_todos = todo_calls[-1]["args"]["todos"]
         done_count = 0
         open_items = []
@@ -20373,7 +20643,6 @@ def _ff17_remaining_plan_or_todo_work(ctx, ev, messages) -> dict:
                 done_count += 1
             else:
                 open_items.append((content, status))
-        # Only count non-test acts against non-test open todos when no plan tokens are missing
         src_ok_acts = [e for e in ok_acts if not _is_test_path(_call_path(e.get("args") or {}) or "")]
         consumed_open = max(0, len(src_ok_acts) - done_count) if not missing_plan_tokens else 0
         for idx, (item_txt, item_status) in enumerate(open_items):
@@ -20462,9 +20731,9 @@ def _change_tail(pat, ctx, ev, tm, names_all, total, extra=""):
                         )
                     if rem["missing_plan_tokens"]:
                         parts.append(
-                            "Still missing required symbols/keys/routes in the source file from the plan: "
+                            "Still missing required symbols/functions/routes in the source file from the plan: "
                             + ", ".join(f"`{t}`" for t in rem["missing_plan_tokens"][:8])
-                            + ". Implement them in the source file now (you may combine related additions in ONE edit call)."
+                            + ". Implement or update them in the source file now (you may combine related additions in ONE edit call)."
                         )
                         if rem["uncreated_files"]:
                             parts.append(
@@ -20502,14 +20771,11 @@ def _ff16_todo_ledger(ctx, messages) -> str:
     try:
         ev = _answered_calls(messages or [])
         ok_acts = [e for e in ev if e.get("kind") == "act" and _act_ok(e)]
-        orig_corpus = _ff17_orig_read_corpus(ev)
-        src_added_corpus = _ff17_added_act_corpus(ok_acts, include_tests=False)
-        all_added_corpus = _ff17_added_act_corpus(ok_acts, include_tests=True)
         edited_files = sorted({_call_path(e["args"]) for e in ok_acts if _call_path(e.get("args") or {})})
         tested = _tests_ran_after_act(ev) if edited_files else bool(_test_runs(ev))
 
         has_plan_doc = bool(_ff16_read_plan_bodies(messages or []))
-        step_blocks = _ff16_extract_todo_blocks(ctx, messages or [])
+        eval_steps = _ff17_evaluate_plan_steps(ctx, ev, messages)
         todo_calls = [
             e for e in ev
             if _ff16_is_todo_tool(e.get("name", ""))
@@ -20517,38 +20783,11 @@ def _ff16_todo_ledger(ctx, messages) -> str:
         ]
 
         # Prefer the plan document's concrete checklist steps when a plan doc was read
-        if base_ledger and step_blocks and (has_plan_doc or not todo_calls):
-            s_parts = []
-            for idx, (st_title, st_full) in enumerate(step_blocks[:10], 1):
-                st_reqs = _ff17_extract_req_tokens(st_full, orig_corpus)
-                st_files = [
-                    f for f in T._files_in(T._strip_fences(st_full))
-                    if f.lower() not in T._NON_FILE_NAMES and not _ff16_is_plan_doc(f) and not _is_doc(f)
-                    and f.lower().endswith(_SRC_EXT)
-                ]
-                is_test_step = any(_is_test_path(sf) for sf in st_files)
-                target_corpus = all_added_corpus if is_test_step else src_added_corpus
-                if st_reqs:
-                    done = all(r in target_corpus for r in st_reqs)
-                elif is_test_step:
-                    done = all(any(_ff12_same_file(sf, ef) for ef in edited_files) for sf in st_files)
-                elif re.search(r"\b_build_headers\b", st_full):
-                    done = (
-                        "get_active_cookie_credentials" in src_added_corpus
-                        or "_pool_accounts" in src_added_corpus
-                    )
-                elif re.search(r"\bgenerate_stream\b", st_full):
-                    done = (
-                        "mark_cookie_cooldown" in src_added_corpus
-                        and ("429" in src_added_corpus or "1037" in src_added_corpus)
-                    )
-                elif st_files:
-                    done = all(any(_ff12_same_file(sf, ef) for ef in edited_files) for sf in st_files)
-                elif re.search(r"\b(?:test|unittest|pytest|verify|kiem\s+tra|nghiem\s+thu)\b", st_title, re.I):
-                    done = tested
-                else:
-                    done = False
-                s_parts.append(f"{idx}. {'[x]' if done else '[ ]'} {st_title}")
+        if base_ledger and eval_steps and (has_plan_doc or not todo_calls):
+            s_parts = [
+                f"{s['index']}. {'[x]' if s['done'] else '[ ]'} {s['title']}"
+                for s in eval_steps[:12]
+            ]
             prefix_lines = [ln for ln in base_ledger.splitlines() if not ln.startswith("Steps: ")]
             prefix_lines.append("Steps: " + " | ".join(s_parts))
             return "\n".join(prefix_lines)
@@ -20562,7 +20801,7 @@ def _ff16_todo_ledger(ctx, messages) -> str:
                 s_parts = []
                 rem_info = _ff17_remaining_plan_or_todo_work(ctx, ev, messages)
                 rem_set = {x.lower() for x in rem_info["remaining_todos"]}
-                for idx, td in enumerate(raw_todos[:10], 1):
+                for idx, td in enumerate(raw_todos[:12], 1):
                     txt = str(td.get("content") or td.get("title") or "").strip()
                     st_raw = str(td.get("status") or "").strip().lower()
                     if _ff17_is_pure_test_todo(txt, edited_files):
@@ -20583,15 +20822,122 @@ def _ff16_todo_ledger(ctx, messages) -> str:
     return base_ledger
 
 
+_FF17_TODOWRITE_NAME_RE = re.compile(r"(?i)^(?:todo_?write|write_?todos?)$")
+
+
+def _ff17_attach_todowrite(ctx, messages, tm, step, calls) -> list:
+    """When `flow16_plan_todo` is enabled and the client provides `todowrite`,
+    automatically synthesize and prepend a `todowrite` tool_call whenever a plan
+    document's step statuses change so client UIs (like OpenCode) render live TODOs."""
+    out_calls = list(calls or [])
+    if not out_calls or not _ff16_c("flow16_plan_todo") or tm is None or ctx is None:
+        return out_calls
+    try:
+        if any(_ff16_is_todo_tool((tc.get("function") or {}).get("name")) for tc in out_calls):
+            return out_calls
+        todo_tool_name = next(
+            (n for n in tm.by_kind.get("other", []) if _FF17_TODOWRITE_NAME_RE.match(str(n or "").strip())),
+            None,
+        )
+        if not todo_tool_name:
+            return out_calls
+        ev = _answered_calls(messages or [])
+        has_plan_doc = bool(_ff16_read_plan_bodies(messages or []))
+        has_prior_todo = any(_ff16_is_todo_tool(e.get("name", "")) for e in ev)
+        if not (has_plan_doc or has_prior_todo):
+            return out_calls
+        step_name = getattr(step, "name", None)
+        eval_steps = _ff17_evaluate_plan_steps(
+            ctx, ev, messages, pending_calls=out_calls, step_name=step_name
+        )
+        if not eval_steps:
+            return out_calls
+
+        todos_payload = []
+        in_prog_assigned = False
+        for s in eval_steps[:12]:
+            if s["done"]:
+                st_str = "completed"
+            elif not in_prog_assigned:
+                st_str = "in_progress"
+                in_prog_assigned = True
+            else:
+                st_str = "pending"
+            todos_payload.append({
+                "id": str(s["index"]),
+                "content": s["title"],
+                "status": st_str,
+                "priority": "high" if s["index"] <= 3 else "medium",
+            })
+
+        # Deduplicate against the most recent todowrite call in `ev`
+        todo_calls = [
+            e for e in ev
+            if _ff16_is_todo_tool(e.get("name", ""))
+            and isinstance((e.get("args") or {}).get("todos"), list)
+        ]
+        if todo_calls:
+            prev_todos = todo_calls[-1]["args"]["todos"]
+            prev_sig = [
+                (str(t.get("content") or "").strip(), str(t.get("status") or "").strip().lower())
+                for t in prev_todos if isinstance(t, dict)
+            ]
+            new_sig = [(t["content"], t["status"]) for t in todos_payload]
+            if prev_sig == new_sig:
+                return out_calls
+
+        tc_todo = {
+            "id": "call_" + uuid.uuid4().hex[:8],
+            "type": "function",
+            "function": {
+                "name": todo_tool_name,
+                "arguments": json.dumps({"todos": todos_payload}, ensure_ascii=False),
+            },
+        }
+        return [tc_todo] + out_calls
+    except Exception as ex:
+        log("[fix17] attach todowrite error: %s" % ex)
+        return out_calls
+
+
+def _ff17_extract_code_targets_from_text(text: str):
+    """Extract candidate function/class/global names, routes, and `# Section:` names
+    from `text` without polluting `cand_idents` with JSON field names or prose words."""
+    idents, routes, sections = set(), set(), set()
+    if not text:
+        return idents, routes, sections
+    for m_sec in re.finditer(r"#\s*Section:\s*([A-Za-z0-9_.-]+)", text, re.I):
+        sections.add(m_sec.group(1).lower())
+    for sp in re.findall(r"`([^`\n]+)`", text):
+        sp_s = sp.strip()
+        for m_rt in re.finditer(r"(/v\d+(?:beta)?/[A-Za-z0-9_/-]+)", sp_s):
+            routes.add(m_rt.group(1))
+        m_fn = re.match(r"^(?:def\s+|class\s+)?([A-Za-z_]\w{2,})\s*(?:\(|$)", sp_s)
+        m_var = re.match(r"^([A-Za-z_]\w{2,})\s*=", sp_s)
+        if m_fn:
+            tok = m_fn.group(1)
+            if tok not in _FF17_STOP_IDENTS:
+                idents.add(tok)
+        elif m_var:
+            tok = m_var.group(1)
+            if tok not in _FF17_STOP_IDENTS:
+                idents.add(tok)
+        else:
+            for m_call in re.finditer(r"\b([A-Za-z_]\w{2,})\s*\(", sp_s):
+                tok = m_call.group(1)
+                if tok not in _FF17_STOP_IDENTS:
+                    idents.add(tok)
+    return idents, routes, sections
+
+
 def _ff17_act_context_pack(ctx, messages) -> str:
     """When read tool results exceed 80 KB (so `_join_prompt_parts` truncates the
     earlier chunks of a large file and/or the plan document), build a compact
     verbatim context pack containing:
       1. Any read plan document (`feature_implementation_plan.md`)
       2. Unnumbered verbatim code windows from the current post-edit file text
-         (`_ff9_read_texts(messages)`) around every `# Section:` header, function,
-         class, referenced module-level global variable, config dict, and route
-         referenced by the plan or user request (with regex fallback if AST fails).
+         (`_ff9_read_texts(messages)`), prioritizing windows for PENDING (`[ ]`)
+         plan steps so completed steps do not crowd out later targets like `do_GET`.
     """
     ev = _answered_calls(messages or [])
     total_read_chars = sum(
@@ -20612,21 +20958,28 @@ def _ff17_act_context_pack(ctx, messages) -> str:
 
     plan_text = "\n".join(b for _p, b in plan_bodies)
     req_text = (getattr(ctx, "request", "") or getattr(ctx, "last", "") or "") + "\n" + plan_text
-    cand_idents = set()
-    cand_routes = set()
-    cand_sections = set()
-    for m_sec in re.finditer(r"#\s*Section:\s*([A-Za-z0-9_.-]+)", req_text, re.I):
-        cand_sections.add(m_sec.group(1).lower())
-    for sp in re.findall(r"`([^`\n]+)`", req_text):
-        for m_rt in re.finditer(r"(/v\d+(?:beta)?/[A-Za-z0-9_/-]+)", sp):
-            cand_routes.add(m_rt.group(1))
-        for m_id in re.finditer(r"\b([A-Za-z_]\w{2,})\b", sp):
-            tok = m_id.group(1)
-            if tok not in _FF17_STOP_IDENTS:
-                cand_idents.add(tok)
-    for kw in _keywords(getattr(ctx, "request", "") or ""):
-        if len(kw) >= 4 and kw not in _FF17_STOP_IDENTS:
-            cand_idents.add(kw)
+
+    eval_steps = _ff17_evaluate_plan_steps(ctx, ev, messages) if plan_bodies else []
+    pending_src_steps = [
+        s for s in eval_steps
+        if not s["done"] and not s["is_test_run"] and not s["is_test_step"]
+    ]
+    if pending_src_steps:
+        pending_text = "\n".join(s["full"] for s in pending_src_steps)
+        cand_idents, cand_routes, cand_sections = _ff17_extract_code_targets_from_text(pending_text)
+        # Only include `# Section: <name>` 60-line top headers when a pending step
+        # needs to add new module-level symbols/functions (`missing_tokens` not starting with `/v`)
+        needs_new_defs = any(
+            any(not tok.startswith("/v") for tok in s["missing_tokens"])
+            for s in pending_src_steps
+        )
+        if not needs_new_defs and cand_idents:
+            cand_sections = set()
+    else:
+        cand_idents, cand_routes, cand_sections = _ff17_extract_code_targets_from_text(req_text)
+        for kw in _keywords(getattr(ctx, "request", "") or ""):
+            if len(kw) >= 4 and kw not in _FF17_STOP_IDENTS:
+                cand_idents.add(kw)
 
     tracked_texts = _ff9_read_texts(messages or [])
     if not tracked_texts:
@@ -20635,7 +20988,7 @@ def _ff17_act_context_pack(ctx, messages) -> str:
             if clean_s:
                 tracked_texts[v.get("path") or ""] = clean_s
 
-    budget_remaining = 36000
+    budget_remaining = 48000
     for fpath, full_src in tracked_texts.items():
         if not full_src or len(full_src) < 60000 or _ff16_is_plan_doc(fpath) or _is_doc(fpath):
             continue
@@ -20643,7 +20996,7 @@ def _ff17_act_context_pack(ctx, messages) -> str:
         src_lines = clean_src.splitlines()
         windows = []
 
-        # 1. Include `# Section: <name>` headers referenced by the plan (+ 60 lines of module globals)
+        # 1. Include `# Section: <name>` headers referenced by active steps (+ 60 lines of module globals)
         if cand_sections:
             for idx_ln, ln_str in enumerate(src_lines, 1):
                 m_sh = re.match(r"^#\s*Section:\s*([A-Za-z0-9_.-]+)", ln_str.strip(), re.I)
@@ -20661,7 +21014,7 @@ def _ff17_act_context_pack(ctx, messages) -> str:
             def _collect_ast_windows(stmts):
                 for node in stmts:
                     if isinstance(node, (_ff5_ast.FunctionDef, _ff5_ast.AsyncFunctionDef)):
-                        if node.name in cand_idents or any(len(c) >= 5 and c.lower() == node.name.lower() for c in cand_idents):
+                        if node.name in cand_idents:
                             s_ln = max(1, node.lineno - 3)
                             e_ln = min(len(src_lines), getattr(node, "end_lineno", node.lineno) + 3)
                             windows.append((s_ln, e_ln, node.name))
@@ -20689,7 +21042,7 @@ def _ff17_act_context_pack(ctx, messages) -> str:
                 for node in tree.body:
                     if isinstance(node, _ff5_ast.Assign):
                         for t in node.targets:
-                            if isinstance(t, _ff5_ast.Name) and t.id in referenced_globals:
+                            if isinstance(t, _ff5_ast.Name) and t.id in referenced_globals and not t.id.startswith("_ff"):
                                 s_ln = max(1, node.lineno - 3)
                                 e_ln = min(len(src_lines), getattr(node, "end_lineno", node.lineno) + 3)
                                 windows.append((s_ln, e_ln, t.id))

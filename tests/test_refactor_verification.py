@@ -756,3 +756,287 @@ class TestReportedInvestigationAndReviewFixes(unittest.TestCase):
         ]
         rep = M._repeatable_calls(msgs_with_todo)
         self.assertIn(("read", M._canonical_args({"filePath": "feature_implementation_plan.md"})), rep)
+    def test_opencode_todowrite_auto_emitted_and_deduplicated_across_steps(self):
+        """When flow16_plan_todo is enabled and `todowrite` is declared by the client (e.g. OpenCode),
+        `_ff17_attach_todowrite` automatically prepends a `todowrite` tool_call when plan step statuses
+        change, deduplicates unchanged turns, and respects `CONFIG["flow16_plan_todo"] = False`."""
+        self.assertIs(M.DEFAULT_CONFIG.get("flow16_plan_todo"), True)
+        self.assertIs(M.DEFAULT_CONFIG.get("flow17_plan_todo_act"), True)
+        plan_md = (
+            "### Bước 1: Mở rộng Cấu hình (`# Section: config.py`)\n"
+            "- [ ] Thêm các tùy chọn cấu hình mới vào `DEFAULT_CONFIG`:\n"
+            "  - `\"cookie_pool\": []`\n"
+            "### Bước 2: Quản lý Trạng thái (`# Section: gemini.py`)\n"
+            "- [ ] Viết hàm `init_cookie_pool() -> None`:\n"
+            "### Bước 3: Kiểm thử\n"
+            "- [ ] Chạy `python -m unittest discover -s tests -v` để nghiệm thu.\n"
+        )
+        msgs = [
+            {"role": "user", "content": "Hãy đọc file feature_implementation_plan.md và implement."},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c_plan", "type": "function", "function": {"name": "read", "arguments": json.dumps({"filePath": "feature_implementation_plan.md"})}},
+            ]},
+            {"role": "tool", "tool_call_id": "c_plan", "name": "read", "content": plan_md},
+        ]
+        tm = M.ToolMap(
+            {"glob", "read", "edit", "write", "bash", "todowrite", "todoread"},
+            {
+                "glob": {"pattern"},
+                "read": {"filePath", "offset", "limit"},
+                "edit": {"filePath", "oldString", "newString"},
+                "write": {"filePath", "content"},
+                "bash": {"command"},
+                "todowrite": {"todos"},
+                "todoread": set(),
+            },
+            {},
+        )
+        ctx = M._analyze(msgs)
+        read_call = {"id": "c_r1", "type": "function", "function": {"name": "read", "arguments": json.dumps({"filePath": "gemini_web2api.py"})}}
+        step_read = M.Step("CHANGE", "read", 2, 5, {"read"}, "Read target", [read_call], True, ["read"])
+
+        # 1. When flow16_plan_todo is False, no todowrite is attached and ledger is empty
+        orig_flag = M.CONFIG.get("flow16_plan_todo", True)
+        try:
+            M.CONFIG["flow16_plan_todo"] = False
+            self.assertEqual([read_call], M._ff17_attach_todowrite(ctx, msgs, tm, step_read, [read_call]))
+            self.assertEqual("", M._ff16_todo_ledger(ctx, msgs))
+        finally:
+            M.CONFIG["flow16_plan_todo"] = orig_flag
+
+        # 2. When flow16_plan_todo is True, todowrite is prepended with step 1 in_progress, 2..3 pending
+        attached = M._ff17_attach_todowrite(ctx, msgs, tm, step_read, [read_call])
+        self.assertEqual(2, len(attached))
+        self.assertEqual("todowrite", attached[0]["function"]["name"])
+        todos_1 = json.loads(attached[0]["function"]["arguments"])["todos"]
+        self.assertEqual(["in_progress", "pending", "pending"], [t["status"] for t in todos_1])
+
+        # 3. Record that todowrite + read in conversation history; next read chunk with unchanged statuses must NOT re-emit todowrite
+        msgs.extend([
+            {"role": "assistant", "content": "", "tool_calls": attached},
+            {"role": "tool", "tool_call_id": attached[0]["id"], "name": "todowrite", "content": "ok"},
+            {"role": "tool", "tool_call_id": "c_r1", "name": "read", "content": 'DEFAULT_CONFIG = {"port": 8081}\ndef load_cookie():\n    pass\n'},
+        ])
+        ctx = M._analyze(msgs)
+        read_call_2 = {"id": "c_r2", "type": "function", "function": {"name": "read", "arguments": json.dumps({"filePath": "gemini_web2api.py", "offset": 401, "limit": 400})}}
+        self.assertEqual([read_call_2], M._ff17_attach_todowrite(ctx, msgs, tm, step_read, [read_call_2]))
+
+        # 4. When an edit completes Step 1, _ff17_attach_todowrite emits updated todowrite (Step 1 completed, Step 2 in_progress)
+        edit_step1 = {"id": "c_e1", "type": "function", "function": {
+            "name": "edit",
+            "arguments": json.dumps({
+                "filePath": "gemini_web2api.py",
+                "oldString": 'DEFAULT_CONFIG = {"port": 8081}',
+                "newString": 'DEFAULT_CONFIG = {"port": 8081, "cookie_pool": []}',
+            }),
+        }}
+        step_act = M.Step("CHANGE", "act", 3, 5, {"act"}, "Act", None, False, ["edit", "write"])
+        attached_act = M._ff17_attach_todowrite(ctx, msgs, tm, step_act, [edit_step1])
+        self.assertEqual(2, len(attached_act))
+        todos_2 = json.loads(attached_act[0]["function"]["arguments"])["todos"]
+        self.assertEqual(["completed", "in_progress", "pending"], [t["status"] for t in todos_2])
+
+    def test_phase3_existing_functions_and_token_definitions_not_skipped_by_substring(self):
+        """Regression for conversation.txt Turns 8-12:
+        1. `_ff17_extract_req_tokens` checks actual definitions (`def fn(`, `_var =`, `"key":`) in `orig_corpus`
+           rather than naive substring membership.
+        2. Phase 3 steps updating existing functions (`_build_headers`, `generate`, `generate_stream`)
+           stay pending (`done=False`) until those functions' bodies are actually modified."""
+        plan_md = (
+            "### Bước 2: Quản lý Trạng thái (`# Section: gemini.py`)\n"
+            "- [ ] Khởi tạo cấu trúc dữ liệu trạng thái:\n"
+            "  - `_pool_accounts = []`\n"
+            "- [ ] Viết hàm `get_active_cookie_credentials() -> tuple`:\n"
+            "- [ ] Viết hàm `mark_cookie_cooldown(path: str, reason: str = \"\") -> None`:\n"
+            "### Bước 3: Tích hợp vào Luồng Request (`# Section: gemini.py`)\n"
+            "- [ ] Cập nhật hàm `_build_headers(ticket: str = None)`:\n"
+            "  - Lấy credentials từ `get_active_cookie_credentials()`.\n"
+            "- [ ] Cập nhật logic retry trong `generate()` và `generate_stream()`:\n"
+            "  - Khi gặp lỗi 429 hoặc 1037, gọi `mark_cookie_cooldown(active_path)`.\n"
+        )
+        # Simulate reading a file that mentions "get_active_cookie_credentials" inside a string literal
+        # and already defines `_build_headers`, `generate`, and `generate_stream`.
+        src_initial = (
+            "# Section: gemini.py\n"
+            "_SOME_STRING = 'get_active_cookie_credentials _pool_accounts mark_cookie_cooldown'\n"
+            "def _build_headers(ticket: str = None) -> dict:\n"
+            "    return {'Origin': 'https://gemini.google.com'}\n"
+            "def generate(prompt: str):\n"
+            "    return 'ok'\n"
+            "def generate_stream(prompt: str):\n"
+            "    yield 'ok'\n"
+        )
+        req_toks = M._ff17_extract_req_tokens(plan_md, src_initial)
+        self.assertIn("_pool_accounts", req_toks)
+        self.assertIn("get_active_cookie_credentials", req_toks)
+        self.assertIn("mark_cookie_cooldown", req_toks)
+
+        msgs = [
+            {"role": "user", "content": "Hãy đọc file feature_implementation_plan.md và implement."},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "r1", "type": "function", "function": {"name": "read", "arguments": json.dumps({"filePath": "feature_implementation_plan.md"})}},
+                {"id": "r2", "type": "function", "function": {"name": "read", "arguments": json.dumps({"filePath": "gemini_web2api.py"})}},
+            ]},
+            {"role": "tool", "tool_call_id": "r1", "name": "read", "content": plan_md},
+            {"role": "tool", "tool_call_id": "r2", "name": "read", "content": src_initial},
+            # Model implements Bước 2 (`_pool_accounts`, `get_active_cookie_credentials`, `mark_cookie_cooldown`)
+            # but has NOT updated `_build_headers`, `generate`, or `generate_stream` yet!
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "e1", "type": "function", "function": {"name": "edit", "arguments": json.dumps({
+                    "filePath": "gemini_web2api.py",
+                    "oldString": "# Section: gemini.py",
+                    "newString": (
+                        "# Section: gemini.py\n"
+                        "_pool_accounts = []\n"
+                        "def get_active_cookie_credentials():\n    return ('', None, None)\n"
+                        "def mark_cookie_cooldown(path: str, reason: str = ''):\n    pass"
+                    ),
+                })}},
+            ]},
+            {"role": "tool", "tool_call_id": "e1", "name": "edit", "content": "Edit applied successfully."},
+        ]
+        ctx = M._analyze(msgs)
+        ev = M._answered_calls(msgs)
+        rem = M._ff17_remaining_plan_or_todo_work(ctx, ev, msgs)
+        self.assertTrue(rem["has_more"])
+        self.assertIn("_build_headers", rem["missing_plan_tokens"])
+        self.assertIn("generate", rem["missing_plan_tokens"])
+        self.assertIn("generate_stream", rem["missing_plan_tokens"])
+        ledger = M._ff16_todo_ledger(ctx, msgs)
+        self.assertIn("1. [x]", ledger)
+        self.assertIn("2. [x]", ledger)
+        self.assertIn("3. [x]", ledger)
+        self.assertIn("4. [ ] Cập nhật hàm `_build_headers(ticket: str = None)`", ledger)
+        self.assertIn("5. [ ] Cập nhật logic retry trong `generate()` và `generate_stream()`", ledger)
+
+    def test_act_context_pack_prioritizes_pending_steps_and_drops_completed_windows(self):
+        """Regression for conversation.txt Turns 21-23:
+        Once Bước 1 (`DEFAULT_CONFIG`) is completed, `_ff17_act_context_pack` drops `DEFAULT_CONFIG`
+        from `[Target Code Windows]` and places pending step targets (`_build_headers`, `do_GET`) at the top."""
+        filler = "# padding line\n" * 5000
+        src_body = (
+            "# Section: config.py\n"
+            "DEFAULT_CONFIG = {\n"
+            "    'port': 8081,\n"
+            "    'cookie_pool': [],\n"
+            "}\n"
+            + filler +
+            "# Section: gemini.py\n"
+            "def _build_headers(ticket: str = None) -> dict:\n"
+            "    return {}\n"
+            + filler +
+            "# Section: server.py\n"
+            "class GeminiHandler:\n"
+            "    def do_GET(self):\n"
+            "        if self.path == '/health':\n"
+            "            return\n"
+        )
+        plan_md = (
+            "### Bước 1: Mở rộng Cấu hình (`# Section: config.py`)\n"
+            "- [ ] Thêm tùy chọn vào `DEFAULT_CONFIG`:\n"
+            "  - `\"cookie_pool\": []`\n"
+            "### Bước 3: Luồng Request (`# Section: gemini.py`)\n"
+            "- [ ] Cập nhật hàm `_build_headers(ticket: str = None)`:\n"
+            "### Bước 4: Endpoint (`# Section: server.py`)\n"
+            "- [ ] Mở rộng hàm `do_GET(self)` với `GET /v1/cookies/pool`:\n"
+        )
+        msgs = [
+            {"role": "user", "content": "Implement feature_implementation_plan.md"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "r1", "type": "function", "function": {"name": "read", "arguments": json.dumps({"filePath": "feature_implementation_plan.md"})}},
+                {"id": "r2", "type": "function", "function": {"name": "read", "arguments": json.dumps({"filePath": "gemini_web2api.py"})}},
+            ]},
+            {"role": "tool", "tool_call_id": "r1", "name": "read", "content": plan_md},
+            {"role": "tool", "tool_call_id": "r2", "name": "read", "content": src_body.replace("    'cookie_pool': [],\n", "")},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "e1", "type": "function", "function": {"name": "edit", "arguments": json.dumps({
+                    "filePath": "gemini_web2api.py",
+                    "oldString": "DEFAULT_CONFIG = {\n    'port': 8081,\n}",
+                    "newString": "DEFAULT_CONFIG = {\n    'port': 8081,\n    'cookie_pool': [],\n}",
+                })}},
+            ]},
+            {"role": "tool", "tool_call_id": "e1", "name": "edit", "content": "Edit applied successfully."},
+        ]
+        ctx = M._analyze(msgs)
+        pack = M._ff17_act_context_pack(ctx, msgs)
+        target_part = pack.split("[Target Code Windows from gemini_web2api.py")[1]
+        self.assertNotIn("DEFAULT_CONFIG =", target_part)
+        self.assertIn("def _build_headers(ticket: str = None)", target_part)
+        self.assertIn("def do_GET(self):", target_part)
+
+    def test_edit_gate_rejects_duplicate_class_methods_and_nonexistent_fn_oldstring(self):
+        """Regression for conversation.txt 08:02:35 & 08:04:28:
+        1. Prepending a duplicate `def do_GET(self):` or `def do_OPTIONS(self):` onto `GeminiHandler`
+           is rejected with the exact verbatim lines of the existing method.
+        2. Using `oldString: 'def init_cookie_pool():\\n    pass'` for a non-existent function is
+           rejected with a clear message and anchor snippet instead of matching an unrelated `def`."""
+        src_body = (
+            "# Section: gemini.py\n"
+            "def load_cookie():\n"
+            "    return ('', None)\n"
+            "def _write_tool(tm):\n"
+            "    return None\n"
+            "class GeminiHandler:\n"
+            "    def do_OPTIONS(self):\n"
+            "        return 204\n"
+            "    def do_GET(self):\n"
+            "        if self.path == '/health':\n"
+            "            return 200\n"
+        )
+        msgs = [
+            {"role": "user", "content": "Implement plan"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "r1", "type": "function", "function": {"name": "read", "arguments": json.dumps({"filePath": "gemini_web2api.py"})}},
+            ]},
+            {"role": "tool", "tool_call_id": "r1", "name": "read", "content": src_body},
+        ]
+        # Case 1: duplicate method `def do_GET(self):` prepended onto `def do_OPTIONS(self):`
+        dup_tc = {
+            "id": "e_dup",
+            "type": "function",
+            "function": {
+                "name": "edit",
+                "arguments": json.dumps({
+                    "filePath": "gemini_web2api.py",
+                    "oldString": "    def do_OPTIONS(self):\n        return 204",
+                    "newString": (
+                        "    def do_OPTIONS(self):\n        return 204\n"
+                        "    def do_GET(self):\n        if self.path == '/v1/cookies/pool': return 200"
+                    ),
+                }),
+            },
+        }
+        out_dup, probs_dup = M._base_gate_act_calls([dup_tc], msgs)
+        self.assertEqual([], out_dup)
+        self.assertTrue(any("duplicate `def do_GET(self...)`" in p for p in probs_dup))
+        self.assertTrue(any("if self.path == '/health':" in p for p in probs_dup))
+
+        # Case 2: non-existent `def init_cookie_pool(): pass` as oldString
+        ghost_tc = {
+            "id": "e_ghost",
+            "type": "function",
+            "function": {
+                "name": "edit",
+                "arguments": json.dumps({
+                    "filePath": "gemini_web2api.py",
+                    "oldString": "def init_cookie_pool():\n    pass",
+                    "newString": "def init_cookie_pool():\n    return True",
+                }),
+            },
+        }
+        out_ghost, probs_ghost = M._base_gate_act_calls([ghost_tc], msgs)
+        self.assertEqual([], out_ghost)
+        self.assertTrue(any("`def init_cookie_pool(...)` does not exist" in p for p in probs_ghost))
+        self.assertFalse(any("_write_tool" in p for p in probs_ghost))
+
+    def test_single_canonical_build_headers_in_gemini_section(self):
+        """Ensure `def _build_headers(` is defined only once in `gemini_web2api.py` so edits
+        to `_build_headers` in `# Section: gemini.py` are never shadowed by a later duplicate."""
+        with open(M.__file__, "r", encoding="utf-8") as f:
+            src = f.read()
+        matches = list(M.re.finditer(r"(?m)^def\s+_build_headers\s*\(", src))
+        self.assertEqual(1, len(matches))
+
+
+if __name__ == "__main__":
+    unittest.main()
