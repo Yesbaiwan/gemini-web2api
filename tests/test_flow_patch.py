@@ -1252,6 +1252,7 @@ class TestFlowEngineEnhancements(unittest.TestCase):
     def tearDown(self):
         CONFIG.clear()
         CONFIG.update(self.orig_config)
+        F._ff8_tls.messages = None
 
     def test_post_test_self_healing_allows_act_after_max_acts_exceeded(self):
         """When a CHANGE task with a plan has exceeded flow_max_acts (e.g. 7 acts),
@@ -1497,12 +1498,64 @@ class TestFlowEngineEnhancements(unittest.TestCase):
             ]},
             {"role": "tool", "tool_call_id": "c_r1", "content": plan_doc},
         ]
-        cmds = F._ff17_extract_verification_commands(msgs)
+        cmds = F._ff17_extract_verification_commands(msgs, require_existing=False)
         self.assertEqual(2, len(cmds))
         # Specific test file comes first
         self.assertIn("test_cookie_pool.py", cmds[0])
         # Full discover suite comes second
         self.assertIn("discover -s tests", cmds[1])
+
+        # With require_existing=True (default), test files that do not exist yet are filtered out
+        cmds_strict = F._ff17_extract_verification_commands(msgs)
+        self.assertEqual(1, len(cmds_strict))
+        self.assertIn("discover -s tests", cmds_strict[0])
+
+    def test_plan_evaluation_short_circuits_audit_and_act_excludes_todowrite(self):
+        """1. _ff17_evaluate_plan_steps short-circuits compliance audit when tests haven't completed.
+        2. _ff5_after_plan does not include todowrite in step.tool_names for act step.
+        """
+        CONFIG["flow16_plan_todo"] = True
+        CONFIG["flow17_plan_todo_act"] = True
+        plan_doc = (
+            "## 1. Implementation Steps\n"
+            "- [ ] Step 1: Update code\n\n"
+            "## 4. Verification Commands\n"
+            "```bash\n"
+            "python -m unittest discover -s tests\n"
+            "```\n"
+        )
+        msgs = [
+            {"role": "user", "content": "implement plan"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c_r1", "type": "function", "function": {"name": "read", "arguments": json.dumps({"filePath": "feature_implementation_plan.md"})}}
+            ]},
+            {"role": "tool", "tool_call_id": "c_r1", "content": plan_doc},
+        ]
+        ctx = F._analyze(msgs)
+        ev = F._answered_calls(msgs)
+
+        # Audit should NOT be called because tests have not completed
+        eval_steps = F._ff17_evaluate_plan_steps(ctx, ev, msgs)
+        # eval_steps has 1 plan step + 2 appended steps (verification cmds + audit)
+        self.assertEqual(3, len(eval_steps))
+        self.assertIn("Chạy verification commands", eval_steps[1]["title"])
+        self.assertFalse(eval_steps[1]["done"])
+        self.assertEqual("Đối chiếu plan (compliance audit)", eval_steps[2]["title"])
+        self.assertFalse(eval_steps[2]["done"])
+
+        # Tool names for act must not include todowrite
+        tm = F.ToolMap(
+            {"edit", "todowrite"},
+            {"edit": {"filePath", "oldString", "newString"}, "todowrite": {"todos"}},
+            {"edit": {"filePath", "oldString", "newString"}, "todowrite": {"todos"}}
+        )
+        step_act = F.Step("CHANGE", "act", 3, 5, {"act"}, "do edit", None, False, ["edit"])
+        out_step = F._ff5_after_plan(step_act, msgs, tm, ctx)
+        self.assertNotIn("todowrite", out_step.tool_names)
+
+        # 3. Lean step prompt is only used when flow6_lean_prompt is explicitly configured
+        CONFIG["flow6_lean_prompt"] = False
+        self.assertIsNone(F.build_step_prompt(ctx, step_act, msgs, tm))
 
     def test_static_ast_pre_gate_negative_tests_allow_valid_patterns(self):
         """Valid patterns that must NEVER be rejected by static AST pre-gate:
@@ -1678,6 +1731,302 @@ class TestFlowEngineEnhancements(unittest.TestCase):
         res_comp = F._ff17_audit_plan_compliance(msgs_comp, [])
         self.assertTrue(res_comp["compliant"])
         self.assertEqual([], res_comp["violations"])
+
+    def test_two_parallel_edits_count_as_one_round(self):
+        """Two parallel edits in the same turn must count as 1 repair round, not 2.
+        After 2 repair turns (4 post-test acts), flow18 (max_repair_rounds=4) still allows round 3."""
+        CONFIG["flow_max_acts"] = 10
+        CONFIG["flow17_plan_max_acts"] = 10
+        CONFIG["flow17_post_test_max_acts"] = 4
+        CONFIG["flow18_enabled"] = True
+        CONFIG["flow18_max_repair_rounds"] = 4
+        CONFIG["flow18_hard_max_acts"] = 24
+
+        plan_doc = (
+            "# Plan\n"
+            "- [x] `cookie_pool`: list\n"
+            "- [x] `init_cookie_pool()`: fn\n"
+        )
+        msgs = [
+            {"role": "user", "content": "Implement cookie pool"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c_r1", "type": "function", "function": {"name": "read", "arguments": json.dumps({"filePath": "feature_implementation_plan.md"})}},
+                {"id": "c_r2", "type": "function", "function": {"name": "read", "arguments": json.dumps({"filePath": "gemini_web2api.py"})}},
+            ]},
+            {"role": "tool", "tool_call_id": "c_r1", "content": plan_doc},
+            {"role": "tool", "tool_call_id": "c_r2", "content": "# Section: gemini.py\n" + "x = 1\n" * 15000},
+        ]
+        # Initial 10 implementation acts
+        for i in range(1, 11):
+            msgs.extend([
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": f"c_init{i}", "type": "function", "function": {"name": "edit", "arguments": json.dumps({"filePath": "gemini_web2api.py", "oldString": f"x = {i}", "newString": f"x = {i + 1}"})}},
+                ]},
+                {"role": "tool", "tool_call_id": f"c_init{i}", "content": "Edit applied."},
+            ])
+        # Test run 1 fails
+        test_fail_1 = (
+            "FAIL: test_pool_rotation (tests.test_cookie_pool.TestCookiePool)\n"
+            "Traceback (most recent call last):\n"
+            '  File "tests/test_cookie_pool.py", line 88, in test_pool_rotation\n'
+            "    self.assertEqual(len(_pool_accounts), 2)\n"
+            "AssertionError: 0 != 2\n\nFAILED (failures=1)"
+        )
+        msgs.extend([
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c_t1", "type": "function", "function": {"name": "bash", "arguments": json.dumps({"command": "python -m unittest tests/test_cookie_pool.py"})}},
+            ]},
+            {"role": "tool", "tool_call_id": "c_t1", "content": test_fail_1},
+        ])
+        # Round 1: Turn with 2 parallel edits
+        msgs.extend([
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c_p1_a", "type": "function", "function": {"name": "edit", "arguments": json.dumps({"filePath": "gemini_web2api.py", "oldString": "x = 11", "newString": "x = 12"})}},
+                {"id": "c_p1_b", "type": "function", "function": {"name": "edit", "arguments": json.dumps({"filePath": "gemini_web2api.py", "oldString": "x = 12", "newString": "x = 13"})}},
+            ]},
+            {"role": "tool", "tool_call_id": "c_p1_a", "content": "Edit applied."},
+            {"role": "tool", "tool_call_id": "c_p1_b", "content": "Edit applied."},
+        ])
+        # Test run 2 fails
+        msgs.extend([
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c_t2", "type": "function", "function": {"name": "bash", "arguments": json.dumps({"command": "python -m unittest tests/test_cookie_pool.py"})}},
+            ]},
+            {"role": "tool", "tool_call_id": "c_t2", "content": test_fail_1},
+        ])
+        # Round 2: Turn with 2 parallel edits (total 4 post-test acts!)
+        msgs.extend([
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c_p2_a", "type": "function", "function": {"name": "edit", "arguments": json.dumps({"filePath": "gemini_web2api.py", "oldString": "x = 13", "newString": "x = 14"})}},
+                {"id": "c_p2_b", "type": "function", "function": {"name": "edit", "arguments": json.dumps({"filePath": "gemini_web2api.py", "oldString": "x = 14", "newString": "x = 15"})}},
+            ]},
+            {"role": "tool", "tool_call_id": "c_p2_a", "content": "Edit applied."},
+            {"role": "tool", "tool_call_id": "c_p2_b", "content": "Edit applied."},
+        ])
+        # Test run 3 fails
+        msgs.extend([
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c_t3", "type": "function", "function": {"name": "bash", "arguments": json.dumps({"command": "python -m unittest tests/test_cookie_pool.py"})}},
+            ]},
+            {"role": "tool", "tool_call_id": "c_t3", "content": test_fail_1},
+        ])
+
+        tm = _tm()
+        ctx = F._analyze(msgs)
+        ev = F._answered_calls(msgs)
+        F._ff8_tls.messages = msgs
+
+        # Under flow18: rounds_used = 2 < 4. Must return 'act' step (not terminate)!
+        step = F._change_tail("CHANGE", ctx, ev, tm, ["gemini_web2api.py", "tests/test_cookie_pool.py"], 5)
+        self.assertIsNotNone(step)
+        self.assertEqual("act", step.name)
+        self.assertFalse(getattr(step, "final", False))
+
+        # Under flow18_enabled=False: fallback to flow17 (post_test_acts = 4 >= 4) -> terminates!
+        CONFIG["flow18_enabled"] = False
+        step_fallback = F._change_tail("CHANGE", ctx, ev, tm, ["gemini_web2api.py", "tests/test_cookie_pool.py"], 5)
+        self.assertIsNotNone(step_fallback)
+        self.assertEqual("answer", step_fallback.name)
+        self.assertIn("Edit budget exhausted", step_fallback.instruction)
+
+    def test_same_failure_injects_no_progress_warning_and_source_windows(self):
+        """When the same failure repeats across consecutive runs, _change_tail and _ff5_after_plan
+        must inject an IDENTICAL failure warning and source code windows for tested symbols."""
+        CONFIG["flow18_enabled"] = True
+        CONFIG["flow18_max_repair_rounds"] = 4
+
+        test_code = (
+            "import unittest\n"
+            "from gemini_web2api import init_cookie_pool, _pool_accounts\n"
+            "class TestCookiePool(unittest.TestCase):\n"
+            "    def test_pool_rotation(self):\n"
+            "        init_cookie_pool([{'cookie': 'c1'}, {'cookie': 'c2'}])\n"
+            "        self.assertEqual(len(_pool_accounts), 2)\n"
+        )
+        src_code = (
+            "# Section: gemini.py\n"
+            "_pool_accounts = []\n\n"
+            "def init_cookie_pool(accounts):\n"
+            "    global _pool_accounts\n"
+            "    _pool_accounts = accounts\n"
+            + "x = 1\n" * 15000
+        )
+        test_fail = (
+            "FAIL: test_pool_rotation (tests.test_cookie_pool.TestCookiePool)\n"
+            "Traceback (most recent call last):\n"
+            '  File "tests/test_cookie_pool.py", line 6, in test_pool_rotation\n'
+            "    self.assertEqual(len(_pool_accounts), 2)\n"
+            "AssertionError: 0 != 2\n\nFAILED (failures=1)"
+        )
+
+        msgs = [
+            {"role": "user", "content": "Fix cookie pool rotation"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c_r1", "type": "function", "function": {"name": "read", "arguments": json.dumps({"filePath": "tests/test_cookie_pool.py"})}},
+                {"id": "c_r2", "type": "function", "function": {"name": "read", "arguments": json.dumps({"filePath": "gemini_web2api.py"})}},
+            ]},
+            {"role": "tool", "tool_call_id": "c_r1", "content": test_code},
+            {"role": "tool", "tool_call_id": "c_r2", "content": src_code},
+            # Test run 1
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c_t1", "type": "function", "function": {"name": "bash", "arguments": json.dumps({"command": "python -m unittest tests/test_cookie_pool.py"})}},
+            ]},
+            {"role": "tool", "tool_call_id": "c_t1", "content": test_fail},
+            # Edit attempt
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c_a1", "type": "function", "function": {"name": "edit", "arguments": json.dumps({"filePath": "gemini_web2api.py", "oldString": "x = 1", "newString": "x = 2"})}},
+            ]},
+            {"role": "tool", "tool_call_id": "c_a1", "content": "Edit applied."},
+            # Test run 2: IDENTICAL failure
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c_t2", "type": "function", "function": {"name": "bash", "arguments": json.dumps({"command": "python -m unittest tests/test_cookie_pool.py"})}},
+            ]},
+            {"role": "tool", "tool_call_id": "c_t2", "content": test_fail},
+        ]
+
+        tm = _tm()
+        ctx = F._analyze(msgs)
+        ev = F._answered_calls(msgs)
+        F._ff8_tls.messages = msgs
+
+        step = F._change_tail("CHANGE", ctx, ev, tm, ["gemini_web2api.py", "tests/test_cookie_pool.py"], 5)
+        self.assertIsNotNone(step)
+        self.assertEqual("act", step.name)
+        # Warning about identical output must be injected in instruction
+        self.assertIn("IDENTICAL", step.instruction)
+        self.assertIn("test_pool_rotation", step.instruction)
+
+        # Context pack via _ff5_after_plan must inject source windows for init_cookie_pool / _pool_accounts
+        step_with_pack = F._ff5_after_plan(step, msgs, tm, ctx)
+        self.assertIn("[Diagnostic Source Windows for Failing Test Symbols", step_with_pack.instruction)
+        self.assertIn("init_cookie_pool", step_with_pack.instruction)
+        self.assertIn("_pool_accounts", step_with_pack.instruction)
+
+    def test_progress_grants_bonus_round(self):
+        """When a repair attempt reduces the number of failing tests, progress is recorded and a bonus round is granted."""
+        CONFIG["flow18_enabled"] = True
+        CONFIG["flow18_max_repair_rounds"] = 4
+        CONFIG["flow18_progress_bonus_rounds"] = 2
+
+        fail_2_tests = (
+            "FAIL: test_first (tests.test_a.TestA)\n"
+            "AssertionError: 1 != 2\n"
+            "FAIL: test_second (tests.test_a.TestA)\n"
+            "AssertionError: 3 != 4\n\nFAILED (failures=2)"
+        )
+        fail_1_test = (
+            "FAIL: test_first (tests.test_a.TestA)\n"
+            "AssertionError: 1 != 2\n\nFAILED (failures=1)"
+        )
+
+        msgs = [
+            {"role": "user", "content": "Fix tests"},
+            # Test 1: 2 failures
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c_t1", "type": "function", "function": {"name": "bash", "arguments": json.dumps({"command": "python -m unittest tests/test_a.py"})}},
+            ]},
+            {"role": "tool", "tool_call_id": "c_t1", "content": fail_2_tests},
+            # Edit
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c_a1", "type": "function", "function": {"name": "edit", "arguments": json.dumps({"filePath": "a.py", "oldString": "a=1", "newString": "a=2"})}},
+            ]},
+            {"role": "tool", "tool_call_id": "c_a1", "content": "Edit applied."},
+            # Test 2: 1 failure (progress!)
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c_t2", "type": "function", "function": {"name": "bash", "arguments": json.dumps({"command": "python -m unittest tests/test_a.py"})}},
+            ]},
+            {"role": "tool", "tool_call_id": "c_t2", "content": fail_1_test},
+        ]
+        ev = F._answered_calls(msgs)
+        prog = F._ff18_analyze_failure_progression(ev)
+        self.assertEqual(1, prog["progress_count"])
+        self.assertEqual(1, prog["bonus_rounds"])
+        self.assertFalse(prog["is_no_progress"])
+        self.assertEqual(["test_first"], prog["failed_names"])
+
+    def test_hard_cap_still_terminates(self):
+        """When total acts reach flow18_hard_max_acts, _change_tail must terminate with final=True answer."""
+        CONFIG["flow18_enabled"] = True
+        CONFIG["flow18_hard_max_acts"] = 6
+        CONFIG["flow18_max_repair_rounds"] = 10
+
+        test_fail = "FAIL: test_x (test.TestX)\nAssertionError\nFAILED (failures=1)"
+        msgs = [{"role": "user", "content": "Implement feature"}]
+        # 6 acts
+        for i in range(1, 7):
+            msgs.extend([
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": f"c_a{i}", "type": "function", "function": {"name": "edit", "arguments": json.dumps({"filePath": "a.py", "oldString": f"x{i}", "newString": f"y{i}"})}},
+                ]},
+                {"role": "tool", "tool_call_id": f"c_a{i}", "content": "Done."},
+            ])
+        # Test failed
+        msgs.extend([
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c_t1", "type": "function", "function": {"name": "bash", "arguments": json.dumps({"command": "python -m unittest tests/test_a.py"})}},
+            ]},
+            {"role": "tool", "tool_call_id": "c_t1", "content": test_fail},
+        ])
+
+        tm = _tm()
+        ctx = F._analyze(msgs)
+        ev = F._answered_calls(msgs)
+        F._ff8_tls.messages = msgs
+
+        step = F._change_tail("CHANGE", ctx, ev, tm, ["a.py"], 5)
+        self.assertIsNotNone(step)
+        self.assertEqual("answer", step.name)
+        self.assertIn("Edit budget exhausted", step.instruction)
+
+    def test_honest_final_rejects_false_completion_when_last_test_failed(self):
+        """When the session ends with a failing test and model claims completion falsely:
+        - On first attempt (last=False), _ff5_postfilter returns (None, nudge) requiring honest reporting.
+        - On final attempt (last=True), _ff5_postfilter prepends warning notice.
+        - When tests passed, _ff5_postfilter leaves the completion text untouched."""
+        CONFIG["flow18_enabled"] = True
+        CONFIG["flow18_honest_final"] = True
+
+        test_fail = "FAIL: test_pool_rotation (TestCookiePool)\nAssertionError: 0 != 2\nFAILED (failures=1)"
+        msgs_fail = [
+            {"role": "user", "content": "Triển khai cookie pool"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c_t1", "type": "function", "function": {"name": "bash", "arguments": json.dumps({"command": "python -m unittest tests/test_cookie_pool.py"})}},
+            ]},
+            {"role": "tool", "tool_call_id": "c_t1", "content": test_fail},
+        ]
+
+        false_text = "Các bước triển khai Cookie Pool Rotation đã được hoàn tất thành công 100%."
+        res_tuple = (false_text, None)
+
+        # 1. First attempt (last=False): must nudge for retry
+        final_res, nudge = F._ff5_postfilter(res_tuple, msgs_fail, last=False)
+        self.assertIsNone(final_res)
+        self.assertIsNotNone(nudge)
+        self.assertIn("CRITICAL REQUIREMENT", nudge)
+        self.assertIn("test_pool_rotation", nudge)
+        self.assertIn("still FAIL", nudge)
+
+        # 2. Final attempt (last=True): prepends warning banner
+        final_res2, nudge2 = F._ff5_postfilter(res_tuple, msgs_fail, last=True)
+        self.assertIsNone(nudge2)
+        self.assertIsNotNone(final_res2)
+        text2, _ = final_res2
+        self.assertTrue(text2.startswith("⚠️ [Lưu ý:"))
+        self.assertIn("test_pool_rotation", text2)
+        self.assertIn(false_text, text2)
+
+        # 3. When last test passed: completion text is untouched
+        test_pass = "Ran 10 tests in 0.5s\n\nOK"
+        msgs_pass = [
+            {"role": "user", "content": "Triển khai cookie pool"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c_t1", "type": "function", "function": {"name": "bash", "arguments": json.dumps({"command": "python -m unittest tests/test_cookie_pool.py"})}},
+            ]},
+            {"role": "tool", "tool_call_id": "c_t1", "content": test_pass},
+        ]
+        final_res3, nudge3 = F._ff5_postfilter(res_tuple, msgs_pass, last=False)
+        self.assertIsNone(nudge3)
+        self.assertEqual(res_tuple, final_res3)
 
 
 if __name__ == "__main__":

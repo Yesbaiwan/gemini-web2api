@@ -6171,8 +6171,9 @@ class Step:
         head = f"[FLOW {self.pattern} step {self.index}/{self.total} -- {self.name.upper()}]"
         out = [head + " " + self.instruction]
         if self.tool_names:
+            hint = " For edits, keep oldString short (1-5 unique anchor lines); do NOT copy large chunks." if self.name == "act" else ""
             out.append("Allowed tools this turn: " + ", ".join(self.tool_names)
-                       + ". Output ONLY tool_call block(s), no prose.")
+                       + ". Output ONLY tool_call block(s), no prose." + hint)
         if self.calls:
             out.append("Emit exactly:")
             for c in self.calls:
@@ -6798,6 +6799,9 @@ def install():
             _ff5_metric("lean_prompt_used")
             _ff5_metric("lean_saved_chars", max(0, len(prompt) - len(step_prompt)))
 
+        sys_note = prompt[prompt.rfind("\n\n[SYSTEM NOTE] "):] if "\n\n[SYSTEM NOTE] " in prompt else ""
+        effective_prompt = (step_prompt + sys_note) if step_prompt else prompt
+
         if step.name == "answer":
             if (_cfg("flow_mapreduce")
                     and step.pattern in ("GENERIC_REVIEW", "FILE_REVIEW")):
@@ -6813,7 +6817,7 @@ def install():
                     report = None
                 if report:
                     return report, None
-            return call((step_prompt or prompt) + "\n\n" + step.directive())
+            return call(effective_prompt + "\n\n" + step.directive())
         if step.drive and _cfg("flow_drive"):
             d_calls = list(step.calls or [])
             if "_ff17_attach_todowrite" in globals():
@@ -6830,7 +6834,7 @@ def install():
         for attempt in range(1 + max_retries):
             try:
                 text, calls = call(
-                    (step_prompt or prompt) + "\n\n" + step.directive() + nudge,
+                    effective_prompt + "\n\n" + step.directive() + nudge,
                     True,
                     allowed_override=(step_allowed if attempt >= 1 else None),
                 )
@@ -11825,16 +11829,16 @@ def _ff5_has_fresh_evidence_after_last_act(messages, path):
             if re.search(r"\bgit\s+(?:--no-pager\s+)?diff\b", cmd):
                 return True
 
-    # If the previous act(s) on `path` were surgical edits (oldString -> newString)
-    # and `_ff9_read_texts` still tracks the updated content of `path` in-place
-    # (with no failed test run since `last_act`), allow subsequent phase edits.
-    last_args = ev[last_act].get("args") or {}
-    has_old = any(isinstance(last_args.get(k), str) and last_args[k] for k in _OLD_KEYS)
-    has_new = any(isinstance(last_args.get(k), str) for k in _NEW_KEYS)
-    if has_old and has_new and "_ff9_read_texts" in globals():
+    # If `_ff9_read_texts` still tracks the updated content of `path` in-place
+    # (from earlier edits or full-file writes, with no failed test run since `last_act`),
+    # allow subsequent phase edits without forcing a redundant re-read.
+    if "_ff9_read_texts" in globals():
         tracked = _ff9_read_texts(messages)
-        if any(T._path_seen(path, [k]) for k in tracked):
-            return True
+        tk = _ff17_find_key(tracked, path) if "_ff17_find_key" in globals() else None
+        if tk is not None or any(T._path_seen(path, [k]) for k in tracked):
+            tests_ran = _tests_ran_after_act(ev) if "_tests_ran_after_act" in globals() else False
+            if not tests_ran or len(tracked.get(tk or path) or "") > 50000:
+                return True
 
     return False
 
@@ -11868,12 +11872,24 @@ def _ff5_postfilter(result, messages, perm=None, last=True, tm=None, ctx=None):
         if read_probs:
             body = "\n".join("- " + x for x in read_probs[:5])
             log("[fix5] edit without a successful read: " + " | ".join(read_probs))
+            needed_paths = []
+            for tc in calls or []:
+                fn = (tc or {}).get("function") or {}
+                if tool_kind(fn.get("name")) == "act":
+                    p = _call_path(T._tool_arguments_dict(fn))
+                    if p and any(p in prob for prob in read_probs) and p not in needed_paths:
+                        needed_paths.append(p)
+            if needed_paths and tm is not None and tm.first("read"):
+                read_calls = _read_calls(tm, needed_paths)
+                if read_calls:
+                    log("[fix5] converting needs-read edit into driven read step: " + ", ".join(needed_paths))
+                    return ("", read_calls), None
             return blocked(
                 "Mình chưa sửa vì file chưa được đọc thành công:\n" + body,
                 "I did not edit because the target file was not successfully "
                 "read:\n" + body,
                 "Read the target file successfully before editing it:\n" + body,
-                retry=True)
+                retry=False)
 
     # 0. adapt every call to the schema the client actually declared (proposal 3)
     if tm is not None:
@@ -12293,7 +12309,8 @@ def _ff5_act_needs_read_problems(calls, messages, ctx):
         return []
     if pattern == "DEBUG" and not fix:
         return []
-    good = _ff5_successful_read_paths(messages)
+    tracked = _ff9_read_texts(messages) if "_ff9_read_texts" in globals() else {}
+    good = list(set(_ff5_successful_read_paths(messages)).union(tracked.keys()))
     listing = _ff6c_survey_listing(_answered_calls(messages))
     problems = []
     for tc in calls or []:
@@ -12605,10 +12622,12 @@ def _ff8_write_check(result, messages, ctx):
         if any(T._path_seen(path, [x]) for x in touched):
             fixed, pr = _gate_act_calls([tc], messages)
             if pr:
-                content_only_touch = not any(isinstance(args.get(k), str) and args[k] for k in _OLD_KEYS)
                 tracked_now = _ff9_read_texts(messages) if "_ff9_read_texts" in globals() else {}
-                is_tracked = any(T._path_seen(path, [k]) for k in tracked_now)
-                if content_only_touch or not is_tracked:
+                tk = _ff17_find_key(tracked_now, path) if "_ff17_find_key" in globals() else None
+                is_tracked = (tk is not None) or any(T._path_seen(path, [k]) for k in tracked_now)
+                tests_ran = _tests_ran_after_act(ev) if "_tests_ran_after_act" in globals() else False
+                stale_re_read = not is_tracked or (tests_ran and len(tracked_now.get(tk or path) or "") <= 50000)
+                if stale_re_read:
                     probs.extend(pr + ["%s: the file changed after your last read; "
                                        "re-read it before editing again" % path])
                 else:
@@ -16493,7 +16512,8 @@ def _ff5_act_needs_read_problems(calls, messages, ctx):
         return []
     if pattern == "DEBUG" and not fix:
         return []
-    good = _ff5_successful_read_paths(messages)
+    tracked = _ff9_read_texts(messages) if "_ff9_read_texts" in globals() else {}
+    good = list(set(_ff5_successful_read_paths(messages)).union(tracked.keys()))
     listing = _ff6c_survey_listing(_answered_calls(messages))
     problems = []
     for tc in calls or []:
@@ -19524,7 +19544,7 @@ def _ff17_targeted_test_commands(names, ev):
     return out
 
 
-def _ff17_extract_verification_commands(messages, names=None, ev=None) -> list:
+def _ff17_extract_verification_commands(messages, names=None, ev=None, require_existing: bool = True) -> list:
     """Extract verification/test commands from read plan documents or prompt messages,
     sorting targeted/specific test file commands BEFORE full-suite discover commands."""
     plan_bodies = [b for _p, b in _ff16_read_plan_bodies(messages or [])]
@@ -19559,6 +19579,8 @@ def _ff17_extract_verification_commands(messages, names=None, ev=None) -> list:
         return 0
 
     raw_cmds.sort(key=_cmd_weight)
+    if not require_existing:
+        return raw_cmds
 
     # Filter out commands referencing .py files that do not exist yet in tracked texts or on disk
     tracked = _ff9_read_texts(messages or [])
@@ -20717,6 +20739,8 @@ def _ff17_extract_req_tokens(text: str, orig_corpus: str, include_tests: bool = 
             m_test = re.match(r"^(?:def\s+)?(test_[A-Za-z0-9_]+)(?:\(|$)", sp_s)
             if m_test and not sp_s.endswith((".py", ".js", ".ts", ".spec", ".test")) and "/" not in sp_s and "\\" not in sp_s:
                 token, tkind = m_test.group(1), "fn"
+        if token and token.lower() in ("attempt", "cooldown_until", "retry", "reason", "true", "false", "null", "none"):
+            token = None
         if (token and token not in _FF17_STOP_IDENTS
                 and (include_tests or not token.startswith("test_"))
                 and not _ff17_token_defined_in_corpus(token, tkind, orig_corpus or "")
@@ -20770,11 +20794,13 @@ def _ff17_extract_func_body(fn_name: str, src_text: str) -> str:
 
 def _ff17_was_func_modified(fn_name: str, orig_corpus: str, tracked_src: str, ok_acts: list) -> bool:
     """Return True if the existing function `fn_name` in `orig_corpus` was modified in `tracked_src`
-    or by any non-test edit in `ok_acts`."""
+    or by any non-test edit in `ok_acts`. Returns False if unchanged or undetermined."""
     orig_body = _ff17_extract_func_body(fn_name, orig_corpus)
     cur_body = _ff17_extract_func_body(fn_name, tracked_src)
-    if orig_body and cur_body and orig_body != cur_body:
-        return True
+    if orig_body and cur_body:
+        if orig_body != cur_body:
+            return True
+        return False
     rx_def = re.compile(rf"(?m)^[ \t]*(?:async\s+)?def\s+{re.escape(fn_name)}\s*\(")
     for e in ok_acts or []:
         args_a = e.get("args") or {}
@@ -20798,11 +20824,9 @@ def _ff17_was_func_modified(fn_name: str, orig_corpus: str, tracked_src: str, ok
             new_fn = _ff17_extract_func_body(fn_name, new_s)
             if new_fn and new_fn != old_fn:
                 return True
-        if orig_body:
-            for oln in old_s.split("\n"):
-                s_oln = oln.strip()
-                if len(s_oln) >= 12 and not s_oln.startswith(("def ", "async def ", "#")) and s_oln in orig_body:
-                    return True
+        # If the edit replaced multiple lines inside the function body
+        if orig_body and old_s in orig_body and len([l for l in old_s.strip().splitlines() if l.strip()]) >= 2:
+            return True
     return False
 
 
@@ -20955,15 +20979,24 @@ def _ff17_evaluate_plan_steps(ctx, ev, messages, pending_calls=None, step_name=N
         ]
         is_test_step = any(_is_test_path(sf) for sf in st_files) or bool(re.search(r"\b(?:tests/|test_)\w+", st_title))
         st_reqs = _ff17_extract_req_tokens(body_without_heading, orig_corpus, include_tests=is_test_step)
-        st_existing_fns = _ff17_extract_existing_fn_targets(st_title, orig_corpus)
+        st_existing_fns = _ff17_extract_existing_fn_targets(st_title + "\n" + body_without_heading, orig_corpus)
         is_pure_test = (not is_test_step and not st_reqs and not st_existing_fns
                         and (_ff17_is_pure_test_todo(st_title, edited_files)
                              or bool(re.search(r"\b(?:test|unittest|pytest|verify|kiem\s+tra|nghiem\s+thu)\b", st_title, re.I))))
         target_corpus = all_added_corpus if is_test_step else src_added_corpus
         test_disk_corpus = "\n".join(tracked_map.get(f, "") for f in st_files) if is_test_step else ""
+
+        def _is_defined(tok):
+            for corp in (target_corpus, test_disk_corpus, tracked_src):
+                if not corp:
+                    continue
+                if any(_ff17_token_defined_in_corpus(tok, kd, corp) for kd in ("fn", "var", "cfg", "route")):
+                    return True
+            return False
+
         missing_reqs = [
             r for r in st_reqs
-            if r not in target_corpus and r not in test_disk_corpus
+            if not _is_defined(r)
         ]
         unmodified_fns = (
             [] if is_test_step else [
@@ -20995,6 +21028,51 @@ def _ff17_evaluate_plan_steps(ctx, ev, messages, pending_calls=None, step_name=N
             "missing_tokens": missing_reqs,
             "unmodified_fns": unmodified_fns,
             "uncreated_files": uncreated_st_files,
+        })
+
+    # D3: Append verification commands and compliance audit steps to eval_steps
+    v_cmds = _ff17_extract_verification_commands(messages, None, ev, require_existing=False) if "_ff17_extract_verification_commands" in globals() else []
+    if v_cmds:
+        n_steps = len(out)
+        runs = _test_runs(ev_list)
+        last_act_idx = max((i for i, e in enumerate(ev_list) if e.get("kind") == "act"), default=-1)
+        runs_after_act = [r for r in runs if r[0] > last_act_idx]
+        has_failing_test = any(test_outcome(r[2]) in ("fail", "broken") for r in runs_after_act)
+        tests_completed = bool(runs_after_act and not has_failing_test) if last_act_idx >= 0 else bool(runs and not any(test_outcome(r[2]) in ("fail", "broken") for r in runs))
+
+        # N+1: Chạy verification commands
+        v_title = "Chạy verification commands" + (f" ({'; '.join(v_cmds[:2])})" if v_cmds else "")
+        v_step_idx = n_steps + 1
+        out.append({
+            "index": v_step_idx,
+            "title": v_title,
+            "full": v_title,
+            "done": tests_completed,
+            "is_test_run": True,
+            "is_test_step": True,
+            "missing_tokens": [],
+            "unmodified_fns": [],
+            "uncreated_files": [],
+        })
+
+        # N+2: Đối chiếu plan (compliance audit)
+        all_prev_done = bool(tests_completed and all(s["done"] for s in out[:n_steps]))
+        audit_res = (
+            _ff17_audit_plan_compliance(messages, ev_list)
+            if (all_prev_done and "_ff17_audit_plan_compliance" in globals())
+            else {"compliant": False, "violations": []}
+        )
+        audit_done = bool(all_prev_done and audit_res.get("compliant"))
+        out.append({
+            "index": n_steps + 2,
+            "title": "Đối chiếu plan (compliance audit)",
+            "full": "Đối chiếu plan (compliance audit)",
+            "done": audit_done,
+            "is_test_run": True,
+            "is_test_step": False,
+            "missing_tokens": [],
+            "unmodified_fns": [],
+            "uncreated_files": [],
         })
 
     return out
@@ -21120,6 +21198,23 @@ def _ff17_remaining_plan_or_todo_work(ctx, ev, messages) -> dict:
 _ff17_prev_change_tail = _change_tail
 
 
+def _ff17_attach_audit_note_to_answer(step_ans, msgs, ev, tested_after=False):
+    if not step_ans or not _ff17_c("flow17_plan_compliance_audit", True):
+        return step_ans
+    try:
+        audit_res = _ff17_audit_plan_compliance(msgs, ev)
+        test_status_str = " (đã verify bằng test)" if tested_after else " (chưa verify bằng test)"
+        if not audit_res.get("compliant") and audit_res.get("violations"):
+            v_str = "\n".join("- " + v for v in audit_res["violations"][:5])
+            note = f"\n\n[Plan Compliance Audit{test_status_str}]: Phát hiện không tuân thủ plan:\n{v_str}"
+            step_ans.instruction = (step_ans.instruction or "") + note
+        elif audit_res.get("compliant") and (msgs and _ff16_read_plan_bodies(msgs)):
+            step_ans.instruction = (step_ans.instruction or "") + f"\n\n[Plan Compliance Audit{test_status_str}]: Tuân thủ đầy đủ các yêu cầu trong plan."
+    except Exception:
+        pass
+    return step_ans
+
+
 def _change_tail(pat, ctx, ev, tm, names_all, total, extra=""):
     if _ff17_c("flow17_plan_todo_act") and tm.first("act"):
         try:
@@ -21175,6 +21270,7 @@ def _change_tail(pat, ctx, ev, tm, names_all, total, extra=""):
                         st = _answer_step("CHANGE", ev, total, total, final=True)
                         if st:
                             st.pattern = pat
+                            st = _ff17_attach_audit_note_to_answer(st, msgs, ev, tested_after=bool(after))
                         return st
                 else:
                     # All tests in after passed! Check if further verification commands are pending
@@ -21226,6 +21322,7 @@ def _change_tail(pat, ctx, ev, tm, names_all, total, extra=""):
                     st = _answer_step("CHANGE", ev, total, total)
                     if st:
                         st.pattern = pat
+                        st = _ff17_attach_audit_note_to_answer(st, msgs, ev, tested_after=bool(after))
                     return st
 
             # Case B: Model just did an act after a prior test failed (re-run the failed test!)
@@ -21297,7 +21394,10 @@ def _change_tail(pat, ctx, ev, tm, names_all, total, extra=""):
                         return _tests_step(pat, tm, cmd, 4, total)
         except Exception as ex:
             log("[fix17] plan/todo act continuation error: %s" % ex)
-    return _ff17_prev_change_tail(pat, ctx, ev, tm, names_all, total, extra=extra)
+    res = _ff17_prev_change_tail(pat, ctx, ev, tm, names_all, total, extra=extra)
+    if res and getattr(res, "name", None) == "answer":
+        res = _ff17_attach_audit_note_to_answer(res, msgs, ev, tested_after=bool(after if "after" in locals() else False))
+    return res
 
 
 _ff17_prev_todo_ledger_outer = _ff16_todo_ledger
@@ -21325,7 +21425,7 @@ def _ff16_todo_ledger(ctx, messages) -> str:
         if base_ledger and eval_steps and (has_plan_doc or not todo_calls):
             s_parts = [
                 f"{s['index']}. {'[x]' if s['done'] else '[ ]'} {s['title']}"
-                for s in eval_steps[:12]
+                for s in eval_steps[:14]
             ]
             prefix_lines = [ln for ln in base_ledger.splitlines() if not ln.startswith("Steps: ")]
             prefix_lines.append("Steps: " + " | ".join(s_parts))
@@ -21394,7 +21494,7 @@ def _ff17_attach_todowrite(ctx, messages, tm, step, calls) -> list:
 
         todos_payload = []
         in_prog_assigned = False
-        for s in eval_steps[:12]:
+        for s in eval_steps[:14]:
             if s["done"]:
                 st_str = "completed"
             elif not in_prog_assigned:
@@ -21682,7 +21782,7 @@ _ff17_prev_after_plan = _ff5_after_plan
 def _ff5_after_plan(step, messages, tm, ctx=None):
     step = _ff17_prev_after_plan(step, messages, tm, ctx)
     try:
-        if step is not None and getattr(step, "local_text", None) is None and not _c5("flow6_lean_prompt"):
+        if step is not None and getattr(step, "local_text", None) is None:
             if getattr(step, "name", None) == "answer":
                 idx_block = _ff17_large_file_structure_index(messages)
                 if idx_block and "[Structure index for " not in (step.instruction or ""):
@@ -21709,6 +21809,516 @@ def install():
         CONFIG.setdefault(k, v)
     log("[fix17] flow_fix17 installed")
 # ==== flowfix17:end ====
+
+# ==== flowfix18:start ====
+# Flow Engine 18: Post-test repair budget & loop intelligence
+#   1. Group consecutive successful acts into repair rounds (flow18_max_repair_rounds=4)
+#   2. Failure fingerprinting (detect identical failure vs progress)
+#   3. Progress bonus rounds (flow18_progress_bonus_rounds=2, hard cap flow18_hard_max_acts=24)
+#   4. Diagnostic context & warning injection on repeated identical failure
+#   5. Final answer honesty guard (flow18_honest_final=True)
+
+_FF18_DEFAULTS = {
+    "flow18_enabled": True,
+    "flow18_max_repair_rounds": 4,
+    "flow18_hard_max_acts": 24,
+    "flow18_progress_bonus_rounds": 2,
+    "flow18_honest_final": True,
+}
+_FLOW_DEFAULTS.update(_FF18_DEFAULTS)
+_DEFAULTS.update(_FF18_DEFAULTS)
+for _k18, _v18 in _FF18_DEFAULTS.items():
+    CONFIG.setdefault(_k18, _v18)
+
+
+def _ff18_c(key, default=None):
+    if not _flow_c("flow18_enabled", True):
+        return False
+    return _flow_c(key, _FF18_DEFAULTS.get(key, default))
+
+
+def _ff18_failed_test_names(res: str) -> list:
+    """Extract sorted unique failed/errored test function names from test output."""
+    if not res:
+        return []
+    names = set()
+    for m in re.finditer(r"(?m)^(?:FAIL|ERROR):\s*([A-Za-z0-9_]+)", res):
+        names.add(m.group(1))
+    for m in re.finditer(r"(?m)^FAILED\s+\S*?([A-Za-z0-9_]+)(?:\s+-\s+.*)?$", res):
+        names.add(m.group(1))
+    return sorted(names)
+
+
+def _ff18_fail_fingerprint(res: str) -> str:
+    """Normalize test traceback and compute a stable hash for regression/progress detection."""
+    if not res:
+        return ""
+    failed_names = _ff18_failed_test_names(res)
+    norm = res
+    norm = re.sub(r"Ran \d+ tests in [\d.]+s", "", norm)
+    norm = re.sub(r"line \d+", "line X", norm)
+    norm = re.sub(r":\d+:", ":X:", norm)
+    norm = re.sub(r"0x[0-9a-fA-F]+", "0xADDR", norm)
+    norm = re.sub(r'File "[^"\n]+"', 'File "<path>"', norm)
+    norm = re.sub(r"File '[^'\n]+'", "File '<path>'", norm)
+    norm = re.sub(r"(?i)(?:[a-z]:[\\/][^\s\"']*[\\/]temp[\\/]|/tmp/)tmp[a-z0-9_]+", "<tmp>", norm)
+    lines = [
+        ln.strip() for ln in norm.splitlines()
+        if re.search(r"(?:FAIL|ERROR|FAILED|AssertionError|Exception|Error:)", ln)
+    ]
+    key_str = "|".join(failed_names) + "\n" + "\n".join(lines)
+    return _ff17_hashlib.sha256(key_str.encode("utf-8")).hexdigest()[:16]
+
+
+def _ff18_repair_rounds(ev) -> int:
+    """Count completed repair rounds after the first test failure.
+    A repair round is a group of one or more successful act events between test executions.
+    Parallel edits in the same turn belong to the same round."""
+    first_failed_test_idx = -1
+    for i, e in enumerate(ev):
+        if e.get("kind") == "exec":
+            cmd = _call_command(e.get("args") or {})
+            if _is_test_cmd(cmd) and test_outcome(e.get("result") or "") in ("fail", "broken"):
+                first_failed_test_idx = i
+                break
+    if first_failed_test_idx == -1:
+        return 0
+
+    rounds = 0
+    cur_round_had_ok_act = False
+    for i in range(first_failed_test_idx + 1, len(ev)):
+        e = ev[i]
+        k = e.get("kind")
+        if k == "act":
+            if _act_ok(e):
+                cur_round_had_ok_act = True
+        elif k == "exec":
+            cmd = _call_command(e.get("args") or {})
+            if _is_test_cmd(cmd):
+                if cur_round_had_ok_act:
+                    rounds += 1
+                    cur_round_had_ok_act = False
+    if cur_round_had_ok_act:
+        rounds += 1
+    return rounds
+
+
+def _ff18_analyze_failure_progression(ev) -> dict:
+    """Analyze the history of test failures to determine progress, bonus rounds, and identical failure loops."""
+    runs = _test_runs(ev)
+    failed_runs = [
+        r for r in runs
+        if test_outcome(r[2]) in ("fail", "broken")
+    ]
+    if not failed_runs:
+        return {
+            "rounds_used": 0,
+            "bonus_rounds": 0,
+            "is_no_progress": False,
+            "failed_names": [],
+            "latest_fingerprint": "",
+            "progress_count": 0,
+        }
+
+    rounds_used = _ff18_repair_rounds(ev)
+    fps = [_ff18_fail_fingerprint(r[2]) for r in failed_runs]
+    names_list = [_ff18_failed_test_names(r[2]) for r in failed_runs]
+
+    progress_count = 0
+    # Evaluate progress between consecutive failed runs that had act(s) between them
+    for j in range(1, len(failed_runs)):
+        prev_idx = failed_runs[j - 1][0]
+        cur_idx = failed_runs[j][0]
+        had_acts = any(ev[k].get("kind") == "act" for k in range(prev_idx + 1, cur_idx))
+        if had_acts:
+            prev_names = names_list[j - 1]
+            cur_names = names_list[j]
+            prev_fp = fps[j - 1]
+            cur_fp = fps[j]
+            # Progress if fewer tests fail or error signature changed
+            if len(cur_names) < len(prev_names) or (cur_fp != prev_fp and test_outcome(failed_runs[j][2]) != "broken"):
+                progress_count += 1
+
+    bonus_cap = int(_ff18_c("flow18_progress_bonus_rounds", 2) or 2)
+    bonus_rounds = min(bonus_cap, progress_count)
+
+    is_no_progress = False
+    if len(failed_runs) >= 2:
+        last_prev_idx = failed_runs[-2][0]
+        last_cur_idx = failed_runs[-1][0]
+        had_acts = any(ev[k].get("kind") == "act" for k in range(last_prev_idx + 1, last_cur_idx))
+        if had_acts and fps[-1] == fps[-2]:
+            is_no_progress = True
+
+    return {
+        "rounds_used": rounds_used,
+        "bonus_rounds": bonus_rounds,
+        "is_no_progress": is_no_progress,
+        "failed_names": names_list[-1],
+        "latest_fingerprint": fps[-1],
+        "progress_count": progress_count,
+    }
+
+
+def _ff18_extract_test_symbols(failed_res: str, messages: list, ev: list) -> set:
+    """Extract project functions and variables called or asserted inside failing test methods."""
+    failed_names = set(_ff18_failed_test_names(failed_res))
+    if not failed_names:
+        return set()
+
+    locs = failure_locations(failed_res)
+    test_files = [p for p, _ln in locs if p.lower().endswith(".py")]
+
+    tracked = _ff9_read_texts(messages or [])
+    if ev:
+        for v in _ff8_file_views(ev):
+            p = v.get("path") or ""
+            if p and p not in tracked:
+                tracked[p] = v.get("text") or ""
+
+    test_sources = []
+    for tf in test_files:
+        src = (
+            tracked.get(tf)
+            or tracked.get(tf.replace("\\", "/"))
+            or tracked.get(tf.replace("/", "\\"))
+        )
+        if not src and os.path.exists(tf):
+            try:
+                with open(tf, "r", encoding="utf-8", errors="replace") as f:
+                    src = f.read()
+            except Exception:
+                src = None
+        if src:
+            test_sources.append(src)
+
+    if not test_sources:
+        for p, src in tracked.items():
+            if "test" in p.lower() and any(fn in src for fn in failed_names):
+                test_sources.append(src)
+
+    stop_symbols = {
+        "self", "assertEqual", "assertNotEqual", "assertTrue", "assertFalse",
+        "assertRaises", "assertIn", "assertNotIn", "assertIsNone", "assertIsNotNone",
+        "assertAlmostEqual", "assertListEqual", "assertDictEqual", "assertSetEqual",
+        "None", "True", "False", "len", "range", "str", "int", "dict", "list",
+        "set", "tuple", "bool", "float", "print", "open", "unittest", "pytest",
+        "patch", "MagicMock", "Mock", "setUp", "tearDown", "Exception", "args", "kwargs",
+    }
+
+    called_symbols = set()
+    for src in test_sources:
+        clean_src, _ = _ff17_strip_numbered_lines(src)
+        try:
+            tree = _ff5_ast.parse(clean_src)
+        except Exception:
+            tree = None
+        if tree is not None:
+            for node in _ff5_ast.walk(tree):
+                if isinstance(node, (_ff5_ast.FunctionDef, _ff5_ast.AsyncFunctionDef)):
+                    if node.name in failed_names:
+                        for sub in _ff5_ast.walk(node):
+                            if isinstance(sub, _ff5_ast.Name):
+                                if sub.id not in stop_symbols and not sub.id.startswith("__"):
+                                    called_symbols.add(sub.id)
+                            elif isinstance(sub, _ff5_ast.Attribute):
+                                if isinstance(sub.value, _ff5_ast.Name) and sub.value.id not in stop_symbols:
+                                    called_symbols.add(sub.value.id)
+                                if sub.attr not in stop_symbols and not sub.attr.startswith("__"):
+                                    called_symbols.add(sub.attr)
+        else:
+            for fn in failed_names:
+                m = re.search(rf"def\s+{re.escape(fn)}\s*\([^)]*\):(.*?)(?=\n\s*(?:def|class|\Z))", clean_src, re.S)
+                if m:
+                    body = m.group(1)
+                    for sym in re.findall(r"\b[A-Za-z_]\w*\b", body):
+                        if sym not in stop_symbols and not sym.startswith("__"):
+                            called_symbols.add(sym)
+
+    return called_symbols
+
+
+def _ff18_diagnostic_context(called_symbols: set, messages: list, ev: list) -> str:
+    """Generate verbatim code windows from project source files for symbols tested/called in failing tests."""
+    if not called_symbols:
+        return ""
+
+    tracked = _ff9_read_texts(messages or [])
+    if ev:
+        for v in _ff8_file_views(ev):
+            p = v.get("path") or ""
+            if p and p not in tracked:
+                tracked[p] = v.get("text") or ""
+
+    out_blocks = []
+    budget_remaining = 24000
+
+    for fpath, full_src in tracked.items():
+        if not full_src or _ff16_is_plan_doc(fpath) or _is_doc(fpath) or _is_test_path(fpath):
+            continue
+        clean_src, _ = _ff17_strip_numbered_lines(full_src)
+        src_lines = clean_src.splitlines()
+
+        try:
+            tree = _ff5_ast.parse(clean_src)
+        except Exception:
+            tree = None
+
+        matched_windows = []
+        if tree is not None:
+            for node in _ff5_ast.walk(tree):
+                if isinstance(node, (_ff5_ast.FunctionDef, _ff5_ast.AsyncFunctionDef)):
+                    if node.name in called_symbols:
+                        s_ln = max(1, node.lineno - 2)
+                        e_ln = min(len(src_lines), getattr(node, "end_lineno", node.lineno) + 2)
+                        matched_windows.append((s_ln, e_ln, node.name))
+                elif isinstance(node, _ff5_ast.ClassDef):
+                    if node.name in called_symbols:
+                        s_ln = max(1, node.lineno - 2)
+                        e_ln = min(len(src_lines), getattr(node, "end_lineno", node.lineno) + 2)
+                        matched_windows.append((s_ln, e_ln, node.name))
+            for node in getattr(tree, "body", []):
+                if isinstance(node, _ff5_ast.Assign):
+                    for t in node.targets:
+                        if isinstance(t, _ff5_ast.Name) and t.id in called_symbols:
+                            s_ln = max(1, node.lineno - 2)
+                            e_ln = min(len(src_lines), getattr(node, "end_lineno", node.lineno) + 2)
+                            matched_windows.append((s_ln, e_ln, t.id))
+        else:
+            ident_pat = "|".join(re.escape(x) for x in sorted(called_symbols) if len(x) >= 3)
+            if ident_pat:
+                def_rx = re.compile(rf"^([ \t]*)(?:async\s+def|def)\s+({ident_pat})\b|^([ \t]*)({ident_pat})\s*=")
+                for idx_ln, ln_str in enumerate(src_lines, 1):
+                    m_d = def_rx.match(ln_str)
+                    if m_d:
+                        sym = m_d.group(2) or m_d.group(4)
+                        s_ln = max(1, idx_ln - 2)
+                        e_ln = min(len(src_lines), idx_ln + 40)
+                        matched_windows.append((s_ln, e_ln, sym))
+
+        if not matched_windows:
+            continue
+
+        matched_windows.sort()
+        merged = []
+        for s_ln, e_ln, wname in matched_windows:
+            if merged and s_ln <= merged[-1][1] + 5:
+                prev_s, prev_e, prev_n = merged[-1]
+                new_n = prev_n if wname in prev_n.split(",") else (prev_n + "," + wname)
+                merged[-1] = (prev_s, max(prev_e, e_ln), new_n)
+            else:
+                merged.append((s_ln, e_ln, wname))
+
+        file_excerpts = [
+            f"[Diagnostic Source Windows for Failing Test Symbols ({fpath}):]"
+        ]
+        for s_ln, e_ln, wnames in merged:
+            snippet = "\n".join(src_lines[s_ln - 1:e_ln])
+            if len(snippet) > budget_remaining and len(file_excerpts) > 1:
+                break
+            header = f"--- {fpath} lines {s_ln}-{e_ln} ({wnames}) ---"
+            file_excerpts.append(header + "\n" + snippet)
+            budget_remaining -= len(snippet)
+            if budget_remaining <= 0:
+                break
+        if len(file_excerpts) > 1:
+            out_blocks.append("\n\n".join(file_excerpts))
+
+    return "\n\n".join(out_blocks)
+
+
+_ff18_prev_change_tail = _change_tail
+
+
+def _change_tail(pat, ctx, ev, tm, names_all, total, extra=""):
+    if not _ff18_c("flow18_enabled", True):
+        return _ff18_prev_change_tail(pat, ctx, ev, tm, names_all, total, extra=extra)
+
+    try:
+        msgs = getattr(_ff8_tls, "messages", None)
+        acts = [e for e in ev if e.get("kind") == "act"]
+        runs = _test_runs(ev)
+        last_act = max((i for i, e in enumerate(ev) if e.get("kind") == "act"), default=-1)
+        after = [r for r in runs if r[0] > last_act]
+
+        if after and tm.first("act"):
+            failed_test = next((r for r in reversed(after) if test_outcome(r[2]) in ("fail", "broken")), None)
+            if failed_test is not None:
+                progression = _ff18_analyze_failure_progression(ev)
+                rounds_used = progression["rounds_used"]
+                bonus_rounds = progression["bonus_rounds"]
+                base_max_rounds = int(_ff18_c("flow18_max_repair_rounds", 4) or 4)
+                effective_max_rounds = base_max_rounds + bonus_rounds
+                hard_max_acts = int(_ff18_c("flow18_hard_max_acts", 24) or 24)
+
+                log(
+                    f"[fix18] round={rounds_used}/{effective_max_rounds} (bonus={bonus_rounds}) "
+                    f"progress={'no' if progression['is_no_progress'] else 'yes'} "
+                    f"fp={progression['latest_fingerprint']} acts={len(acts)}/{hard_max_acts}"
+                )
+
+                if rounds_used < effective_max_rounds and len(acts) < hard_max_acts:
+                    stale = [p for p in _ff9_stale_edits(ev) if p.lower().endswith(_SRC_EXT)][:4]
+                    if stale and tm.first("read"):
+                        return _read_step(
+                            pat, tm, stale, 2, total,
+                            instruction="Your last edit changed these files, so your copy is "
+                                        "stale. Re-read them before the next edit: "
+                                        + ", ".join(stale) + "."
+                        )
+
+                    failed_cmd, failed_res = failed_test[1], failed_test[2]
+                    excerpt_txt = _excerpt(failed_res, 1800)
+                    locs = failure_locations(failed_res)
+                    loc_str = ""
+                    if locs:
+                        loc_items = [f"{p}:{ln}" for p, ln in locs[:3]]
+                        loc_str = " Potential failure locations: " + ", ".join(loc_items) + "."
+
+                    msg = (
+                        f"The test command `{failed_cmd}` FAILED after your changes.{loc_str} "
+                        f"Analyze the traceback and fix the cause with an edit/write tool_call "
+                        f"(copy oldString verbatim from the file as it is now). "
+                        f"Test failure excerpt:\n{excerpt_txt}"
+                    )
+                    if progression["is_no_progress"]:
+                        called_syms = _ff18_extract_test_symbols(failed_res, msgs, ev)
+                        sym_str = ", ".join(f"`{s}`" for s in sorted(called_syms)[:8]) if called_syms else "the called functions"
+                        fn_str = ", ".join(f"`{n}`" for n in progression["failed_names"][:5])
+                        msg += (
+                            f"\n\n[DIAGNOSTIC NOTICE - REPEATED FAILURE]\n"
+                            f"WARNING: The test output is IDENTICAL to the previous run ({fn_str}). "
+                            f"Your last edit had NO effect on the failure. Do NOT repeat the same edit. "
+                            f"Check the implementation of {sym_str} in the source file vs how the test inspects them."
+                        )
+                    return Step(
+                        pat, "act", max(3, total - 2), total, {"act"},
+                        msg + _DO_NOT_DESCRIBE + extra,
+                        None, False, tm.names({"act"})
+                    )
+                else:
+                    st = _answer_step("CHANGE", ev, total, total, final=True)
+                    if st:
+                        st.pattern = pat
+                        if "_ff17_attach_audit_note_to_answer" in globals():
+                            st = _ff17_attach_audit_note_to_answer(st, msgs, ev, tested_after=True)
+                        if _ff18_c("flow18_honest_final", True) and progression["failed_names"]:
+                            fn_str = ", ".join(progression["failed_names"][:6])
+                            st.instruction = (st.instruction or "") + (
+                                f"\n\nCRITICAL: The following unit tests STILL FAIL: {fn_str}. "
+                                f"You MUST NOT claim that the task is completed or that all tests pass. "
+                                f"State clearly that the repair budget has been exhausted, list the failing tests ({fn_str}), "
+                                f"and explain what was implemented versus what remains unresolved."
+                            )
+                    return st
+    except Exception as ex:
+        log(f"[fix18] change_tail repair loop error: {ex}")
+
+    return _ff18_prev_change_tail(pat, ctx, ev, tm, names_all, total, extra=extra)
+
+
+_ff18_prev_after_plan = _ff5_after_plan
+
+
+def _ff5_after_plan(step, messages, tm, ctx=None):
+    step = _ff18_prev_after_plan(step, messages, tm, ctx)
+    if not _ff18_c("flow18_enabled", True):
+        return step
+    try:
+        if (step is not None and getattr(step, "name", None) == "act"
+                and getattr(step, "local_text", None) is None
+                and not getattr(step, "drive", False)):
+            ev = _answered_calls(messages or [])
+            runs = _test_runs(ev)
+            last_act = max((i for i, e in enumerate(ev) if e.get("kind") == "act"), default=-1)
+            after = [r for r in runs if r[0] > last_act]
+            last_test_res = after[-1][2] if after else (runs[-1][2] if runs else "")
+            if test_outcome(last_test_res) in ("fail", "broken"):
+                progression = _ff18_analyze_failure_progression(ev)
+                if progression["is_no_progress"]:
+                    called_syms = _ff18_extract_test_symbols(last_test_res, messages, ev)
+                    diag_pack = _ff18_diagnostic_context(called_syms, messages, ev)
+                    if diag_pack and "[Diagnostic Source Windows" not in (step.instruction or ""):
+                        step.instruction = (step.instruction or "") + "\n\n" + diag_pack
+    except Exception as e:
+        log(f"[fix18] after_plan diagnostic context error: {e}")
+    return step
+
+
+_ff18_prev_postfilter = _ff5_postfilter
+
+_VI_FALSE_COMPLETION = re.compile(
+    r"(?i)\b(?:đã\s+(?:được\s+)?hoàn\s+(?:tất|thành)|hoàn\s+thành\s+(?:100%|toàn\s+bộ|mọi\s+bước)"
+    r"|triển\s+khai\s+thành\s+công|tất\s+cả\s+(?:các\s+)?test\s+(?:đều\s+)?pass)\b"
+)
+_EN_FALSE_COMPLETION = re.compile(
+    r"(?i)\b(?:all\s+tests?\s+(?:have\s+)?pass(?:ed)?|successfully\s+(?:implemented|completed)"
+    r"|implementation\s+is\s+complete|everything\s+is\s+(?:working|done|fixed))\b"
+)
+_HONEST_KEYWORDS = re.compile(
+    r"(?i)\b(?:fail(?:ed|ing|ure|s)?|chưa\s+pass|chưa\s+hoàn\s+thành|lỗi|error"
+    r"|AssertionError|tuy\s+nhiên|however|unresolved|budget\s+exhausted|còn\s+vướng)\b"
+)
+
+
+def _ff5_postfilter(result, messages, perm=None, last=True, tm=None, ctx=None):
+    res, nudge = _ff18_prev_postfilter(result, messages, perm, last, tm, ctx)
+    if nudge is not None or not _ff18_c("flow18_honest_final", True):
+        return res, nudge
+    if not (isinstance(res, tuple) and len(res) == 2):
+        return res, nudge
+    text, calls = res
+    if calls or not text:
+        return res, nudge
+
+    try:
+        ev = _answered_calls(messages or [])
+        runs = _test_runs(ev)
+        if not runs:
+            return res, nudge
+        last_test = runs[-1]
+        if test_outcome(last_test[2]) not in ("fail", "broken"):
+            return res, nudge
+
+        failed_names = _ff18_failed_test_names(last_test[2])
+        fn_str = ", ".join(failed_names[:6]) if failed_names else "unit tests"
+
+        is_false_claim = (
+            (_VI_FALSE_COMPLETION.search(text) or _EN_FALSE_COMPLETION.search(text))
+            and not _HONEST_KEYWORDS.search(text)
+        )
+        if is_false_claim:
+            log(f"[fix18] honest_final detected false completion claim while tests fail: {fn_str}")
+            if not last:
+                nudge_msg = (
+                    f"CRITICAL REQUIREMENT: Unit tests ({fn_str}) still FAIL. "
+                    f"Do NOT claim the task is completed or that all tests pass. "
+                    f"Plainly report what was implemented, that tests still fail ({fn_str}), and why."
+                )
+                return None, nudge_msg
+            else:
+                last_user = _ff5_last_user_text(messages)
+                vi = bool(_VI_RE.search(last_user.lower())) or bool(_VI_RE.search(text.lower()))
+                if vi:
+                    notice = f"⚠️ [Lưu ý: Quá trình tự sửa lỗi đã dừng và vẫn còn test chưa pass: {fn_str}]\n\n"
+                else:
+                    notice = f"⚠️ [Note: Self-healing budget reached and tests are still failing: {fn_str}]\n\n"
+                return (notice + text, calls), None
+    except Exception as ex:
+        log(f"[fix18] honest_final postfilter error: {ex}")
+
+    return res, nudge
+
+
+_ff18_prev_install = install
+
+
+def install():
+    _ff18_prev_install()
+    for k, v in _FF18_DEFAULTS.items():
+        CONFIG.setdefault(k, v)
+    log("[fix18] flow_fix18 installed")
+# ==== flowfix18:end ====
 
 if __name__ == "__main__":
     main()
