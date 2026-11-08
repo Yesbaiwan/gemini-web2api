@@ -19559,7 +19559,28 @@ def _ff17_extract_verification_commands(messages, names=None, ev=None) -> list:
         return 0
 
     raw_cmds.sort(key=_cmd_weight)
-    return raw_cmds
+
+    # Filter out commands referencing .py files that do not exist yet in tracked texts or on disk
+    tracked = _ff9_read_texts(messages or [])
+    if ev:
+        for v in _ff8_file_views(ev):
+            p = v.get("path") or ""
+            if p and p not in tracked:
+                tracked[p] = v.get("text") or ""
+
+    filtered = []
+    for cmd in raw_cmds:
+        file_refs = re.findall(r'(?:^|\s)((?:[\w./\\-]+/)*[\w-]+\.py)\b', cmd)
+        if file_refs:
+            if all(
+                (tracked.get(f) or tracked.get(f.replace("\\", "/")) or tracked.get(f.replace("/", "\\")) or "").strip()
+                or os.path.exists(f) or os.path.exists(f.replace("\\", "/"))
+                for f in file_refs
+            ):
+                filtered.append(cmd)
+        else:
+            filtered.append(cmd)
+    return filtered
 
 
 def pick_test_command(names, ev):
@@ -19594,10 +19615,28 @@ def pick_test_command(names, ev):
     after = [r for r in runs if r[0] > last_act]
     broken_cmds = {cmd.strip() for _i, cmd, res in runs
                    if test_outcome(res) == "broken"}
+    tracked = _ff9_read_texts(getattr(_ff8_tls, "messages", None) or [])
+    if ev:
+        for v in _ff8_file_views(ev):
+            p = v.get("path") or ""
+            if p and p not in tracked:
+                tracked[p] = v.get("text") or ""
+
+    def _cmd_target_exists(cmd_s):
+        file_refs = re.findall(r'(?:^|\s)((?:[\w./\\-]+/)*[\w-]+\.py)\b', cmd_s)
+        if file_refs:
+            return all(
+                (tracked.get(f) or tracked.get(f.replace("\\", "/")) or tracked.get(f.replace("/", "\\")) or "").strip()
+                or os.path.exists(f) or os.path.exists(f.replace("\\", "/"))
+                for f in file_refs
+            )
+        return True
+
     if not after:
         for c in cands:
-            if c.strip() not in broken_cmds:
-                return c
+            c_s = c.strip()
+            if c_s not in broken_cmds and _cmd_target_exists(c_s):
+                return c_s
         return _ff17_prev_pick_test_command(names, ev)
     if test_outcome(after[-1][2]) != "broken":
         return None
@@ -19605,8 +19644,9 @@ def pick_test_command(names, ev):
         return None
     tried = {cmd.strip() for _i, cmd, _r in after}
     for c in cands:
-        if c.strip() not in tried and c.strip() not in broken_cmds:
-            return c
+        c_s = c.strip()
+        if c_s not in tried and c_s not in broken_cmds and _cmd_target_exists(c_s):
+            return c_s
     return None
 
 
@@ -20909,7 +20949,7 @@ def _ff17_evaluate_plan_steps(ctx, ev, messages, pending_calls=None, step_name=N
             ln for ln in st_full.splitlines() if not ln.lstrip().startswith("#")
         )
         st_files = [
-            f for f in T._files_in(T._strip_fences(body_without_heading))
+            f for f in T._files_in(T._strip_fences(st_full))
             if f.lower() not in T._NON_FILE_NAMES and not _ff16_is_plan_doc(f) and not _is_doc(f)
             and f.lower().endswith(_SRC_EXT)
         ]
@@ -20932,8 +20972,8 @@ def _ff17_evaluate_plan_steps(ctx, ev, messages, pending_calls=None, step_name=N
             ]
         )
         uncreated_st_files = [
-            sf for sf in st_files
-            if not any(_ff12_same_file(sf, ef) for ef in edited_files)
+            f for f in st_files
+            if not ((tracked_map.get(f) or tracked_map.get(f.replace("\\", "/")) or tracked_map.get(f.replace("/", "\\")) or "").strip())
         ]
         if is_test_step:
             done = len(uncreated_st_files) == 0 and len(missing_reqs) == 0
@@ -21059,8 +21099,9 @@ def _ff17_remaining_plan_or_todo_work(ctx, ev, messages) -> dict:
         uncreated_files.append("tests/test_new_feature.py")
 
     # 4. Check plan compliance before completing all plan work
+    #    Run audit when no remaining todos/tokens, even if uncreated_files are still present
     if _ff17_c("flow17_plan_compliance_audit", True) and plan_bodies:
-        if not remaining_todos and not missing_plan_tokens and not uncreated_files:
+        if not remaining_todos and not missing_plan_tokens:
             audit_res = _ff17_audit_plan_compliance(messages, ev)
             if not audit_res["compliant"]:
                 for v in audit_res["violations"]:
@@ -21168,6 +21209,20 @@ def _change_tail(pat, ctx, ev, tm, names_all, total, extra=""):
                                 None, False, tm.names({"act"})
                             )
 
+                    # Before finishing: check if any plan files are still missing
+                    rem_final = _ff17_remaining_plan_or_todo_work(ctx, ev, msgs)
+                    if rem_final.get("uncreated_files") and len(acts) < total_max_acts and tm.first("act"):
+                        uc_str = ", ".join(rem_final["uncreated_files"][:4])
+                        msg = (
+                            f"Tests passed, but these plan files are still missing: "
+                            f"{uc_str}. Create them before finishing."
+                        )
+                        return Step(
+                            pat, "act", max(3, total - 2), total, {"act"},
+                            msg + _DO_NOT_DESCRIBE + extra,
+                            None, False, tm.names({"act"})
+                        )
+
                     st = _answer_step("CHANGE", ev, total, total)
                     if st:
                         st.pattern = pat
@@ -21224,6 +21279,19 @@ def _change_tail(pat, ctx, ev, tm, names_all, total, extra=""):
                         None, False, tm.names({"act"})
                     )
                 else:
+                    # Guard: if there are still uncreated files from the plan,
+                    # force act step instead of running tests on non-existent files
+                    if rem.get("uncreated_files") and len(acts) < plan_max_acts and tm.first("act"):
+                        uc_str = ", ".join(rem["uncreated_files"][:4])
+                        msg = (
+                            f"The following files from the plan have NOT been created yet: "
+                            f"{uc_str}. Create them now using write/edit tool_calls."
+                        )
+                        return Step(
+                            pat, "act", max(3, total - 2), total, {"act"},
+                            msg + _DO_NOT_DESCRIBE + extra,
+                            None, False, tm.names({"act"})
+                        )
                     cmd = pick_test_command(names_all, ev)
                     if cmd and tm.first("exec"):
                         return _tests_step(pat, tm, cmd, 4, total)
