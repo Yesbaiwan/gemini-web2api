@@ -22320,5 +22320,522 @@ def install():
     log("[fix18] flow_fix18 installed")
 # ==== flowfix18:end ====
 
+# ==== flowfix19:start ====
+# Flow Engine 19: corrected post-test repair convergence.
+#   1. _excerpt + fail-fingerprint keep swallowed handler errors
+#      ("GET error: ... takes 1 positional argument but 2 were given") that
+#      the old case-sensitive regex dropped -> diagnosis is no longer blind.
+#   2. Anti-oscillation: returning to an already-seen fingerprint is NOT
+#      progress and earns no bonus round.
+#   3. force-read has an exit condition (one read per act) and
+#      flow19_stop_after (5) > flow19_force_read_after (3).
+#   4. NEW: AST call-signature check on production edits -- catches
+#      self._needs_auth() missing the required `path` BEFORE the client runs it.
+#   5. Override signatures resolved via ast (last definition wins), scoped to
+#      non-test helper classes. No proxy-log scraping (tests run elsewhere).
+
+_FF19_DEFAULTS = {
+    "flow19_enabled": True,
+    "flow19_force_read_after": 3,
+    "flow19_stop_after": 5,            # must be > force_read_after
+    "flow19_anti_oscillation": True,
+    "flow19_call_sig_check": True,
+    "flow19_override_sigs": True,
+}
+_FLOW_DEFAULTS.update(_FF19_DEFAULTS)
+_DEFAULTS.update(_FF19_DEFAULTS)
+for _k19, _v19 in _FF19_DEFAULTS.items():
+    CONFIG.setdefault(_k19, _v19)
+
+
+def _ff19_c(key, default=None):
+    if not _flow_c("flow19_enabled", True):
+        return False
+    return _flow_c(key, _FF19_DEFAULTS.get(key, default))
+
+
+# --------------------------------------------------------------------------
+# 1a. _excerpt: keep swallowed handler-error lines (case-insensitive)
+# --------------------------------------------------------------------------
+_ff19_prev_excerpt = _excerpt
+_FF19_EXC_BASE = re.compile(
+    r"Traceback|^FAIL|^ERROR|AssertionError|Error:|\bfailed\b|not ok")
+_FF19_EXC_EXTRA = re.compile(
+    r"\b(?:GET|POST)\s+error\b|takes \d+ positional argument"
+    r"|unexpected keyword argument|missing \d+ required", re.IGNORECASE)
+
+
+def _excerpt(text, limit=1800):
+    if not _ff19_c("flow19_enabled"):
+        return _ff19_prev_excerpt(text, limit)
+    lines = (text or "").splitlines()
+    for i, ln in enumerate(lines):
+        if _FF19_EXC_BASE.search(ln) or _FF19_EXC_EXTRA.search(ln):
+            lines = lines[max(0, i - 2):]
+            break
+    return "\n".join(lines).strip()[:limit]
+
+
+# --------------------------------------------------------------------------
+# 1b. fail fingerprint: include the swallowed-error lines too
+# --------------------------------------------------------------------------
+_ff19_prev_fp = _ff18_fail_fingerprint
+
+
+def _ff18_fail_fingerprint(res):
+    if not _ff19_c("flow19_enabled"):
+        return _ff19_prev_fp(res)
+    if not res:
+        return ""
+    failed_names = _ff18_failed_test_names(res)
+    norm = res
+    norm = re.sub(r"Ran \d+ tests in [\d.]+s", "", norm)
+    norm = re.sub(r"line \d+", "line X", norm)
+    norm = re.sub(r":\d+:", ":X:", norm)
+    norm = re.sub(r"0x[0-9a-fA-F]+", "0xADDR", norm)
+    norm = re.sub(r'File "[^"\n]+"', 'File "<path>"', norm)
+    norm = re.sub(r"File '[^'\n]+'", "File '<path>'", norm)
+    norm = re.sub(r"(?i)(?:[a-z]:[\\/][^\s\"']*[\\/]temp[\\/]|/tmp/)tmp[a-z0-9_]+",
+                  "<tmp>", norm)
+    lines = [ln.strip() for ln in norm.splitlines()
+             if re.search(r"(?:FAIL|ERROR|FAILED|AssertionError|Exception|Error:)", ln)
+             or _FF19_EXC_EXTRA.search(ln)]
+    key_str = "|".join(failed_names) + "\n" + "\n".join(lines)
+    return _ff17_hashlib.sha256(key_str.encode("utf-8")).hexdigest()[:16]
+
+
+# --------------------------------------------------------------------------
+# 2. anti-oscillation: recompute progress with a seen-fingerprint set
+# --------------------------------------------------------------------------
+_ff19_prev_prog = _ff18_analyze_failure_progression
+
+
+def _ff18_analyze_failure_progression(ev):
+    res = _ff19_prev_prog(ev)
+    if not _ff19_c("flow19_enabled") or not _ff19_c("flow19_anti_oscillation"):
+        return res
+    try:
+        failed_runs = [r for r in _test_runs(ev)
+                       if test_outcome(r[2]) in ("fail", "broken")]
+        if len(failed_runs) < 2:
+            return res
+        fps = [_ff18_fail_fingerprint(r[2]) for r in failed_runs]
+        seen = {fps[0]}
+        progress = 0
+        for j in range(1, len(failed_runs)):
+            prev_idx, cur_idx = failed_runs[j - 1][0], failed_runs[j][0]
+            had_acts = any(ev[k].get("kind") == "act"
+                           for k in range(prev_idx + 1, cur_idx))
+            # a fingerprint we have seen before (oscillation) is NOT progress
+            if had_acts and fps[j] != fps[j - 1] and fps[j] not in seen:
+                progress += 1
+            seen.add(fps[j])
+        bonus_cap = int(_ff18_c("flow18_progress_bonus_rounds", 2) or 2)
+        res["progress_count"] = progress
+        res["bonus_rounds"] = min(bonus_cap, progress)
+    except Exception as e:
+        log("[fix19] anti-oscillation error: %s" % e)
+    return res
+
+
+# --------------------------------------------------------------------------
+# streak helpers (fp streak drives stop; name streak drives force-read)
+# --------------------------------------------------------------------------
+def _ff19_streak(ev, key_fn):
+    failed = [r for r in _test_runs(ev)
+              if test_outcome(r[2]) in ("fail", "broken")]
+    if len(failed) < 2:
+        return 0
+    keys = [key_fn(r[2]) for r in failed]
+    streak = 1
+    for j in range(len(failed) - 1, 0, -1):
+        prev_idx, cur_idx = failed[j - 1][0], failed[j][0]
+        had_acts = any(e.get("kind") == "act"
+                       for e in ev[prev_idx + 1:cur_idx])
+        if had_acts and keys[j] == keys[j - 1] and keys[j]:
+            streak += 1
+        else:
+            break
+    return streak
+
+
+def _ff19_fp_streak(ev):
+    return _ff19_streak(ev, _ff18_fail_fingerprint)
+
+
+def _ff19_names_streak(ev):
+    return _ff19_streak(ev, lambda r: frozenset(_ff18_failed_test_names(r)))
+
+
+# --------------------------------------------------------------------------
+# tracked sources / noise filter (shared by read-targets + override sigs)
+# --------------------------------------------------------------------------
+def _ff19_tracked_sources(messages):
+    try:
+        tracked = dict(_ff9_read_texts(messages or []))
+    except Exception:
+        tracked = {}
+    try:
+        for v in _ff8_file_views(_answered_calls(messages or [])):
+            p = v.get("path") or ""
+            if p and p not in tracked:
+                tracked[p] = v.get("text") or ""
+    except Exception:
+        pass
+    return tracked
+
+
+def _ff19_is_noise(p):
+    try:
+        return _is_test_path(p) or _is_doc(p) or _ff16_is_plan_doc(p)
+    except Exception:
+        return False
+
+
+def _ff19_read_targets(ev, messages, failed_res):
+    syms = set()
+    try:
+        syms |= _ff18_extract_test_symbols(failed_res, messages, ev)
+    except Exception:
+        pass
+    try:
+        syms |= _ff19_override_symbols(messages)
+    except Exception:
+        pass
+    targets = []
+    for fpath, src in _ff19_tracked_sources(messages).items():
+        if _ff19_is_noise(fpath) or not src:
+            continue
+        for s in syms:
+            if re.search(r"(?:def|class)\s+" + re.escape(s) + r"\b", src):
+                targets.append(fpath)
+                break
+    return targets
+
+
+# --------------------------------------------------------------------------
+# 5. override symbols + signatures via ast (scoped, last-definition-wins)
+# --------------------------------------------------------------------------
+def _ff19_override_symbols(messages):
+    out = set()
+    if not _ff19_c("flow19_override_sigs"):
+        return out
+    for fpath, src in _ff19_tracked_sources(messages).items():
+        if not _is_test_path(fpath):
+            continue
+        try:
+            tree = _ff5_ast.parse(src)
+        except Exception:
+            continue
+        for node in _ff5_ast.walk(tree):
+            # helper/double classes only: skip the TestCase class itself
+            if isinstance(node, _ff5_ast.ClassDef) and \
+                    not node.name.lower().startswith("test"):
+                for item in node.body:
+                    if isinstance(item, (_ff5_ast.FunctionDef,
+                                         _ff5_ast.AsyncFunctionDef)):
+                        nm = item.name
+                        if nm.startswith("test") or nm.startswith("__") or \
+                                nm in ("setUp", "tearDown",
+                                       "setUpClass", "tearDownClass"):
+                            continue
+                        out.add(nm)
+            # handler.foo.return_value = ... -> mocked method `foo`
+            if isinstance(node, _ff5_ast.Attribute) and \
+                    node.attr in ("return_value", "side_effect") and \
+                    isinstance(node.value, _ff5_ast.Attribute):
+                out.add(node.value.attr)
+    return out
+
+
+def _ff19_format_sig(name, node):
+    a = node.args
+    parts = []
+    n, ndef = len(a.args), len(a.defaults)
+    for i, arg in enumerate(a.args):
+        s = arg.arg
+        di = i - (n - ndef)
+        if 0 <= di < len(a.defaults):
+            try:
+                s += "=" + _ff5_ast.unparse(a.defaults[di])
+            except Exception:
+                s += "=?"
+        parts.append(s)
+    if a.vararg:
+        parts.append("*" + a.vararg.arg)
+    elif a.kwonlyargs:
+        parts.append("*")
+    for i, arg in enumerate(a.kwonlyargs):
+        s = arg.arg
+        if i < len(a.kw_defaults) and a.kw_defaults[i] is not None:
+            try:
+                s += "=" + _ff5_ast.unparse(a.kw_defaults[i])
+            except Exception:
+                s += "=?"
+        parts.append(s)
+    if a.kwarg:
+        parts.append("**" + a.kwarg.arg)
+    return "def %s(%s)" % (name, ", ".join(parts))
+
+
+def _ff19_signature_windows(symbols, messages, limit=30):
+    if not symbols:
+        return ""
+    lines = []
+    for fpath, src in _ff19_tracked_sources(messages).items():
+        if _ff19_is_noise(fpath):
+            continue
+        try:
+            tree = _ff5_ast.parse(src)
+        except Exception:
+            continue
+        # last definition wins (file has many flowfix re-definitions)
+        defs = {}
+        for node in _ff5_ast.walk(tree):
+            if isinstance(node, (_ff5_ast.FunctionDef,
+                                 _ff5_ast.AsyncFunctionDef)) \
+                    and node.name in symbols:
+                ln = getattr(node, "lineno", 0)
+                if node.name not in defs or ln > defs[node.name][0]:
+                    defs[node.name] = (ln, node)
+        for name, (ln, node) in defs.items():
+            lines.append("%s:%d: %s" % (fpath, ln, _ff19_format_sig(name, node)))
+            if len(lines) >= limit:
+                break
+    return "\n".join(lines[:limit])
+
+
+# --------------------------------------------------------------------------
+# 3. _change_tail: force-read (with exit) + late stop
+# --------------------------------------------------------------------------
+_ff19_prev_change_tail = _change_tail
+
+
+def _change_tail(pat, ctx, ev, tm, names_all, total, extra=""):
+    if not _ff19_c("flow19_enabled"):
+        return _ff19_prev_change_tail(pat, ctx, ev, tm, names_all, total, extra=extra)
+    try:
+        msgs = getattr(_ff8_tls, "messages", None)
+        runs = _test_runs(ev)
+        last_act = max((i for i, e in enumerate(ev)
+                        if e.get("kind") == "act"), default=-1)
+        after = [r for r in runs if r[0] > last_act]
+        if after and tm.first("act"):
+            failed_test = next((r for r in reversed(after)
+                                if test_outcome(r[2]) in ("fail", "broken")), None)
+            if failed_test is not None:
+                failed_res = failed_test[2]
+                fp_streak = _ff19_fp_streak(ev)
+                names_streak = _ff19_names_streak(ev)
+                stop_after = int(_ff19_c("flow19_stop_after", 5))
+                force_read_after = int(_ff19_c("flow19_force_read_after", 3))
+
+                # late stop: identical fingerprint many rounds in a row
+                if fp_streak >= stop_after:
+                    st = _answer_step("CHANGE", ev, total, total, final=True)
+                    if st:
+                        st.pattern = pat
+                        if "_ff17_attach_audit_note_to_answer" in globals():
+                            st = _ff17_attach_audit_note_to_answer(
+                                st, msgs, ev, tested_after=True)
+                        fnames = _ff18_failed_test_names(failed_res)
+                        fn_str = ", ".join(fnames[:6]) or "unit tests"
+                        st.instruction = (st.instruction or "") + (
+                            "\n\nCRITICAL: Repair STOPPED EARLY after %d "
+                            "consecutive rounds with an IDENTICAL error "
+                            "signature. Tests STILL FAIL: %s. Do NOT claim "
+                            "success." % (fp_streak, fn_str))
+                        return st
+
+                # force-read once per act (exit condition: a read after the
+                # last act lifts the force until the next act)
+                read_after_act = any(e.get("kind") == "read"
+                                     for e in ev[last_act + 1:])
+                if names_streak >= force_read_after and not read_after_act \
+                        and tm.first("read"):
+                    targets = _ff19_read_targets(ev, msgs, failed_res)
+                    if targets:
+                        return _read_step(
+                            pat, tm, targets[:4], 2, total,
+                            instruction=(
+                                "Repair has made NO progress on the SAME "
+                                "failing test for %d rounds. STOP guessing "
+                                "and READ the source of the code under test "
+                                "BEFORE editing again: %s."
+                                % (names_streak, ", ".join(targets[:4]))))
+    except Exception as ex:
+        log("[fix19] change_tail pre-pass error: %s" % ex)
+    return _ff19_prev_change_tail(pat, ctx, ev, tm, names_all, total, extra=extra)
+
+
+# --------------------------------------------------------------------------
+# 4. AST call-signature check on production edits (the high-value one)
+# --------------------------------------------------------------------------
+def _ff19_check_self_calls(path, post_src):
+    """Conservative self.<method>() arity check.
+
+    Goals:
+    - catch obvious new bugs like self._needs_auth() when the method is
+      def _needs_auth(self, path)
+    - do NOT reject valid dynamic calls such as:
+        self.send_api_error(*_map_upstream_error(e))
+        self.foo(**kwargs)
+    - resolve methods by the enclosing class, not one global name table.
+    """
+    problems = []
+    try:
+        tree = _ff5_ast.parse(post_src)
+    except Exception:
+        return problems
+
+    def method_info(fn):
+        if getattr(fn, "decorator_list", None):
+            return None
+        a = fn.args
+        pos = list(getattr(a, "posonlyargs", ())) + list(a.args)
+        if not pos or pos[0].arg not in ("self", "cls"):
+            return None
+
+        total_with_receiver = len(pos)
+        required_with_receiver = max(0, total_with_receiver - len(a.defaults))
+        req = max(0, required_with_receiver - 1)
+        mx = max(0, total_with_receiver - 1)
+        return req, mx, a.vararg is not None
+
+    class Visitor(_ff5_ast.NodeVisitor):
+        def __init__(self):
+            self.class_stack = []
+
+        def visit_ClassDef(self, node):
+            methods = {}
+            for item in node.body:
+                if isinstance(item, (_ff5_ast.FunctionDef, _ff5_ast.AsyncFunctionDef)):
+                    info = method_info(item)
+                    if info is not None:
+                        # Last definition wins inside this class.
+                        methods[item.name] = info
+            self.class_stack.append((node.name, methods))
+            self.generic_visit(node)
+            self.class_stack.pop()
+
+        def visit_Call(self, node):
+            try:
+                if self.class_stack:
+                    fn = node.func
+                    if (isinstance(fn, _ff5_ast.Attribute)
+                            and isinstance(fn.value, _ff5_ast.Name)
+                            and fn.value.id == "self"):
+                        # Dynamic shapes: do not guess.
+                        if node.keywords:
+                            self.generic_visit(node)
+                            return
+                        if any(isinstance(arg, _ff5_ast.Starred) for arg in node.args):
+                            self.generic_visit(node)
+                            return
+
+                        name = fn.attr
+                        methods = self.class_stack[-1][1]
+                        if name in methods:
+                            req, mx, has_var = methods[name]
+                            given = len(node.args)
+                            if has_var:
+                                if given < req:
+                                    problems.append(
+                                        "%s: self.%s() needs at least %d positional "
+                                        "arg(s) but the new code passes %d"
+                                        % (path, name, req, given))
+                            elif given < req or given > mx:
+                                problems.append(
+                                    "%s: self.%s() expects %d-%d positional "
+                                    "arg(s) but the new code passes %d"
+                                    % (path, name, req, mx, given))
+            except Exception:
+                pass
+            self.generic_visit(node)
+
+    Visitor().visit(tree)
+    return problems
+
+
+_ff19_prev_gate = _gate_act_calls
+
+
+def _gate_act_calls(calls, messages):
+    out, problems = _ff19_prev_gate(calls, messages)
+    if not _ff19_c("flow19_enabled") or not _ff19_c("flow19_call_sig_check"):
+        return out, problems
+    try:
+        texts = _ff9_read_texts(messages)
+        for tc in out:
+            fn = (tc or {}).get("function") or {}
+            if tool_kind(fn.get("name")) != "act":
+                continue
+            args = T._tool_arguments_dict(fn)
+            path = _call_path(args)
+            if not path or not path.lower().endswith(".py") or _is_test_path(path):
+                continue
+            nkey = next((k for k in _NEW_KEYS if isinstance(args.get(k), str)), None)
+            if not nkey:
+                continue
+            new_code = args[nkey]
+            okey = next((k for k in _OLD_KEYS
+                         if isinstance(args.get(k), str) and args[k]), None)
+            old_code = args.get(okey) if okey else ""
+            tk = _ff17_find_key(texts, path) if "_ff17_find_key" in globals() else None
+            full = texts.get(tk or path) or ""
+            if not full:
+                continue
+            post = full.replace(old_code, new_code, 1) if old_code else full
+            problems.extend(_ff19_check_self_calls(path, post))
+    except Exception as ex:
+        log("[fix19] call-sig gate error: %s" % ex)
+    return out, problems
+
+
+# --------------------------------------------------------------------------
+# enrich guided act step with ast override signatures while a test fails
+# --------------------------------------------------------------------------
+_ff19_prev_after_plan = _ff5_after_plan
+
+
+def _ff5_after_plan(step, messages, tm, ctx=None):
+    step = _ff19_prev_after_plan(step, messages, tm, ctx)
+    if not _ff19_c("flow19_enabled") or not _ff19_c("flow19_override_sigs"):
+        return step
+    try:
+        if step is not None and getattr(step, "name", None) == "act" \
+                and getattr(step, "local_text", None) is None \
+                and not getattr(step, "drive", False):
+            ev = _answered_calls(messages or [])
+            runs = _test_runs(ev)
+            last_act = max((i for i, e in enumerate(ev)
+                            if e.get("kind") == "act"), default=-1)
+            after = [r for r in runs if r[0] > last_act]
+            last_res = after[-1][2] if after else (runs[-1][2] if runs else "")
+            if test_outcome(last_res) in ("fail", "broken"):
+                sigs = _ff19_signature_windows(
+                    _ff19_override_symbols(messages), messages)
+                if sigs and "[fix19 override signatures]" not in (step.instruction or ""):
+                    step.instruction = (step.instruction or "") + (
+                        "\n\n[fix19 override signatures -- your test doubles "
+                        "MUST match these exactly:]\n" + sigs)
+    except Exception as e:
+        log("[fix19] after_plan override-sig error: %s" % e)
+    return step
+
+
+# --------------------------------------------------------------------------
+# install
+# --------------------------------------------------------------------------
+_ff19_prev_install = install
+
+
+def install():
+    _ff19_prev_install()
+    for k, v in _FF19_DEFAULTS.items():
+        CONFIG.setdefault(k, v)
+    log("[fix19] flow_fix19 installed (excerpt/fingerprint fix + "
+        "anti-oscillation + force-read + AST call-sig gate)")
+# ==== flowfix19:end ====
 if __name__ == "__main__":
     main()

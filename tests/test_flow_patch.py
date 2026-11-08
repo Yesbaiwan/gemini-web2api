@@ -2029,5 +2029,63 @@ class TestFlowEngineEnhancements(unittest.TestCase):
         self.assertEqual(res_tuple, final_res3)
 
 
+class TestFlowFix19(unittest.TestCase):
+    """Flow Engine 19 regression tests."""
+
+    def test_ff19_self_call_gate_ignores_starred_args(self):
+        """Star-unpacked calls like self.send_api_error(*_map_upstream_error(e)) must not trigger false positive arity errors."""
+        src = '''
+class GeminiHandler:
+    def send_api_error(self, status, message, type_=None, code=None):
+        pass
+
+    def f(self, e):
+        self.send_api_error(*_map_upstream_error(e))
+'''
+        probs = F._ff19_check_self_calls("gemini_web2api.py", src)
+        self.assertEqual([], probs)
+
+    def test_ff19_self_call_gate_catches_missing_path(self):
+        """Calls with missing required arguments like self._needs_auth() when method expects (self, path) must be detected."""
+        src = '''
+class GeminiHandler:
+    def _needs_auth(self, path):
+        return True
+
+    def do_GET(self):
+        path = "/v1/cookies/pool"
+        if self._needs_auth() and not self._authorized():
+            return
+'''
+        probs = F._ff19_check_self_calls("gemini_web2api.py", src)
+        self.assertTrue(len(probs) > 0)
+        self.assertTrue(any("_needs_auth" in p and "expects 1-1" in p for p in probs), probs)
+
+    def test_ff19_self_call_gate_scopes_methods_by_class(self):
+        """A same-named method in another class must not lend its signature.
+
+        Only the enclosing class's definition applies, so ``B.f(self)`` is
+        valid even though ``A.f(self, x)`` requires an argument.
+        """
+        src = '''
+class A:
+    def f(self, x):
+        return x
+
+    def bad(self):
+        self.f()
+
+class B:
+    def f(self):
+        return 1
+
+    def good(self):
+        self.f()
+'''
+        probs = F._ff19_check_self_calls("gemini_web2api.py", src)
+        self.assertEqual(1, len(probs), probs)
+        self.assertIn("self.f() expects 1-1", probs[0])
+
+
 if __name__ == "__main__":
     unittest.main()
