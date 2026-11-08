@@ -533,3 +533,226 @@ class TestReportedInvestigationAndReviewFixes(unittest.TestCase):
         cleaned = M.clean_text(glitched)
         self.assertTrue(cleaned.startswith("Qua điều tra source code trong file `gemini_web2api.py`"))
         self.assertNotIn("`geminiQua", cleaned)
+
+    def test_plan_files_ignores_threading_lock_section_headers_and_json_examples(self):
+        """Regression for conversation.txt Sec 20+: _ff16_plan_files and _ff17_remaining_plan_or_todo_work
+        must ignore threading.Lock, `# Section: config.py`, and `./cookie1.json` config examples."""
+        plan_md = (
+            "# Feature Implementation Plan: Multi-Cookie Pool\n"
+            "1. **Single-File Architecture:** Toàn bộ mã nguồn nằm trong `gemini_web2api.py` "
+            "(được chia thành các `# Section: config.py`, `gemini.py`, `server.py`, v.v.).\n"
+            "2. **Thread-Safety:** Sử dụng `threading.Lock` khi đọc/ghi trạng thái.\n"
+            "### Bước 1: Mở rộng Cấu hình (`# Section: config.py`)\n"
+            "- [ ] Thêm các tùy chọn cấu hình mới vào `DEFAULT_CONFIG`:\n"
+            "  - `\"cookie_pool\": []` (Danh sách đường dẫn file cookie JSON, ví dụ: `[\"./cookie1.json\", \"./cookie2.json\"]`)\n"
+            "  - `\"cookie_pool_strategy\": \"round_robin\"`\n"
+            "  - `\"cookie_cooldown_sec\": 300`\n"
+            "### Bước 5: Kiểm thử (`tests/test_cookie_pool.py`)\n"
+            "- [ ] Tạo file unit test mới `tests/test_cookie_pool.py` sử dụng `unittest`.\n"
+        )
+        msgs = [
+            {"role": "user", "content": "Hãy đọc file feature_implementation_plan.md và implement tính năng theo đúng các bước trong plan đó."},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "read", "arguments": json.dumps({"filePath": "feature_implementation_plan.md"})}},
+            ]},
+            {"role": "tool", "tool_call_id": "c1", "name": "read", "content": plan_md},
+        ]
+        ctx = M._analyze(msgs)
+        listing = ["gemini_web2api.py", "tests/test_server.py"]
+        pfiles = M._ff16_plan_files(ctx, msgs, listing)
+        self.assertEqual(["gemini_web2api.py", "tests/test_cookie_pool.py"], pfiles)
+        self.assertNotIn("threading.Lock", M._files_in(plan_md))
+        rem = M._ff17_remaining_plan_or_todo_work(ctx, M._answered_calls(msgs), msgs)
+        self.assertEqual(["tests/test_cookie_pool.py"], rem["uncreated_files"])
+
+    def test_todo_blocks_prioritize_checkboxes_and_track_sub_bullet_config_keys(self):
+        """Regression for conversation.txt Sec 20-38: _ff16_extract_todo_items must prioritize `- [ ]`
+        checkboxes over numbered constraint items and track indented sub-bullet config keys."""
+        plan_md = (
+            "## 2. Constraints & Project Guidelines\n"
+            "1. **Single-File Architecture:** Toàn bộ mã nguồn nằm trong `gemini_web2api.py`.\n"
+            "2. **Zero External Dependencies:** Chỉ sử dụng Python Standard Library.\n"
+            "## 3. Implementation Phases\n"
+            "- [ ] Thêm các tùy chọn cấu hình mới vào `DEFAULT_CONFIG`:\n"
+            "  - `\"cookie_pool\": []`\n"
+            "  - `\"cookie_pool_strategy\": \"round_robin\"`\n"
+            "  - `\"cookie_cooldown_sec\": 300`\n"
+            "- [ ] Viết hàm `init_cookie_pool() -> None`:\n"
+            "  - Đọc danh sách từ `CONFIG.get(\"cookie_pool\")`.\n"
+        )
+        msgs = [
+            {"role": "user", "content": "Hãy đọc file feature_implementation_plan.md và implement."},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "read", "arguments": json.dumps({"filePath": "feature_implementation_plan.md"})}},
+                {"id": "c2", "type": "function", "function": {"name": "read", "arguments": json.dumps({"filePath": "gemini_web2api.py"})}},
+            ]},
+            {"role": "tool", "tool_call_id": "c1", "name": "read", "content": plan_md},
+            {"role": "tool", "tool_call_id": "c2", "name": "read", "content": "DEFAULT_CONFIG = {\"port\": 8000}\n"},
+        ]
+        ctx = M._analyze(msgs)
+        items = M._ff16_extract_todo_items(ctx, msgs)
+        self.assertEqual(2, len(items))
+        self.assertIn("DEFAULT_CONFIG", items[0])
+        ledger_before = M._ff16_todo_ledger(ctx, msgs)
+        self.assertIn("1. [ ] Thêm các tùy chọn cấu hình mới vào `DEFAULT_CONFIG`", ledger_before)
+
+        # Now apply Step 1 edit adding the 3 config keys
+        msgs.extend([
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c3", "type": "function", "function": {"name": "edit", "arguments": json.dumps({
+                    "filePath": "gemini_web2api.py",
+                    "oldString": "DEFAULT_CONFIG = {\"port\": 8000}",
+                    "newString": "DEFAULT_CONFIG = {\"port\": 8000, \"cookie_pool\": [], \"cookie_pool_strategy\": \"round_robin\", \"cookie_cooldown_sec\": 300}",
+                })}},
+            ]},
+            {"role": "tool", "tool_call_id": "c3", "name": "edit", "content": "Edit applied successfully."},
+        ])
+        ledger_after = M._ff16_todo_ledger(ctx, msgs)
+        self.assertIn("1. [x] Thêm các tùy chọn cấu hình mới vào `DEFAULT_CONFIG`", ledger_after)
+        self.assertIn("2. [ ] Viết hàm `init_cookie_pool() -> None`", ledger_after)
+
+    def test_act_context_pack_includes_section_headers_and_referenced_module_globals(self):
+        """Regression for conversation.txt Sec 21: _ff17_act_context_pack must include `# Section: gemini.py`
+        and module-level globals referenced inside matched functions (`_cookie_cache`, etc.)."""
+        filler = "# filler line\n" * 6500
+        src_body = (
+            "# Section: gemini.py\n"
+            "_cookie_cache = (\"\", None, 0)\n"
+            "_cookie_last_mtime_check = 0.0\n"
+            "_COOKIE_MTIME_MIN_INTERVAL = 1.0\n"
+            + filler +
+            "def load_cookie():\n"
+            "    global _cookie_cache, _cookie_last_mtime_check\n"
+            "    return _cookie_cache[1]\n"
+        )
+        plan_md = "### Bước 2: Quản lý Trạng thái (`# Section: gemini.py`)\n- [ ] Cập nhật hàm `load_cookie()`\n"
+        msgs = [
+            {"role": "user", "content": "Implement feature_implementation_plan.md"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "read", "arguments": json.dumps({"filePath": "feature_implementation_plan.md"})}},
+                {"id": "c2", "type": "function", "function": {"name": "read", "arguments": json.dumps({"filePath": "gemini_web2api.py"})}},
+            ]},
+            {"role": "tool", "tool_call_id": "c1", "name": "read", "content": plan_md},
+            {"role": "tool", "tool_call_id": "c2", "name": "read", "content": src_body},
+        ]
+        ctx = M._analyze(msgs)
+        pack = M._ff17_act_context_pack(ctx, msgs)
+        self.assertIn("_cookie_cache = (\"\", None, 0)", pack)
+        self.assertIn("def load_cookie():", pack)
+
+    def test_pure_anchor_edit_auto_repairs_and_window_reread_preserves_ast(self):
+        """Regression for conversation.txt Sec 21 & Sec 38:
+        1. Pure-anchor append edit with minor literal drift (`0.0` vs `0`) is auto-repaired.
+        2. Window re-read (`offset=1, limit=5`) splices in place without corrupting the file tail."""
+        src_body = "\n".join([
+            "# Section: config.py",
+            "DEFAULT_CONFIG = {}",
+            "# Section: gemini.py",
+            "_cookie_cache = (\"\", None, 0)",
+            "_cookie_last_mtime_check = 0.0",
+            "_COOKIE_MTIME_MIN_INTERVAL = 1.0",
+            "def load_cookie():",
+            "    return None",
+        ])
+        msgs = [
+            {"role": "user", "content": "Implement plan"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "r1", "type": "function", "function": {"name": "read", "arguments": json.dumps({"filePath": "gemini_web2api.py"})}},
+            ]},
+            {"role": "tool", "tool_call_id": "r1", "name": "read", "content": src_body},
+        ]
+        # Pure-anchor append where model wrote 0.0 instead of 0
+        tc = {
+            "id": "e1",
+            "type": "function",
+            "function": {
+                "name": "edit",
+                "arguments": json.dumps({
+                    "filePath": "gemini_web2api.py",
+                    "oldString": "_cookie_cache = (\"\", None, 0.0)\n_cookie_last_mtime_check = 0.0\n_COOKIE_MTIME_MIN_INTERVAL = 1.0",
+                    "newString": "_cookie_cache = (\"\", None, 0.0)\n_cookie_last_mtime_check = 0.0\n_COOKIE_MTIME_MIN_INTERVAL = 1.0\n_cookie_pool_lock = threading.Lock()",
+                }),
+            },
+        }
+        out, probs = M._base_gate_act_calls([tc], msgs)
+        self.assertEqual([], probs)
+        repaired_args = json.loads(out[0]["function"]["arguments"])
+        self.assertEqual("_COOKIE_MTIME_MIN_INTERVAL = 1.0", repaired_args["oldString"])
+        self.assertIn("_cookie_pool_lock = threading.Lock()", repaired_args["newString"])
+
+        # Now apply edit and then a small window read(offset=1, limit=2)
+        msgs.extend([
+            {"role": "assistant", "content": "", "tool_calls": [out[0]]},
+            {"role": "tool", "tool_call_id": "e1", "name": "edit", "content": "Edit applied successfully."},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "r2", "type": "function", "function": {"name": "read", "arguments": json.dumps({"filePath": "gemini_web2api.py", "offset": 1, "limit": 2})}},
+            ]},
+            {"role": "tool", "tool_call_id": "r2", "name": "read", "content": "1: # Section: config.py\n2: DEFAULT_CONFIG = {}"},
+        ])
+        tracked = M._ff9_read_texts(msgs)["gemini_web2api.py"]
+        self.assertIn("def load_cookie():", tracked)
+        self.assertIn("_cookie_pool_lock = threading.Lock()", tracked)
+        # AST must parse cleanly without IndentationError at the tail
+        M._ff5_ast.parse(tracked)
+
+    def test_test_file_edits_do_not_mask_missing_source_symbols_and_noop_edit_rejected(self):
+        """Regression for conversation.txt Sec 39-40:
+        1. Symbols written to `tests/test_cookie_pool.py` must not count as implemented in `gemini_web2api.py`.
+        2. No-op edit (`oldString == newString`) is rejected with a clear problem message."""
+        plan_md = "- [ ] Viết hàm `init_cookie_pool() -> None`\n- [ ] Tạo file `tests/test_cookie_pool.py`\n"
+        msgs = [
+            {"role": "user", "content": "Implement feature_implementation_plan.md"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "r1", "type": "function", "function": {"name": "read", "arguments": json.dumps({"filePath": "feature_implementation_plan.md"})}},
+                {"id": "r2", "type": "function", "function": {"name": "read", "arguments": json.dumps({"filePath": "gemini_web2api.py"})}},
+                {"id": "w1", "type": "function", "function": {"name": "write", "arguments": json.dumps({
+                    "filePath": "tests/test_cookie_pool.py",
+                    "content": "import gemini_web2api\ngemini_web2api.init_cookie_pool()\n",
+                })}},
+            ]},
+            {"role": "tool", "tool_call_id": "r1", "name": "read", "content": plan_md},
+            {"role": "tool", "tool_call_id": "r2", "name": "read", "content": "DEFAULT_CONFIG = {}\n"},
+            {"role": "tool", "tool_call_id": "w1", "name": "write", "content": "Wrote tests/test_cookie_pool.py"},
+        ]
+        ctx = M._analyze(msgs)
+        rem = M._ff17_remaining_plan_or_todo_work(ctx, M._answered_calls(msgs), msgs)
+        self.assertIn("init_cookie_pool", rem["missing_plan_tokens"])
+        self.assertTrue(rem["has_more"])
+
+        # No-op edit rejection
+        noop_tc = {
+            "id": "e_noop",
+            "type": "function",
+            "function": {
+                "name": "edit",
+                "arguments": json.dumps({
+                    "filePath": "gemini_web2api.py",
+                    "oldString": "DEFAULT_CONFIG = {}",
+                    "newString": "DEFAULT_CONFIG = {}",
+                }),
+            },
+        }
+        out, probs = M._base_gate_act_calls([noop_tc], msgs)
+        self.assertEqual([], out)
+        self.assertTrue(any("no-op edit" in p for p in probs))
+
+    def test_required_tool_duplicate_call_does_not_leak_prose_on_next_attempt(self):
+        """Regression for conversation.txt Sec 46: when `required_tool=True` and attempt 1 emits a
+        duplicate tool call while attempt 2 emits plain text, `_generate_with_tool_retry` must NOT
+        return the plain text early -- it must retry until a new tool call is emitted."""
+        msgs = [
+            {"role": "user", "content": "Implement feature_implementation_plan.md"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "read", "arguments": json.dumps({"filePath": "feature_implementation_plan.md"})}},
+            ]},
+            {"role": "tool", "tool_call_id": "c1", "name": "read", "content": "# Plan"},
+        ]
+        # Verify editing another file or calling todowrite does not wipe `read(feature_implementation_plan.md)` from _repeatable_calls
+        msgs_with_todo = list(msgs) + [
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "t1", "type": "function", "function": {"name": "todowrite", "arguments": json.dumps({"todos": [{"content": "step 1", "status": "in_progress"}]})}},
+            ]},
+            {"role": "tool", "tool_call_id": "t1", "name": "todowrite", "content": "ok"},
+        ]
+        rep = M._repeatable_calls(msgs_with_todo)
+        self.assertIn(("read", M._canonical_args({"filePath": "feature_implementation_plan.md"})), rep)
