@@ -1238,5 +1238,447 @@ class Ff10GrepPlannerPaths(unittest.TestCase):
                          paths)
 
 
+class TestFlowEngineEnhancements(unittest.TestCase):
+    """Flow engine improvements:
+    1. Post-test self-healing loop (allowing repair acts after max_acts exceeded).
+    2. Static AST Pre-Gate (detecting UnboundLocalError and reentrant Lock deadlocks).
+    3. Plan Compliance & Test Step evaluation (tracking all required test_* functions).
+    4. Multi-stage targeted test ordering.
+    """
+
+    def setUp(self):
+        self.orig_config = dict(CONFIG)
+
+    def tearDown(self):
+        CONFIG.clear()
+        CONFIG.update(self.orig_config)
+
+    def test_post_test_self_healing_allows_act_after_max_acts_exceeded(self):
+        """When a CHANGE task with a plan has exceeded flow_max_acts (e.g. 7 acts),
+        and tests fail with an error/traceback, _change_tail MUST return an 'act' step
+        for self-healing instead of terminating with final=True answer step."""
+        CONFIG["flow_max_acts"] = 3
+        CONFIG["flow17_plan_max_acts"] = 12
+        CONFIG["flow17_post_test_max_acts"] = 4
+
+        plan_doc = (
+            "# Feature Implementation Plan\n\n"
+            "### Phase 1: Configuration\n"
+            "- [ ] `cookie_pool`: list\n\n"
+            "### Phase 2: State Manager\n"
+            "- [ ] `init_cookie_pool()`: fn\n"
+            "- [ ] `get_active_cookie_credentials()`: fn\n"
+        )
+        msgs = [
+            {"role": "user", "content": "Implement cookie pool according to plan"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c_r1", "type": "function", "function": {"name": "read", "arguments": json.dumps({"filePath": "feature_implementation_plan.md"})}},
+                {"id": "c_r2", "type": "function", "function": {"name": "read", "arguments": json.dumps({"filePath": "gemini_web2api.py"})}},
+            ]},
+            {"role": "tool", "tool_call_id": "c_r1", "content": plan_doc},
+            {"role": "tool", "tool_call_id": "c_r2", "content": "# Section: gemini.py\n_current_pool_index = 0\n" + "x = 1\n" * 15000},
+        ]
+        # Simulate 7 successful act calls (exceeding flow_max_acts=3)
+        for i in range(1, 8):
+            msgs.extend([
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": f"c_a{i}", "type": "function", "function": {
+                        "name": "edit",
+                        "arguments": json.dumps({
+                            "filePath": "gemini_web2api.py",
+                            "oldString": f"x = {i}",
+                            "newString": f"x = {i + 1}",
+                        })
+                    }}
+                ]},
+                {"role": "tool", "tool_call_id": f"c_a{i}", "content": "Edit applied successfully."},
+            ])
+
+        # Then test ran and FAILED with UnboundLocalError
+        test_fail_output = (
+            "Traceback (most recent call last):\n"
+            '  File "tests/test_cookie_pool.py", line 42, in test_pool\n'
+            "    get_active_cookie_credentials()\n"
+            '  File "gemini_web2api.py", line 3995, in get_active_cookie_credentials\n'
+            "    idx = _current_pool_index % n\n"
+            "UnboundLocalError: cannot access local variable '_current_pool_index' where it is not associated with a value\n\n"
+            "FAILED (errors=3)"
+        )
+        msgs.extend([
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c_t1", "type": "function", "function": {
+                    "name": "bash",
+                    "arguments": json.dumps({"command": "python -m unittest discover -s tests"}),
+                }}
+            ]},
+            {"role": "tool", "tool_call_id": "c_t1", "content": test_fail_output},
+        ])
+
+        tm = _tm()
+        ctx = F._analyze(msgs)
+        ev = F._answered_calls(msgs)
+        step = F._change_tail("CHANGE", ctx, ev, tm, ["gemini_web2api.py", "tests/test_cookie_pool.py"], 5)
+
+        self.assertIsNotNone(step)
+        self.assertEqual("act", step.name)
+        self.assertFalse(getattr(step, "final", False))
+        self.assertIn("act", step.kinds)
+        self.assertIn("FAILED", step.instruction)
+        self.assertIn("UnboundLocalError", step.instruction)
+
+    def test_static_ast_pre_gate_rejects_missing_global(self):
+        """When an edit/write call assigns to a module-level variable without declaring
+        'global <var>', _base_gate_act_calls must reject it immediately at the gate."""
+        CONFIG["flow17_static_pre_gate"] = True
+        hay = (
+            "_current_pool_index = 0\n"
+            "_pool_accounts = []\n"
+            "def load_cookie():\n"
+            "    pass\n"
+        )
+        messages = [
+            {"role": "user", "content": "update cookie credentials"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c_r1", "type": "function", "function": {"name": "read", "arguments": json.dumps({"filePath": "gemini_web2api.py"})}}
+            ]},
+            {"role": "tool", "tool_call_id": "c_r1", "content": hay},
+        ]
+        bad_edit = {
+            "id": "c_bad",
+            "type": "function",
+            "function": {
+                "name": "edit",
+                "arguments": json.dumps({
+                    "filePath": "gemini_web2api.py",
+                    "oldString": "def load_cookie():\n    pass",
+                    "newString": (
+                        "def get_active_cookie_credentials():\n"
+                        "    idx = _current_pool_index % 2\n"
+                        "    _current_pool_index = (idx + 1) % 2\n"
+                        "    return ('a', 'b')\n"
+                    ),
+                }),
+            },
+        }
+
+        out_calls, problems = F._base_gate_act_calls([bad_edit], messages)
+        self.assertEqual([], out_calls)
+        self.assertTrue(len(problems) > 0)
+        self.assertTrue(any(
+            "assigns to module-level variable '_current_pool_index' without declaring 'global _current_pool_index'" in p
+            for p in problems
+        ), problems)
+
+    def test_static_ast_pre_gate_rejects_reentrant_deadlock(self):
+        """When a call introduces nested lock acquisition on a non-reentrant threading.Lock(),
+        _base_gate_act_calls must reject it to prevent deadlocks."""
+        CONFIG["flow17_static_pre_gate"] = True
+        hay = (
+            "import threading\n"
+            "_cookie_pool_lock = threading.Lock()\n"
+            "def init_cookie_pool():\n"
+            "    with _cookie_pool_lock:\n"
+            "        pass\n"
+        )
+        messages = [
+            {"role": "user", "content": "update pool"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c_r1", "type": "function", "function": {"name": "read", "arguments": json.dumps({"filePath": "gemini_web2api.py"})}}
+            ]},
+            {"role": "tool", "tool_call_id": "c_r1", "content": hay},
+        ]
+        deadlock_edit = {
+            "id": "c_dl",
+            "type": "function",
+            "function": {
+                "name": "edit",
+                "arguments": json.dumps({
+                    "filePath": "gemini_web2api.py",
+                    "oldString": "def init_cookie_pool():",
+                    "newString": (
+                        "def get_active_cookie_credentials():\n"
+                        "    with _cookie_pool_lock:\n"
+                        "        init_cookie_pool()\n\n"
+                        "def init_cookie_pool():"
+                    ),
+                }),
+            },
+        }
+        out_calls, problems = F._base_gate_act_calls([deadlock_edit], messages)
+        self.assertEqual([], out_calls)
+        self.assertTrue(len(problems) > 0)
+        self.assertTrue(any(
+            "Potential deadlock detected in 'get_active_cookie_credentials': it holds '_cookie_pool_lock' and calls 'init_cookie_pool'" in p
+            for p in problems
+        ), problems)
+
+    def test_plan_evaluation_keeps_test_step_pending_when_missing_test_case(self):
+        """When the plan lists specific test_* functions in Phase 5, Phase 5 remains done=False
+        until ALL of those test functions are defined in the test file."""
+        plan_doc = (
+            "# Plan\n\n"
+            "### Phase 5: Verification & Unit Tests (`tests/test_cookie_pool.py`)\n"
+            "- [ ] Tạo file test `tests/test_cookie_pool.py`:\n"
+            "  1. `test_single_cookie_backward_compatibility`: desc\n"
+            "  2. `test_pool_rotation_on_429`: desc\n"
+            "  3. `test_pool_rotation_on_bard_1037`: desc\n"
+            "  4. `test_pool_status_endpoint`: desc\n"
+        )
+        msgs = [
+            {"role": "user", "content": "Implement plan"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c_r1", "type": "function", "function": {"name": "read", "arguments": json.dumps({"filePath": "feature_implementation_plan.md"})}}
+            ]},
+            {"role": "tool", "tool_call_id": "c_r1", "content": plan_doc},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c_w1", "type": "function", "function": {
+                    "name": "write",
+                    "arguments": json.dumps({
+                        "filePath": "tests/test_cookie_pool.py",
+                        # Only defines 3 of the 4 required test cases (missing test_pool_status_endpoint)
+                        "content": (
+                            "import unittest\n"
+                            "class T(unittest.TestCase):\n"
+                            "    def test_single_cookie_backward_compatibility(self): pass\n"
+                            "    def test_pool_rotation_on_429(self): pass\n"
+                            "    def test_pool_rotation_on_bard_1037(self): pass\n"
+                        ),
+                    }),
+                }}
+            ]},
+            {"role": "tool", "tool_call_id": "c_w1", "content": "Wrote file successfully."},
+        ]
+
+        ctx = F._analyze(msgs)
+        ev = F._answered_calls(msgs)
+        eval_steps = F._ff17_evaluate_plan_steps(ctx, ev, msgs)
+
+        self.assertEqual(1, len(eval_steps))
+        step5 = eval_steps[0]
+        self.assertFalse(step5["done"])
+        self.assertIn("test_pool_status_endpoint", step5["missing_tokens"])
+
+        # Now model adds the missing test case
+        msgs.extend([
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c_e2", "type": "function", "function": {
+                    "name": "edit",
+                    "arguments": json.dumps({
+                        "filePath": "tests/test_cookie_pool.py",
+                        "oldString": "    def test_pool_rotation_on_bard_1037(self): pass",
+                        "newString": (
+                            "    def test_pool_rotation_on_bard_1037(self): pass\n"
+                            "    def test_pool_status_endpoint(self): pass"
+                        ),
+                    }),
+                }}
+            ]},
+            {"role": "tool", "tool_call_id": "c_e2", "content": "Edit applied successfully."},
+        ])
+        ev2 = F._answered_calls(msgs)
+        eval_steps2 = F._ff17_evaluate_plan_steps(ctx, ev2, msgs)
+        self.assertEqual(1, len(eval_steps2))
+        self.assertTrue(eval_steps2[0]["done"])
+        self.assertEqual([], eval_steps2[0]["missing_tokens"])
+
+    def test_multi_stage_test_verification_orders_targeted_first(self):
+        """Targeted test files must be sorted before full discover suite in test verification commands."""
+        plan_doc = (
+            "## 4. Verification Commands\n"
+            "```bash\n"
+            "python -m unittest discover -s tests\n"
+            "python -m unittest tests/test_cookie_pool.py\n"
+            "```\n"
+        )
+        msgs = [
+            {"role": "user", "content": "run tests according to feature_implementation_plan.md"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c_r1", "type": "function", "function": {"name": "read", "arguments": json.dumps({"filePath": "feature_implementation_plan.md"})}}
+            ]},
+            {"role": "tool", "tool_call_id": "c_r1", "content": plan_doc},
+        ]
+        cmds = F._ff17_extract_verification_commands(msgs)
+        self.assertEqual(2, len(cmds))
+        # Specific test file comes first
+        self.assertIn("test_cookie_pool.py", cmds[0])
+        # Full discover suite comes second
+        self.assertIn("discover -s tests", cmds[1])
+
+    def test_static_ast_pre_gate_negative_tests_allow_valid_patterns(self):
+        """Valid patterns that must NEVER be rejected by static AST pre-gate:
+        1. Local variable shadowing module-level variable (data = [1]).
+        2. Comprehensions ([x for x in xs]).
+        3. Local variables starting with '_' (_cache = {}).
+        """
+        CONFIG["flow17_static_pre_gate"] = True
+        hay = "data = {}\nx = 1\n_cache = {}\n"
+        msgs = [{"role": "tool", "content": hay}]
+
+        # 1. Local shadows module-level
+        ed1 = [{
+            "id": "c1", "type": "function", "function": {
+                "name": "edit", "arguments": json.dumps({
+                    "filePath": "gemini_web2api.py", "oldString": "",
+                    "newString": "def process():\n    data = [1]\n    return data\n",
+                })
+            }
+        }]
+        out1, prob1 = F._base_gate_act_calls(ed1, msgs)
+        self.assertEqual([], prob1)
+        self.assertEqual(1, len(out1))
+
+        # 2. Comprehension variable
+        ed2 = [{
+            "id": "c2", "type": "function", "function": {
+                "name": "edit", "arguments": json.dumps({
+                    "filePath": "gemini_web2api.py", "oldString": "",
+                    "newString": "def transform(xs):\n    return [x for x in xs]\n",
+                })
+            }
+        }]
+        out2, prob2 = F._base_gate_act_calls(ed2, msgs)
+        self.assertEqual([], prob2)
+        self.assertEqual(1, len(out2))
+
+        # 3. Local starting with '_'
+        ed3 = [{
+            "id": "c3", "type": "function", "function": {
+                "name": "edit", "arguments": json.dumps({
+                    "filePath": "gemini_web2api.py", "oldString": "",
+                    "newString": "def cache_helper():\n    _cache = {}\n    return _cache\n",
+                })
+            }
+        }]
+        out3, prob3 = F._base_gate_act_calls(ed3, msgs)
+        self.assertEqual([], prob3)
+        self.assertEqual(1, len(out3))
+
+    def test_static_ast_pre_gate_positive_test_rejects_read_before_assign(self):
+        """Pattern _idx = _idx + 1 (or augassign _idx += 1) reads variable before write
+        without global, and MUST be rejected as UnboundLocalError."""
+        CONFIG["flow17_static_pre_gate"] = True
+        hay = "_idx = 0\n"
+        msgs = [{"role": "tool", "content": hay}]
+
+        ed = [{
+            "id": "c_bad", "type": "function", "function": {
+                "name": "edit", "arguments": json.dumps({
+                    "filePath": "gemini_web2api.py", "oldString": "",
+                    "newString": "def increment():\n    _idx = _idx + 1\n    return _idx\n",
+                })
+            }
+        }]
+        out, prob = F._base_gate_act_calls(ed, msgs)
+        self.assertEqual([], out)
+        self.assertTrue(len(prob) > 0)
+        self.assertTrue(any("UnboundLocalError" in p and "_idx" in p for p in prob), prob)
+
+    def test_case_b_baseline_test_passed_does_not_skip_plan_steps(self):
+        """When a baseline test runs and passes before any act, _change_tail must NOT enter
+        Case B to re-run tests immediately after the first act; it must fall through to Case C
+        to continue implementing the remaining plan phases."""
+        CONFIG["flow_max_acts"] = 3
+        CONFIG["flow17_plan_max_acts"] = 12
+
+        plan_doc = (
+            "# Feature Implementation Plan\n\n"
+            "### Phase 1: Configuration\n"
+            "- [ ] `cookie_pool`: list\n\n"
+            "### Phase 2: State Manager\n"
+            "- [ ] `init_cookie_pool()`: fn\n"
+        )
+        msgs = [
+            {"role": "user", "content": "Implement cookie pool according to plan"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c_r1", "type": "function", "function": {"name": "read", "arguments": json.dumps({"filePath": "feature_implementation_plan.md"})}},
+                {"id": "c_r2", "type": "function", "function": {"name": "read", "arguments": json.dumps({"filePath": "gemini_web2api.py"})}},
+            ]},
+            {"role": "tool", "tool_call_id": "c_r1", "content": plan_doc},
+            {"role": "tool", "tool_call_id": "c_r2", "content": "# Section: gemini.py\nx = 1\n" * 5000},
+            # Baseline test passed
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c_t0", "type": "function", "function": {"name": "bash", "arguments": json.dumps({"command": "python -m unittest tests/test_flow_patch.py"})}},
+            ]},
+            {"role": "tool", "tool_call_id": "c_t0", "content": "Ran 100 tests in 1.0s\n\nOK"},
+            # Phase 1 act
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c_a1", "type": "function", "function": {"name": "edit", "arguments": json.dumps({"filePath": "gemini_web2api.py", "oldString": "x = 1", "newString": "cookie_pool = []\nx = 1"})}},
+            ]},
+            {"role": "tool", "tool_call_id": "c_a1", "content": "Edit applied successfully."},
+        ]
+
+        tm = _tm()
+        ctx = F._analyze(msgs)
+        ev = F._answered_calls(msgs)
+        F._ff8_tls.messages = msgs
+
+        step = F._change_tail("CHANGE", ctx, ev, tm, ["gemini_web2api.py"], 5)
+        self.assertIsNotNone(step)
+        # MUST be an act step for the remaining Phase 2, NOT a tests step!
+        self.assertEqual("act", step.name)
+        self.assertIn("act", step.kinds)
+        self.assertIn("Implement the plan steps", step.instruction)
+
+    def test_plan_compliance_audit_arity_and_retry_loop(self):
+        """Plan compliance audit checks:
+        1. Tuple arity mismatch (e.g. 2-tuple vs expected 3-tuple).
+        2. Headers or payload built outside retry loop (using OR condition).
+        """
+        B = chr(96)
+        plan_doc = (
+            f"# Feature Implementation Plan\n\n"
+            f"### Phase 2: Credentials\n"
+            f"- [ ] {B}get_active_cookie_credentials(){B}: trả về tuple {B}(cookie_str, sapisid, meta_dict){B}\n\n"
+            f"### Phase 4: Retry Failover\n"
+            f"Tự động retry failover khi gặp lỗi 429 hoặc Bard error.\n"
+        )
+
+        # Violation 1: Arity is 2-tuple instead of 3-tuple
+        # Violation 2: _build_payload is inside loop, but _build_headers is outside loop
+        code_with_violations = (
+            "def get_active_cookie_credentials():\n"
+            "    return ('cookie', 'sapisid')\n\n"
+            "def generate():\n"
+            "    headers = _build_headers()\n"
+            "    for attempt in range(3):\n"
+            "        payload = _build_payload()\n"
+            "        call()\n"
+        )
+        msgs_viol = [
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c_r1", "type": "function", "function": {"name": "read", "arguments": json.dumps({"filePath": "feature_implementation_plan.md"})}},
+                {"id": "c_r2", "type": "function", "function": {"name": "read", "arguments": json.dumps({"filePath": "gemini_web2api.py"})}},
+            ]},
+            {"role": "tool", "tool_call_id": "c_r1", "content": plan_doc},
+            {"role": "tool", "tool_call_id": "c_r2", "content": code_with_violations},
+        ]
+        res_viol = F._ff17_audit_plan_compliance(msgs_viol, [])
+        self.assertFalse(res_viol["compliant"])
+        self.assertTrue(any("returns a 2-tuple, but the plan specifies a 3-tuple" in v for v in res_viol["violations"]))
+        self.assertTrue(any("_build_headers" in v and "built outside the retry loop" in v for v in res_viol["violations"]))
+
+        # Compliant version: 3-tuple returned and both inside retry loop
+        code_compliant = (
+            "def get_active_cookie_credentials():\n"
+            "    return ('cookie', 'sapisid', {'auth_user': 0})\n\n"
+            "def generate():\n"
+            "    for attempt in range(3):\n"
+            "        headers = _build_headers()\n"
+            "        payload = _build_payload()\n"
+            "        call()\n"
+        )
+        msgs_comp = [
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c_r1", "type": "function", "function": {"name": "read", "arguments": json.dumps({"filePath": "feature_implementation_plan.md"})}},
+                {"id": "c_r2", "type": "function", "function": {"name": "read", "arguments": json.dumps({"filePath": "gemini_web2api.py"})}},
+            ]},
+            {"role": "tool", "tool_call_id": "c_r1", "content": plan_doc},
+            {"role": "tool", "tool_call_id": "c_r2", "content": code_compliant},
+        ]
+        res_comp = F._ff17_audit_plan_compliance(msgs_comp, [])
+        self.assertTrue(res_comp["compliant"])
+        self.assertEqual([], res_comp["violations"])
+
+
 if __name__ == "__main__":
     unittest.main()

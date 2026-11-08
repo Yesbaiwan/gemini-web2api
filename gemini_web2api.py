@@ -18225,7 +18225,7 @@ def _ff16_c(key, default=None):
 #            native [Plan & TODO Progress] ledger, and todo-tool passthrough
 # --------------------------------------------------------------------------
 _FF16_PLAN_DOC_RE = re.compile(
-    r"(?:^|/)(?:plan|todo|tasks?|spec|design|roadmap|implementation|checklist)"
+    r"(?:^|/)(?:.*[-_])?(?:plan|todo|tasks?|spec|design|roadmap|implementation|checklist)"
     r"(?:[-_.\w]*)?\.(?:md|txt|rst)$", re.I)
 _FF16_PLAN_REF_RE = re.compile(
     r"\b(?:plan|ke\s+hoach|todo|checklist|spec|design|buoc|steps?)\b", re.I)
@@ -19231,6 +19231,9 @@ _FF17_DEFAULTS = {
     "flow17_plan_todo_act": True,
     "flow17_act_context_pack": True,
     "flow17_plan_max_acts": 12,
+    "flow17_post_test_max_acts": 4,
+    "flow17_plan_compliance_audit": True,
+    "flow17_static_pre_gate": True,
 }
 _FLOW_DEFAULTS.update(_FF17_DEFAULTS)
 _DEFAULTS.update(_FF17_DEFAULTS)
@@ -19490,14 +19493,14 @@ def _ff17_targeted_test_commands(names, ev):
                 if t not in matched_tests:
                     matched_tests.append(t)
 
-    if matched_tests and explicit_test_edits:
-        for tp in explicit_test_edits:
-            if not any(_ff12_same_file(tp, mt) for mt in matched_tests):
-                matched_tests.insert(0, tp)
-    elif not matched_tests and explicit_test_edits and len(edited_paths) == len(explicit_test_edits):
-        matched_tests = list(explicit_test_edits)
+    if explicit_test_edits:
+        for tp in reversed(explicit_test_edits):
+            matched_tests = [m for m in matched_tests if not _ff12_same_file(tp, m)]
+            matched_tests.insert(0, tp)
 
-    if not matched_tests or len(matched_tests) >= len(all_tests):
+    if not matched_tests:
+        return []
+    if not explicit_test_edits and len(all_tests) >= 2 and len(matched_tests) >= len(all_tests):
         return []
 
     bases = {_base(n) for n in names}
@@ -19521,6 +19524,44 @@ def _ff17_targeted_test_commands(names, ev):
     return out
 
 
+def _ff17_extract_verification_commands(messages, names=None, ev=None) -> list:
+    """Extract verification/test commands from read plan documents or prompt messages,
+    sorting targeted/specific test file commands BEFORE full-suite discover commands."""
+    plan_bodies = [b for _p, b in _ff16_read_plan_bodies(messages or [])]
+    texts_to_scan = list(plan_bodies)
+    if messages:
+        for m in messages:
+            if m.get("role") == "user":
+                c = m.get("content") or ""
+                if isinstance(c, str):
+                    texts_to_scan.append(c)
+
+    seen = set()
+    raw_cmds = []
+    cmd_rx = re.compile(
+        r"(?m)^\s*(?:#\s*\d+\.?\s*)?((?:python(?:\d+)?\s+-m\s+unittest|pytest|npm\s+test|cargo\s+test|go\s+test)[^\r\n`]+)"
+    )
+    for txt in texts_to_scan:
+        for m in cmd_rx.finditer(txt):
+            cmd = m.group(1).strip()
+            cmd = re.sub(r"\s+#.*$", "", cmd).strip()
+            cmd = cmd.rstrip("`").strip()
+            if cmd and cmd not in seen and _is_test_cmd(cmd):
+                seen.add(cmd)
+                raw_cmds.append(cmd)
+
+    def _cmd_weight(c):
+        c_low = c.lower()
+        if "discover" in c_low and "-p" not in c_low:
+            return 2
+        if c_low in ("python -m unittest", "pytest", "npm test", "cargo test", "go test ./..."):
+            return 2
+        return 0
+
+    raw_cmds.sort(key=_cmd_weight)
+    return raw_cmds
+
+
 def pick_test_command(names, ev):
     if not _ff17_c("flow17_targeted_tests"):
         return _ff17_prev_pick_test_command(names, ev)
@@ -19528,10 +19569,26 @@ def pick_test_command(names, ev):
     if configured:
         return _ff17_prev_pick_test_command(names, ev)
     targeted = _ff17_targeted_test_commands(names, ev)
-    if not targeted:
+    msgs = getattr(_ff8_tls, "messages", None)
+    v_cmds = _ff17_extract_verification_commands(msgs, names, ev)
+
+    cands = []
+    for c in targeted:
+        c_s = c.strip()
+        if c_s and c_s not in cands:
+            cands.append(c_s)
+    for c in v_cmds:
+        c_s = c.strip()
+        if c_s and c_s not in cands:
+            cands.append(c_s)
+    for c in test_candidates(names):
+        c_s = c.strip()
+        if c_s and c_s not in cands:
+            cands.append(c_s)
+
+    if not cands:
         return _ff17_prev_pick_test_command(names, ev)
 
-    cands = targeted + [c for c in test_candidates(names) if c not in targeted]
     last_act = max((i for i, e in enumerate(ev) if e["kind"] == "act"), default=-1)
     runs = _test_runs(ev)
     after = [r for r in runs if r[0] > last_act]
@@ -19548,7 +19605,7 @@ def pick_test_command(names, ev):
         return None
     tried = {cmd.strip() for _i, cmd, _r in after}
     for c in cands:
-        if c.strip() not in tried:
+        if c.strip() not in tried and c.strip() not in broken_cmds:
             return c
     return None
 
@@ -20171,6 +20228,204 @@ def _ff17_find_defused_unique(old: str, hay: str):
     return None
 
 
+def _ff17_static_python_lint(path: str, old_v: str, new_v: str, hay: str) -> list:
+    """Analyze new Python code in an edit/write call for common LLM bugs:
+    1. UnboundLocalError: reading a variable before its first assignment in the function's own scope
+       (especially module-level state modified without declaring `global <var>`).
+    2. Re-entrant Lock Deadlock: calling another function while holding a non-reentrant `threading.Lock()`.
+    Returns a list of error strings to reject the call at gate."""
+    if not (path or "").lower().endswith(".py") or not new_v:
+        return []
+    problems = []
+
+    import textwrap as _textwrap
+    import collections as _collections
+
+    try:
+        new_tree = _ff5_ast.parse(_textwrap.dedent(new_v))
+    except Exception:
+        if hay and old_v and old_v in hay:
+            try:
+                new_tree = _ff5_ast.parse(hay.replace(old_v, new_v, 1))
+            except Exception:
+                return []
+        else:
+            return []
+
+    # 1. Module globals collection
+    module_globals = set()
+    if hay:
+        for m in re.finditer(r"(?m)^([A-Za-z_]\w*)\s*=", hay):
+            g_name = m.group(1)
+            if not g_name.startswith("__"):
+                module_globals.add(g_name)
+    for node in getattr(new_tree, "body", []):
+        if isinstance(node, _ff5_ast.Assign):
+            for t in node.targets:
+                if isinstance(t, _ff5_ast.Name):
+                    module_globals.add(t.id)
+
+    class _ScopeVisitor(_ff5_ast.NodeVisitor):
+        def __init__(self):
+            self.params = set()
+            self.globals_declared = set()
+            self.nonlocals_declared = set()
+            self.assigned_names = set()
+            self.read_before_assign = set()
+
+        # Do NOT enter nested function definitions, lambdas, comprehensions, or class definitions
+        def visit_FunctionDef(self, node): pass
+        def visit_AsyncFunctionDef(self, node): pass
+        def visit_Lambda(self, node): pass
+        def visit_ClassDef(self, node): pass
+
+        def visit_ListComp(self, node):
+            for gen in node.generators: self.visit(gen.iter)
+        def visit_SetComp(self, node):
+            for gen in node.generators: self.visit(gen.iter)
+        def visit_DictComp(self, node):
+            for gen in node.generators: self.visit(gen.iter)
+        def visit_GeneratorExp(self, node):
+            for gen in node.generators: self.visit(gen.iter)
+
+        def visit_Global(self, node):
+            self.globals_declared.update(node.names)
+        def visit_Nonlocal(self, node):
+            self.nonlocals_declared.update(node.names)
+
+        def visit_Assign(self, node):
+            self.visit(node.value)
+            for t in node.targets: self._visit_target(t)
+
+        def visit_AugAssign(self, node):
+            if isinstance(node.target, _ff5_ast.Name):
+                name = node.target.id
+                if name not in self.assigned_names:
+                    self.read_before_assign.add(name)
+                self.assigned_names.add(name)
+            else:
+                self.visit(node.target)
+            self.visit(node.value)
+
+        def visit_AnnAssign(self, node):
+            if node.value: self.visit(node.value)
+            self._visit_target(node.target)
+
+        def visit_For(self, node):
+            self.visit(node.iter)
+            self._visit_target(node.target)
+            for stmt in node.body: self.visit(stmt)
+            for stmt in node.orelse: self.visit(stmt)
+
+        def visit_AsyncFor(self, node):
+            self.visit(node.iter)
+            self._visit_target(node.target)
+            for stmt in node.body: self.visit(stmt)
+            for stmt in node.orelse: self.visit(stmt)
+
+        def visit_With(self, node):
+            for item in node.items:
+                self.visit(item.context_expr)
+                if item.optional_vars: self._visit_target(item.optional_vars)
+            for stmt in node.body: self.visit(stmt)
+
+        def visit_AsyncWith(self, node):
+            for item in node.items:
+                self.visit(item.context_expr)
+                if item.optional_vars: self._visit_target(item.optional_vars)
+            for stmt in node.body: self.visit(stmt)
+
+        def visit_ExceptHandler(self, node):
+            if node.type: self.visit(node.type)
+            if node.name: self.assigned_names.add(node.name)
+            for stmt in node.body: self.visit(stmt)
+
+        def visit_NamedExpr(self, node):
+            self.visit(node.value)
+            self._visit_target(node.target)
+
+        def visit_Name(self, node):
+            if isinstance(node.ctx, _ff5_ast.Load):
+                if node.id not in self.assigned_names:
+                    self.read_before_assign.add(node.id)
+            elif isinstance(node.ctx, (_ff5_ast.Store, _ff5_ast.Del)):
+                self.assigned_names.add(node.id)
+
+        def _visit_target(self, target):
+            if isinstance(target, _ff5_ast.Name):
+                self.assigned_names.add(target.id)
+            elif isinstance(target, (_ff5_ast.Tuple, _ff5_ast.List)):
+                for elt in target.elts: self._visit_target(elt)
+            elif isinstance(target, _ff5_ast.Starred):
+                self._visit_target(target.value)
+            else:
+                self.visit(target)
+
+    for node in _ff5_ast.walk(new_tree):
+        if isinstance(node, (_ff5_ast.FunctionDef, _ff5_ast.AsyncFunctionDef)):
+            fn_name = node.name
+            if new_v and fn_name not in new_v:
+                continue
+            params = {a.arg for a in getattr(node.args, "posonlyargs", [])}
+            params.update(a.arg for a in node.args.args)
+            if node.args.vararg:
+                params.add(node.args.vararg.arg)
+            if node.args.kwarg:
+                params.add(node.args.kwarg.arg)
+            for a in node.args.kwonlyargs:
+                params.add(a.arg)
+
+            vis = _ScopeVisitor()
+            vis.params = set(params)
+            vis.assigned_names = set(params)
+            for stmt in node.body:
+                vis.visit(stmt)
+
+            for v in sorted(vis.assigned_names):
+                if v in vis.params or v in vis.globals_declared or v in vis.nonlocals_declared:
+                    continue
+                if v in vis.read_before_assign and (v in module_globals or v.startswith("_")):
+                    problems.append(
+                        f"{path}: Function '{fn_name}' assigns to module-level variable '{v}' "
+                        f"without declaring 'global {v}', which will raise UnboundLocalError: "
+                        f"'{v}' is read before its first assignment. Add 'global {v}' at the top of '{fn_name}'."
+                    )
+
+    # 2. Re-entrant Lock Deadlock check
+    combined = (hay or "") + "\n" + new_v
+    non_reentrant_locks = set()
+    for m in re.finditer(r"(?m)^([A-Za-z_]\w*)\s*=\s*(?:threading\.)?Lock\(\)", combined):
+        non_reentrant_locks.add(m.group(1))
+
+    if non_reentrant_locks:
+        func_calls_under_lock = _collections.defaultdict(set)
+        for node in _ff5_ast.walk(new_tree):
+            if isinstance(node, (_ff5_ast.FunctionDef, _ff5_ast.AsyncFunctionDef)):
+                if new_v and node.name not in new_v:
+                    continue
+                for with_node in _ff5_ast.walk(node):
+                    if isinstance(with_node, _ff5_ast.With):
+                        for item in with_node.items:
+                            lock_id = getattr(item.context_expr, "id", None)
+                            if lock_id in non_reentrant_locks:
+                                for inner in _ff5_ast.walk(with_node):
+                                    if isinstance(inner, _ff5_ast.Call):
+                                        if isinstance(inner.func, _ff5_ast.Name):
+                                            func_calls_under_lock[node.name].add((inner.func.id, lock_id))
+
+        for caller, called_pairs in func_calls_under_lock.items():
+            for callee, lk in called_pairs:
+                callee_body = _ff17_extract_func_body(callee, combined)
+                if callee_body and (f"with {lk}:" in callee_body or f"{lk}.acquire()" in callee_body):
+                    problems.append(
+                        f"{path}: Potential deadlock detected in '{caller}': it holds '{lk}' "
+                        f"and calls '{callee}', which also acquires non-reentrant lock '{lk}'. "
+                        f"Change '{lk} = threading.Lock()' to 'threading.RLock()' or avoid nested lock acquisition."
+                    )
+
+    return problems
+
+
 _ff17_prev_base_gate = _base_gate_act_calls
 
 
@@ -20180,13 +20435,15 @@ def _base_gate_act_calls(calls, messages):
     2. Reject edits that introduce duplicate method definitions (`def <m>(self...)`)
        when the method already exists in the class, showing the existing method lines.
     3. Repair `defuse_extension_words` substitutions and pure-anchor append/prepend edits.
-    4. When `oldString` does not match, include a verbatim multi-line snippet around the
+    4. Reject edits that introduce missing global (UnboundLocalError) or threading.Lock deadlock.
+    5. When `oldString` does not match, include a verbatim multi-line snippet around the
        closest matching line in `hay` (or around the target section/anchor when `oldString`
        invented a non-existent `def <fn>(`)."""
     texts = _ff9_read_texts(messages)
     repaired_calls = []
     noop_problems = []
     dup_method_problems = []
+    static_lint_problems = []
     nonexistent_fn_map = {}
     for tc in calls:
         fn = (tc or {}).get("function") or {}
@@ -20197,6 +20454,21 @@ def _base_gate_act_calls(calls, messages):
         path = _call_path(args)
         okey = next((k for k in _OLD_KEYS if isinstance(args.get(k), str) and args[k]), None)
         nkey = next((k for k in _NEW_KEYS if isinstance(args.get(k), str)), None)
+        wkey = next((k for k in ("content", "contents", "text") if isinstance(args.get(k), str)), None) if not nkey else None
+
+        if _ff17_c("flow17_static_pre_gate", True) and (path or "").lower().endswith(".py"):
+            new_code = args.get(nkey) if nkey is not None else args.get(wkey)
+            if isinstance(new_code, str) and new_code.strip():
+                tk = _ff17_find_key(texts, path) if path else None
+                src_t = texts.get(tk) if tk else None
+                hay_t = src_t.replace("\r\n", "\n") if src_t is not None else ""
+                lint_errs = _ff17_static_python_lint(path, args.get(okey, ""), new_code, hay_t)
+                if lint_errs:
+                    for le in lint_errs:
+                        if le not in static_lint_problems:
+                            static_lint_problems.append(le)
+                    continue
+
         if okey and nkey is not None:
             old_v = _strip_linenos(args[okey].replace("\r\n", "\n"))
             new_v = _strip_linenos(args[nkey].replace("\r\n", "\n"))
@@ -20267,12 +20539,18 @@ def _base_gate_act_calls(calls, messages):
                                         nonexistent_fn_map[path] = fn_cand
         repaired_calls.append(tc)
 
-    early_problems = noop_problems + dup_method_problems
+    early_problems = noop_problems + dup_method_problems + static_lint_problems
     if early_problems and not repaired_calls:
         return [], early_problems
 
     out, problems = _ff17_prev_base_gate(repaired_calls, messages)
     problems = early_problems + list(problems)
+    if static_lint_problems:
+        bad_lint_paths = {p.split(":")[0].strip() for p in static_lint_problems}
+        out = [
+            tc for tc in out
+            if _call_path(T._tool_arguments_dict((tc or {}).get("function") or {})) not in bad_lint_paths
+        ]
     if not problems:
         return out, problems
 
@@ -20374,7 +20652,7 @@ def _ff17_token_defined_in_corpus(token: str, kind: str, corpus: str) -> bool:
     return token in corpus
 
 
-def _ff17_extract_req_tokens(text: str, orig_corpus: str) -> list:
+def _ff17_extract_req_tokens(text: str, orig_corpus: str, include_tests: bool = False) -> list:
     """Extract backticked function names, config keys, variables, and API routes from `text`
     that are NOT already defined in `orig_corpus` (i.e. new symbols to implement)."""
     if not text:
@@ -20395,8 +20673,12 @@ def _ff17_extract_req_tokens(text: str, orig_corpus: str) -> list:
             token, tkind = m_cfg.group(1), "cfg"
         elif m_var:
             token, tkind = m_var.group(1), "var"
+        elif include_tests:
+            m_test = re.match(r"^(?:def\s+)?(test_[A-Za-z0-9_]+)(?:\(|$)", sp_s)
+            if m_test and not sp_s.endswith((".py", ".js", ".ts", ".spec", ".test")) and "/" not in sp_s and "\\" not in sp_s:
+                token, tkind = m_test.group(1), "fn"
         if (token and token not in _FF17_STOP_IDENTS
-                and not token.startswith("test_")
+                and (include_tests or not token.startswith("test_"))
                 and not _ff17_token_defined_in_corpus(token, tkind, orig_corpus or "")
                 and token not in out):
             out.append(token)
@@ -20502,6 +20784,87 @@ def _ff17_is_pure_test_todo(content: str, edited_paths: list) -> bool:
     return True
 
 
+def _ff17_audit_plan_compliance(messages, ev) -> dict:
+    """Audit the codebase against the plan document in messages:
+    1. Missing symbols/functions/routes/test functions specified in backticks in the plan.
+    2. Return tuple arity check (e.g. `get_active_cookie_credentials` returning 3-tuple).
+    3. Retry loop refresh check (ensuring payload/headers are rebuilt inside retry loops).
+    Returns {"compliant": bool, "violations": list[str]}."""
+    violations = []
+    plan_bodies = [b for _p, b in _ff16_read_plan_bodies(messages or [])]
+    if not plan_bodies:
+        return {"compliant": True, "violations": []}
+    plan_text = "\n".join(plan_bodies)
+
+    texts = _ff9_read_texts(messages or [])
+    if not texts:
+        for v in _ff8_file_views(ev or []):
+            clean_s, _ = _ff17_strip_numbered_lines(v.get("text") or "")
+            if clean_s:
+                texts[v.get("path") or ""] = clean_s
+
+    # 1. Missing test_* functions mentioned in the plan
+    for m in re.finditer(r"`(test_[A-Za-z0-9_]+)`", plan_text):
+        t_fn = m.group(1)
+        found = False
+        for p, txt in texts.items():
+            if _is_test_path(p) and re.search(rf"(?m)^[ \t]*def\s+{re.escape(t_fn)}\b", txt):
+                found = True
+                break
+        if not found:
+            violations.append(f"Missing required unit test `{t_fn}` in test files.")
+
+    # 2. Return Tuple Arity Check
+    for m in re.finditer(r"`([A-Za-z_]\w+)\(\)`[^\n]*?(?:tr[\u1ea3a]\s*v[\u1ec1e]|return)[^\n]*?(?:tuple\s*)?`?\(([A-Za-z0-9_,\s]+)\)`?", plan_text, re.I):
+        fn_name = m.group(1)
+        elts_str = m.group(2)
+        expected_elts = [x.strip() for x in elts_str.split(",") if x.strip()]
+        expected_arity = len(expected_elts)
+        if expected_arity >= 2:
+            for p, txt in texts.items():
+                if not _is_test_path(p) and not _is_doc(p) and f"def {fn_name}" in txt:
+                    try:
+                        tree = _ff5_ast.parse(txt)
+                        for node in _ff5_ast.walk(tree):
+                            if isinstance(node, (_ff5_ast.FunctionDef, _ff5_ast.AsyncFunctionDef)) and node.name == fn_name:
+                                for ret in _ff5_ast.walk(node):
+                                    if isinstance(ret, _ff5_ast.Return) and isinstance(ret.value, _ff5_ast.Tuple):
+                                        actual_arity = len(ret.value.elts)
+                                        if actual_arity != expected_arity:
+                                            violations.append(
+                                                f"Function `{fn_name}` in {p} returns a {actual_arity}-tuple, "
+                                                f"but the plan specifies a {expected_arity}-tuple `({', '.join(expected_elts)})`."
+                                            )
+                                            break
+                    except Exception:
+                        pass
+
+    # 3. Retry loop refresh check
+    if re.search(r"\b(?:retry|attempt|failover|cooldown)\b", plan_text, re.I):
+        for p, txt in texts.items():
+            if not _is_test_path(p) and not _is_doc(p) and ("def generate(" in txt or "def generate_stream(" in txt):
+                try:
+                    tree = _ff5_ast.parse(txt)
+                    for node in _ff5_ast.walk(tree):
+                        if isinstance(node, (_ff5_ast.FunctionDef, _ff5_ast.AsyncFunctionDef)) and node.name in ("generate", "generate_stream"):
+                            for sub in node.body:
+                                if isinstance(sub, _ff5_ast.For) and isinstance(sub.target, _ff5_ast.Name) and "attempt" in sub.target.id:
+                                    loop_calls = {
+                                        c.func.id for c in _ff5_ast.walk(sub)
+                                        if isinstance(c, _ff5_ast.Call) and isinstance(c.func, _ff5_ast.Name)
+                                    }
+                                    if "_build_headers" not in loop_calls or "_build_payload" not in loop_calls:
+                                        missing_calls = [f for f in ("_build_headers", "_build_payload") if f not in loop_calls]
+                                        violations.append(
+                                            f"In `{node.name}`, request {' and '.join(missing_calls)} are built outside the retry loop (`for attempt in range(...)`). "
+                                            f"Move `_build_headers` and `_build_payload` inside the retry loop so rotated credentials take effect on retry."
+                                        )
+                except Exception:
+                    pass
+
+    return {"compliant": len(violations) == 0, "violations": violations}
+
+
 def _ff17_evaluate_plan_steps(ctx, ev, messages, pending_calls=None, step_name=None) -> list:
     """Evaluate all checklist steps from `_ff16_extract_todo_blocks(ctx, messages)` against
     the current conversation evidence (plus optional `pending_calls` about to be returned).
@@ -20545,19 +20908,23 @@ def _ff17_evaluate_plan_steps(ctx, ev, messages, pending_calls=None, step_name=N
         body_without_heading = "\n".join(
             ln for ln in st_full.splitlines() if not ln.lstrip().startswith("#")
         )
-        st_reqs = _ff17_extract_req_tokens(body_without_heading, orig_corpus)
-        st_existing_fns = _ff17_extract_existing_fn_targets(st_title, orig_corpus)
         st_files = [
             f for f in T._files_in(T._strip_fences(body_without_heading))
             if f.lower() not in T._NON_FILE_NAMES and not _ff16_is_plan_doc(f) and not _is_doc(f)
             and f.lower().endswith(_SRC_EXT)
         ]
-        is_test_step = any(_is_test_path(sf) for sf in st_files)
+        is_test_step = any(_is_test_path(sf) for sf in st_files) or bool(re.search(r"\b(?:tests/|test_)\w+", st_title))
+        st_reqs = _ff17_extract_req_tokens(body_without_heading, orig_corpus, include_tests=is_test_step)
+        st_existing_fns = _ff17_extract_existing_fn_targets(st_title, orig_corpus)
         is_pure_test = (not is_test_step and not st_reqs and not st_existing_fns
                         and (_ff17_is_pure_test_todo(st_title, edited_files)
                              or bool(re.search(r"\b(?:test|unittest|pytest|verify|kiem\s+tra|nghiem\s+thu)\b", st_title, re.I))))
         target_corpus = all_added_corpus if is_test_step else src_added_corpus
-        missing_reqs = [r for r in st_reqs if r not in target_corpus]
+        test_disk_corpus = "\n".join(tracked_map.get(f, "") for f in st_files) if is_test_step else ""
+        missing_reqs = [
+            r for r in st_reqs
+            if r not in target_corpus and r not in test_disk_corpus
+        ]
         unmodified_fns = (
             [] if is_test_step else [
                 fn for fn in st_existing_fns
@@ -20589,6 +20956,7 @@ def _ff17_evaluate_plan_steps(ctx, ev, messages, pending_calls=None, step_name=N
             "unmodified_fns": unmodified_fns,
             "uncreated_files": uncreated_st_files,
         })
+
     return out
 
 
@@ -20690,6 +21058,15 @@ def _ff17_remaining_plan_or_todo_work(ctx, ev, messages) -> dict:
             and not any(_is_test_path(ep) for ep in edited_paths)):
         uncreated_files.append("tests/test_new_feature.py")
 
+    # 4. Check plan compliance before completing all plan work
+    if _ff17_c("flow17_plan_compliance_audit", True) and plan_bodies:
+        if not remaining_todos and not missing_plan_tokens and not uncreated_files:
+            audit_res = _ff17_audit_plan_compliance(messages, ev)
+            if not audit_res["compliant"]:
+                for v in audit_res["violations"]:
+                    if v not in missing_plan_tokens:
+                        missing_plan_tokens.append(v)
+
     has_more = bool(remaining_todos or missing_plan_tokens or uncreated_files or not src_edited_paths)
     return {
         "has_more": has_more,
@@ -20708,13 +21085,103 @@ def _change_tail(pat, ctx, ev, tm, names_all, total, extra=""):
             msgs = getattr(_ff8_tls, "messages", None)
             acts = [e for e in ev if e["kind"] == "act"]
             plan_max_acts = max(int(_cfg("flow_max_acts")), int(_ff17_c("flow17_plan_max_acts", 12) or 12))
+            post_test_max_acts = int(_ff17_c("flow17_post_test_max_acts", 4) or 4)
+            total_max_acts = plan_max_acts + post_test_max_acts
             has_plan_or_todos = bool(
                 (msgs and _ff16_read_plan_bodies(msgs))
                 or any(_ff16_is_todo_tool(e.get("name", "")) for e in ev)
             )
-            if (len(acts) < plan_max_acts
-                    and not _tests_ran_after_act(ev)
-                    and (has_plan_or_todos or any(_act_ok(e) for e in acts))):
+
+            runs = _test_runs(ev)
+            last_act = max((i for i, e in enumerate(ev) if e["kind"] == "act"), default=-1)
+            after = [r for r in runs if r[0] > last_act]
+            first_test_idx = min((i for i, e in enumerate(ev) if e["kind"] == "exec" and _is_test_cmd(_call_command(e["args"]))), default=-1)
+            post_test_acts = [e for i, e in enumerate(ev) if e["kind"] == "act" and first_test_idx != -1 and i > first_test_idx]
+
+            # Case A: Tests ran after the last act (_tests_ran_after_act is True)
+            if after:
+                failed_test = next((r for r in reversed(after) if test_outcome(r[2]) in ("fail", "broken")), None)
+                if failed_test is not None:
+                    # Test failed: allow self-healing edit if budget allows
+                    if len(post_test_acts) < post_test_max_acts and len(acts) < total_max_acts:
+                        stale = [p for p in _ff9_stale_edits(ev) if p.lower().endswith(_SRC_EXT)][:4]
+                        if stale and tm.first("read"):
+                            return _read_step(
+                                pat, tm, stale, 2, total,
+                                instruction="Your last edit changed these files, so your copy is "
+                                            "stale. Re-read them before the next edit: "
+                                            + ", ".join(stale) + "."
+                            )
+                        failed_cmd, failed_res = failed_test[1], failed_test[2]
+                        excerpt_txt = _excerpt(failed_res, 1800)
+                        locs = failure_locations(failed_res)
+                        loc_str = ""
+                        if locs:
+                            loc_items = [f"{p}:{ln}" for p, ln in locs[:3]]
+                            loc_str = " Potential failure locations: " + ", ".join(loc_items) + "."
+                        msg = (
+                            f"The test command `{failed_cmd}` FAILED after your changes.{loc_str} "
+                            f"Analyze the traceback and fix the cause with an edit/write tool_call "
+                            f"(copy oldString verbatim from the file as it is now). "
+                            f"Test failure excerpt:\n{excerpt_txt}"
+                        )
+                        return Step(
+                            pat, "act", max(3, total - 2), total, {"act"},
+                            msg + _DO_NOT_DESCRIBE + extra,
+                            None, False, tm.names({"act"})
+                        )
+                    else:
+                        st = _answer_step("CHANGE", ev, total, total, final=True)
+                        if st:
+                            st.pattern = pat
+                        return st
+                else:
+                    # All tests in after passed! Check if further verification commands are pending
+                    verification_cmds = _ff17_extract_verification_commands(msgs, names_all, ev)
+                    targeted_cmds = _ff17_targeted_test_commands(names_all, ev)
+                    wanted_cmds = []
+                    for c in targeted_cmds + verification_cmds:
+                        c_clean = c.strip()
+                        if c_clean and c_clean not in wanted_cmds:
+                            wanted_cmds.append(c_clean)
+                    ran_cmds_after = {
+                        _call_command(e["args"]).strip()
+                        for i, e in enumerate(ev)
+                        if i > last_act and e["kind"] == "exec" and _is_test_cmd(_call_command(e["args"]))
+                    }
+                    next_test = next((c for c in wanted_cmds if c not in ran_cmds_after), None)
+                    if next_test and tm.first("exec"):
+                        return _tests_step(pat, tm, next_test, 4, total)
+
+                    # All tests ran and passed: check plan compliance before finishing
+                    if _ff17_c("flow17_plan_compliance_audit", True) and has_plan_or_todos:
+                        audit_res = _ff17_audit_plan_compliance(msgs, ev)
+                        if not audit_res["compliant"] and (len(post_test_acts) < post_test_max_acts and len(acts) < total_max_acts):
+                            viol_str = "; ".join(audit_res["violations"][:4])
+                            msg = (
+                                f"All unit tests passed, but Plan Compliance Audit found discrepancies: {viol_str}. "
+                                f"Please fix these discrepancies using edit/write tool_calls to fully adhere to the Plan."
+                            )
+                            return Step(
+                                pat, "act", max(3, total - 2), total, {"act"},
+                                msg + _DO_NOT_DESCRIBE + extra,
+                                None, False, tm.names({"act"})
+                            )
+
+                    st = _answer_step("CHANGE", ev, total, total)
+                    if st:
+                        st.pattern = pat
+                    return st
+
+            # Case B: Model just did an act after a prior test failed (re-run the failed test!)
+            failed_prev = next((r for r in reversed(runs) if test_outcome(r[2]) in ("fail", "broken") and r[0] < last_act), None)
+            if failed_prev is not None and not after and acts:
+                cmd_to_run = failed_prev[1] or pick_test_command(names_all, ev)
+                if cmd_to_run and tm.first("exec"):
+                    return _tests_step(pat, tm, cmd_to_run, 4, total)
+
+            # Case C: No tests have run yet (Initial implementation phase)
+            if len(acts) < plan_max_acts and (has_plan_or_todos or any(_act_ok(e) for e in acts)):
                 rem = _ff17_remaining_plan_or_todo_work(ctx, ev, msgs)
                 if rem["has_more"] and (rem["missing_plan_tokens"] or rem["remaining_todos"] or rem["uncreated_files"]):
                     parts = [
@@ -20756,6 +21223,10 @@ def _change_tail(pat, ctx, ev, tm, names_all, total, extra=""):
                         " ".join(parts) + _DO_NOT_DESCRIBE + extra,
                         None, False, tm.names({"act"})
                     )
+                else:
+                    cmd = pick_test_command(names_all, ev)
+                    if cmd and tm.first("exec"):
+                        return _tests_step(pat, tm, cmd, 4, total)
         except Exception as ex:
             log("[fix17] plan/todo act continuation error: %s" % ex)
     return _ff17_prev_change_tail(pat, ctx, ev, tm, names_all, total, extra=extra)
@@ -20932,10 +21403,11 @@ def _ff17_extract_code_targets_from_text(text: str):
 
 def _ff17_act_context_pack(ctx, messages) -> str:
     """When read tool results exceed 80 KB (so `_join_prompt_parts` truncates the
-    earlier chunks of a large file and/or the plan document), build a compact
-    verbatim context pack containing:
+    earlier chunks of a large file and/or the plan document), or after a test failure,
+    build a compact verbatim context pack containing:
       1. Any read plan document (`feature_implementation_plan.md`)
-      2. Unnumbered verbatim code windows from the current post-edit file text
+      2. Post-test failure excerpt and target code windows for traceback functions
+      3. Unnumbered verbatim code windows from the current post-edit file text
          (`_ff9_read_texts(messages)`), prioritizing windows for PENDING (`[ ]`)
          plan steps so completed steps do not crowd out later targets like `do_GET`.
     """
@@ -20944,10 +21416,23 @@ def _ff17_act_context_pack(ctx, messages) -> str:
         len(e.get("result") or "") for e in ev
         if e.get("kind") == "read" and _read_ok(e)
     )
-    if total_read_chars < 80000:
+
+    runs = _test_runs(ev)
+    last_act = max((i for i, e in enumerate(ev) if e["kind"] == "act"), default=-1)
+    after = [r for r in runs if r[0] > last_act]
+    last_test_res = after[-1][2] if after else (runs[-1][2] if runs else "")
+    test_failed = test_outcome(last_test_res) in ("fail", "broken")
+
+    if total_read_chars < 80000 and not test_failed:
         return ""
 
     out_blocks = []
+    if test_failed and last_test_res:
+        out_blocks.append(
+            "[Post-Test Repair Context -- Recent Test Failure Excerpt & Locations:]\n"
+            + _excerpt(last_test_res, 1800)
+        )
+
     plan_bodies = _ff16_read_plan_bodies(messages or [])
     for p_path, p_body in plan_bodies[:2]:
         if p_body:
@@ -20959,6 +21444,17 @@ def _ff17_act_context_pack(ctx, messages) -> str:
     plan_text = "\n".join(b for _p, b in plan_bodies)
     req_text = (getattr(ctx, "request", "") or getattr(ctx, "last", "") or "") + "\n" + plan_text
 
+    tb_funcs = set()
+    tb_files = set()
+    if test_failed and last_test_res:
+        for m in re.finditer(r'File\s+["\x27]([^"\x27]+)["\x27],\s+line\s+(\d+),\s+in\s+([A-Za-z_]\w*)', last_test_res):
+            f_p, f_ln, f_fn = m.group(1), int(m.group(2)), m.group(3)
+            if not _SKIP_PATH.search(f_p) and not f_fn.startswith("<"):
+                tb_funcs.add(f_fn)
+                tb_files.add(f_p)
+        for p, ln in failure_locations(last_test_res):
+            tb_files.add(p)
+
     eval_steps = _ff17_evaluate_plan_steps(ctx, ev, messages) if plan_bodies else []
     pending_src_steps = [
         s for s in eval_steps
@@ -20967,8 +21463,6 @@ def _ff17_act_context_pack(ctx, messages) -> str:
     if pending_src_steps:
         pending_text = "\n".join(s["full"] for s in pending_src_steps)
         cand_idents, cand_routes, cand_sections = _ff17_extract_code_targets_from_text(pending_text)
-        # Only include `# Section: <name>` 60-line top headers when a pending step
-        # needs to add new module-level symbols/functions (`missing_tokens` not starting with `/v`)
         needs_new_defs = any(
             any(not tok.startswith("/v") for tok in s["missing_tokens"])
             for s in pending_src_steps
@@ -20981,6 +21475,9 @@ def _ff17_act_context_pack(ctx, messages) -> str:
             if len(kw) >= 4 and kw not in _FF17_STOP_IDENTS:
                 cand_idents.add(kw)
 
+    if tb_funcs:
+        cand_idents.update(tb_funcs)
+
     tracked_texts = _ff9_read_texts(messages or [])
     if not tracked_texts:
         for v in _ff8_file_views(ev):
@@ -20990,11 +21487,21 @@ def _ff17_act_context_pack(ctx, messages) -> str:
 
     budget_remaining = 48000
     for fpath, full_src in tracked_texts.items():
-        if not full_src or len(full_src) < 60000 or _ff16_is_plan_doc(fpath) or _is_doc(fpath):
+        is_fpath_in_tb = any(_ff12_same_file(fpath, tf) for tf in tb_files)
+        if not full_src or _ff16_is_plan_doc(fpath) or _is_doc(fpath):
+            continue
+        if len(full_src) < 60000 and not is_fpath_in_tb:
             continue
         clean_src, _ = _ff17_strip_numbered_lines(full_src)
         src_lines = clean_src.splitlines()
         windows = []
+
+        if test_failed and is_fpath_in_tb and last_test_res:
+            for p, ln in failure_locations(last_test_res):
+                if _ff12_same_file(p, fpath):
+                    s_ln = max(1, ln - 10)
+                    e_ln = min(len(src_lines), ln + 15)
+                    windows.append((s_ln, e_ln, f"failure_line_{ln}"))
 
         # 1. Include `# Section: <name>` headers referenced by active steps (+ 60 lines of module globals)
         if cand_sections:
