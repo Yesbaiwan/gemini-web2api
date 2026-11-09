@@ -10653,7 +10653,15 @@ def _ff5_detect_s1(ctx):
     return None
 
 
-_ff5_tls = _ff5_threading.local()
+_FLOW_STATE_TLS = _ff5_threading.local()
+
+
+def _flow_state():
+    """Unified accessor for flow engine thread-local state."""
+    return _FLOW_STATE_TLS
+
+
+_ff5_tls = _FLOW_STATE_TLS
 _ff5_cache = {}
 
 
@@ -11807,7 +11815,7 @@ for _k8, _v8 in _FF8_DEFAULTS.items():
 _c8 = _flow_c
 
 
-_ff8_tls = _ff8_threading.local()
+_ff8_tls = _FLOW_STATE_TLS
 
 # --------------------------------------------------------------------------
 # 1. Read-only command check: parse the WHOLE command, refuse what we cannot
@@ -18626,7 +18634,7 @@ def _ff17_imported_symbols_by_file(ev, listing=()):
     return sym_map
 
 
-_ff17_tls = threading.local()
+_ff17_tls = _FLOW_STATE_TLS
 
 
 def _ff8_render_view(v, kws, locs, budget):
