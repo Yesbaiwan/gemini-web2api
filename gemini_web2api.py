@@ -9522,6 +9522,9 @@ def _ff5_cmd_readonly(cmd):
     return True
 
 
+is_readonly_command = _ff5_cmd_readonly
+
+
 def _ff5_status(e):
     """success | partial | failed | unknown -- only success/partial unlock the next step.
 
@@ -15735,6 +15738,14 @@ def _ff12_same_file(a, b):
     return False
 
 
+# Semantic aliases for path helpers (Phase 5.1)
+canonical_path = _ff12_canon
+path_base = _base
+is_absolute_path = _ff12_isabs
+is_same_path = _ff12_same_file
+path_matches_suffix = _path_seen
+
+
 def _ff12_scope_match(path, entry):
     """Scope entry written by the user: a bare name ("a.py") may live in any
     folder, a name with a folder is exact."""
@@ -16251,6 +16262,12 @@ def _act_ok(e):
     if _FF12_ACTFAIL_RE.search((e.get("result") or "")[:400]):
         return False
     return _act_ok_s1(e)
+
+
+# Semantic aliases for tool result status (Phase 5.2)
+read_event_status = _read_ok
+act_event_is_success = _act_ok
+exec_event_status = _ff5_status
 
 
 # --------------------------------------------------------------------------
@@ -18850,6 +18867,18 @@ def pick_test_command(names, ev):
         if c_s not in tried and c_s not in broken_cmds and _cmd_target_exists(c_s):
             return c_s
     return None
+
+
+# Semantic aliases for test command helpers (Phase 5.3)
+candidate_test_commands = test_candidates
+extract_verification_commands = _ff17_extract_verification_commands
+
+
+def is_test_command(cmd: str) -> bool:
+    """Return True if the given command is recognized as a test execution command."""
+    if not cmd or not isinstance(cmd, str):
+        return False
+    return bool(_TEST_CMD_RE.search(cmd.strip()))
 
 
 # --------------------------------------------------------------------------
