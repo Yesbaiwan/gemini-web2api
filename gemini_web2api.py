@@ -7254,6 +7254,26 @@ def _is_code_question(text):
     return has_ident or has_file or bool(_FX_PROJECT_RE.search(folded))
 
 
+def _apply_create_intent(ctx, folded: str) -> bool:
+    """Helper to detect and apply CREATE/MERGE pattern to analysis context."""
+    files = _named_files(ctx)
+    created_set = T._created_files(ctx.scannable or "", folded or "")
+    is_merge = bool(_MERGE_RE.search((folded or "").lower()))
+    non_created = [f for f in files
+                   if f.lower() not in created_set
+                   and _base(f).lower() not in created_set]
+    if is_merge or (created_set and (ctx.pattern is None or not non_created)):
+        ctx.pattern = "CREATE"
+        ctx.fix = False
+        target_cands = [f for f in files
+                        if f.lower() in created_set or _base(f).lower() in created_set]
+        ctx.target = (target_cands[0] if target_cands else (files[0] if files else ""))
+        ctx.create_merge = is_merge
+        ctx.dir_cands = _dir_cands(ctx.last)
+        return True
+    return False
+
+
 def _analyze_s1(messages):
     ctx = _base_analyze(messages)
     if ctx is None or not _c("fix_enabled"):
@@ -7272,19 +7292,7 @@ def _analyze_s1(messages):
                 and _create_intent(ctx.folded, ctx.scannable, ctx.last) \
                 and (_named_files(ctx)
                      or _MERGE_RE.search((ctx.folded or "").lower())):
-            files = _named_files(ctx)
-            created_set = T._created_files(ctx.scannable or "", ctx.folded or "")
-            is_merge = bool(_MERGE_RE.search((ctx.folded or "").lower()))
-            non_created = [f for f in files
-                           if f.lower() not in created_set
-                           and _base(f).lower() not in created_set]
-            if is_merge or (created_set and (ctx.pattern is None or not non_created)):
-                ctx.pattern = "CREATE"
-                target_cands = [f for f in files
-                                if f.lower() in created_set or _base(f).lower() in created_set]
-                ctx.target = (target_cands[0] if target_cands else (files[0] if files else ""))
-                ctx.create_merge = is_merge
-                ctx.dir_cands = _dir_cands(ctx.last)
+            _apply_create_intent(ctx, ctx.folded or "")
         elif not ctx.pattern:
             folded = (ctx.folded or "").lower()
             idents = [s for s in re.findall(r"`([^`\n]+)`", ctx.last or "")
@@ -8735,20 +8743,7 @@ def _analyze_s2(messages):
                     and _create_intent(folded, ctx.scannable, ctx.last)
                     and (_named_files(ctx)
                          or _MERGE_RE.search(folded.lower()))):
-                files = _named_files(ctx)
-                created_set = T._created_files(ctx.scannable or "", folded)
-                is_merge = bool(_MERGE_RE.search(folded.lower()))
-                non_created = [f for f in files
-                               if f.lower() not in created_set
-                               and _base(f).lower() not in created_set]
-                if is_merge or (created_set and not non_created):
-                    ctx.pattern = "CREATE"
-                    ctx.fix = False
-                    target_cands = [f for f in files
-                                    if f.lower() in created_set or _base(f).lower() in created_set]
-                    ctx.target = (target_cands[0] if target_cands else (files[0] if files else ""))
-                    ctx.create_merge = is_merge
-                    ctx.dir_cands = _dir_cands(ctx.last)
+                _apply_create_intent(ctx, folded)
     except Exception as e:
         log(f"[fix4] analyze error: {e}")
     return ctx
