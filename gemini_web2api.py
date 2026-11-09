@@ -1937,23 +1937,6 @@ def is_required_tool_choice(tool_choice) -> bool:
     return False
 
 
-def looks_like_extension_refusal(text: str) -> bool:
-    """True for any length of Gemini's Workspace/Gmail extension refusal.
-
-    Verbose models pad the canned refusal ("I can't use Google Drive because
-    required Gmail settings are off...") with prose, which escapes the anchored
-    :data:`_UPSTREAM_ERROR_RE` and would be handed to the client as a finished
-    reply. Deliberately NOT folded into looks_like_upstream_error(): that one
-    also drives generic retries, and matching loose refusals there would retry
-    genuine answers like "you can't use that tool here".
-    """
-    if not text or len(text) > 800:
-        return False
-    folded = _fold_diacritics(text).lower()
-    return bool(re.search(
-        r"can'?t use [a-z][a-z .'\-]{0,40}? because required .{0,60}?"
-        r"(settings|permissions) are off",
-        folded))
 
 
 def looks_like_upstream_error(text: str) -> bool:
@@ -1979,7 +1962,7 @@ def looks_like_canned_failure(text: str) -> bool:
     """True for ANY upstream canned sentence, at any length.
 
     ``looks_like_upstream_error`` is anchored (whole-string) and
-    ``looks_like_extension_refusal`` caps at 800 chars, so a verbose model that
+    a verbose model that
     pads "Sorry, something went wrong..." or the Workspace-settings refusal
     with prose escapes both and is handed to the client as a finished answer --
     observed live as turns that stall ~60 s and then "stop by themselves".
@@ -2306,7 +2289,7 @@ _SOURCE_NOUN_RE = re.compile(
 )
 
 
-def _is_source_review(folded: str) -> bool:
+def _is_source_review_s1(folded: str) -> bool:
     """True when folded text asks for a review of source/code."""
     if _SOURCE_STRONG_VERB_RE.search(folded) and _SOURCE_NOUN_RE.search(folded):
         return True
@@ -2320,7 +2303,7 @@ _READ_THEN_CHANGE_RE = re.compile(
 )
 
 
-def _is_file_review(folded: str, scannable: str) -> bool:
+def _is_file_review_s1(folded: str, scannable: str) -> bool:
     """True when folded text aims a review verb at a named file.
 
     "Tiep tuc review server.py di." carries no source noun, so
@@ -2532,7 +2515,7 @@ def _source_reads_this_turn(messages) -> int:
     return len({f for f in files if f.endswith(".py")})
 
 
-def review_demanded(messages) -> bool:
+def review_demanded_s1(messages) -> bool:
     """True when the newest user turn asks for a source/code review."""
     last_user = None
     for msg in messages or []:
@@ -2813,7 +2796,7 @@ def _looks_like_identifier(text: str) -> bool:
     return bool(_IDENT_RE.match((text or "").strip()))
 
 
-def _is_change_request(folded: str, scannable: str, raw: str = "") -> bool:
+def _is_change_request_s1(folded: str, scannable: str, raw: str = "") -> bool:
     """True when folded text asks for a code change (fix/implement/update).
 
     ``folded``/``scannable`` come from :func:`_strip_code_spans`, which erases
@@ -3131,6 +3114,7 @@ def _task_pattern_banner_legacy(messages) -> str:
             "no prose, before or after.]"
         )
     return ""
+_task_pattern_banner_orig = _task_pattern_banner_legacy
 
 
 # One definition of the flow feeds the banner, the planner and the validator.
@@ -3961,7 +3945,7 @@ _COOKIE_MTIME_MIN_INTERVAL = 1.0
 _cookie_last_mtime_check = 0.0
 
 
-def log(msg: str):
+def log_s1(msg: str):
     if CONFIG["log_requests"]:
         import sys
         line = f"[{time.strftime('%H:%M:%S')}] {msg}"
@@ -4736,7 +4720,7 @@ def upstream_echo(raw: str):
     return None
 
 
-def check_routing(raw: str, model_id: int, extra_fields: dict = None, ticket: str = None) -> None:
+def check_routing_s1(raw: str, model_id: int, extra_fields: dict = None, ticket: str = None) -> None:
     """Log a warning when upstream served a different model than requested.
 
     A missing or expired model ticket is what causes this: the upstream then
@@ -4788,7 +4772,7 @@ def check_routing(raw: str, model_id: int, extra_fields: dict = None, ticket: st
                     "upstream serves the account default without it)")
 
 
-def _status_error(status) -> GeminiError:
+def _status_error_s1(status) -> GeminiError:
     """Build the GeminiError for an upstream HTTP status.
 
     A 400 with no cookie configured is rarely the client's fault: Google
@@ -5053,7 +5037,7 @@ import re
 from urllib.parse import urlparse
 
 from gemini_web2api.config import CONFIG, _config_lock_ctx
-from gemini_web2api.gemini import load_cookie, make_sapisidhash, _get_ssl_ctx, log
+from gemini_web2api.gemini import load_cookie, make_sapisidhash, _get_ssl_ctx, log_s1 as log
 
 
 def _get_page_tokens() -> dict:
@@ -5210,94 +5194,10 @@ def upload_image(image_bytes: bytes, filename: str = "image.png", mime_type: str
 _MAX_IMAGE_BYTES = 16 * 1024 * 1024
 
 
-def _resolve_public_ip(hostname: str) -> str | None:
-    """Resolve hostname and return a single public IP, or None if blocked.
-
-    This resolves DNS *once* and validates all addresses are global.
-    The caller must then connect directly to this IP to prevent
-    DNS-rebinding / TOCTOU attacks.
-    """
-    if not hostname:
-        return None
-    host = hostname.strip().rstrip(".").strip("[]")
-    # Literal IP: check directly.
-    try:
-        return host if ipaddress.ip_address(host).is_global else None
-    except ValueError:
-        pass
-    # Hostname: resolve and validate all addresses.
-    try:
-        infos = socket.getaddrinfo(host, None)
-    except (socket.gaierror, UnicodeError):
-        return None
-    if not infos:
-        return None
-    public_ip = None
-    for info in infos:
-        try:
-            addr = ipaddress.ip_address(info[4][0])
-            if not addr.is_global:
-                return None  # Any non-global address blocks the whole host.
-            public_ip = str(addr)  # Remember first global address.
-        except ValueError:
-            return None
-    return public_ip
 
 
-def _host_is_private(hostname: str) -> bool:
-    """True when ``hostname`` resolves only to non-public IP addresses.
-
-    Delegates to ``_resolve_public_ip`` for the actual check.
-    """
-    return _resolve_public_ip(hostname) is None
 
 
-def fetch_image_bytes(url: str) -> bytes:
-    """Fetch image from URL."""
-    parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https"):
-        log(f"Image fetch skipped for unsupported URL scheme: {parsed.scheme or 'none'}")
-        return b""
-    if _host_is_private(parsed.hostname or ""):
-        log(f"Image fetch blocked for non-public target: {parsed.hostname or 'none'}")
-        return b""
-    # Resolve IP once and connect directly to prevent DNS-rebinding / TOCTOU.
-    target_ip = _resolve_public_ip(parsed.hostname or "")
-    if not target_ip:
-        log(f"Image fetch blocked: could not resolve public IP for {parsed.hostname}")
-        return b""
-    try:
-        # Reconstruct URL with resolved IP, keeping original Host header.
-        # This avoids fragile string replacement on the full URL.
-        netloc = f"{target_ip}:{parsed.port}" if parsed.port else target_ip
-        reconstructed = parsed._replace(netloc=netloc).geturl()
-        req = urllib.request.Request(
-            reconstructed,
-            headers={"User-Agent": "Mozilla/5.0", "Host": parsed.hostname},
-            method="GET",
-        )
-        proxy = CONFIG.get("proxy")
-        if proxy:
-            # With proxy, we can't pin the IP; rely on proxy's DNS.
-            opener = urllib.request.build_opener(
-                urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
-                urllib.request.HTTPSHandler(context=_get_ssl_ctx()),
-            )
-            with opener.open(req, timeout=30) as resp:
-                data = resp.read(_MAX_IMAGE_BYTES + 1)
-        else:
-            opener = urllib.request.build_opener(
-                urllib.request.HTTPSHandler(context=_get_ssl_ctx()),
-            )
-            with opener.open(req, timeout=30) as resp:
-                data = resp.read(_MAX_IMAGE_BYTES + 1)
-        if len(data) > _MAX_IMAGE_BYTES:
-            log(f"Image fetch failed: body exceeds {_MAX_IMAGE_BYTES} bytes")
-            return b""
-        return data
-    except Exception as e:
-        log(f"Image fetch failed: {e}")
-        return b""
 
 # ==== ssrf5:begin (generated by flow_fix5_patch.py -- re-run to refresh, --revert to remove) ====
 import http.client as _hc
@@ -5311,7 +5211,7 @@ import urllib.error as _uerr
 _MAX_REDIRECTS = 5
 
 
-def _resolve_public_ip(hostname):
+def _resolve_public_ip_s1(hostname):
     """First public IP of ``hostname``, or None if ANY address is non-public."""
     if not hostname:
         return None
@@ -5502,7 +5402,7 @@ from gemini_web2api import tools as T
 from gemini_web2api.config import CONFIG
 from concurrent.futures import ThreadPoolExecutor
 
-from gemini_web2api.gemini import log, generate
+from gemini_web2api.gemini import log_s1 as log, generate
 
 # __all__ removed for unified export
 
@@ -5570,7 +5470,7 @@ def _tokens(name):
     return [t for t in re.split(r"[^A-Za-z0-9]+", spaced.lower()) if t]
 
 
-def tool_kind(name) -> str:
+def tool_kind_s1(name) -> str:
     """read | survey | search | act | exec | other"""
     low = str(name or "").lower()
     toks = set(_tokens(name))
@@ -5789,13 +5689,14 @@ class ToolMap:
         return {"id": f"call_{uuid.uuid4().hex[:8]}", "type": "function",
                 "function": {"name": name,
                              "arguments": json.dumps(args, ensure_ascii=False)}}
+_ToolMap_adapt_orig = ToolMap.adapt
 
 
 # --------------------------------------------------------------------------
 # Bằng chứng trong lượt hiện tại (kể từ message user cuối)
 # --------------------------------------------------------------------------
 
-def _answered_calls(messages):
+def _answered_calls_s1(messages):
     """[{name, kind, args, result}] cho mọi call ĐÃ có tool result trong lượt."""
     start = T._last_user_index(messages)
     calls, out = {}, []
@@ -5834,11 +5735,6 @@ def _call_command(args):
 
 
 _LIST_CMD_RE = re.compile(r"\b(ls|find|dir|tree|git\s+ls-files)\b")
-_TEST_CMD_RE = re.compile(
-    r"\b(unittest|pytest|npm\s+(?:run\s+)?test|yarn\s+test|make\s+test|"
-    r"go\s+test|cargo\s+test)\b")
-_SURVEY_CMD = ('git ls-files 2>/dev/null || find . -type f -not -path '
-               '"./.git/*" -not -path "*/node_modules/*" | head -300')
 
 
 _PATH_LINE_RE = re.compile(
@@ -5849,37 +5745,11 @@ _READ_FAIL_RE = re.compile(
     r"|failed|not found)", re.IGNORECASE)
 
 
-def _read_ok(e):
+def _read_ok_s1(e):
     """Tool result của một lệnh read có thật sự chứa nội dung không."""
     return bool(e["result"].strip()) and not _READ_FAIL_RE.match(e["result"])
 
 
-def _listing_files(ev):
-    """File paths từ kết quả survey/search. Giữ nguyên ổ đĩa (D:/...) và
-    đường dẫn tuyệt đối: cắt mất chúng làm mọi lệnh read sau đó 'not found'."""
-    seen, out = set(), []
-
-    def add(f):
-        f = f.replace("\\", "/")
-        if f not in seen and f.lower() not in T._NON_FILE_NAMES:
-            seen.add(f)
-            out.append(f)
-
-    for e in ev:
-        if not (e["kind"] in ("survey", "search") or (
-                e["kind"] == "exec"
-                and _LIST_CMD_RE.search(_call_command(e["args"])))):
-            continue
-        matched = [m.group(1) for m in map(_PATH_LINE_RE.match,
-                                           e["result"].splitlines()) if m]
-        if matched:
-            for f in matched:
-                add(f)
-        else:  # grep-style "path:line: text" output
-            body = e["result"].replace("\\", "/")
-            for f in sorted(T._files_in(body), key=body.find):
-                add(f)
-    return out
 
 
 def _read_set(ev):
@@ -5903,22 +5773,6 @@ def _is_test_cmd(cmd):
     return bool(_TEST_CMD_RE.search(cmd) or (configured and configured in cmd))
 
 
-def _base_test_command(listing):
-    """Lệnh test: config > autodetect theo listing > None (bỏ qua bước test)."""
-    configured = _cfg("flow_test_command")
-    if configured:
-        return configured
-    names = [f.replace("\\", "/").lower() for f in listing]
-    if any(n.endswith("package.json") for n in names) or any(
-            n.endswith((".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx")) for n in names):
-        return "npm test"
-    if any(n.endswith(".go") for n in names):
-        return "go test ./..."
-    if any(n.endswith(".rs") for n in names):
-        return "cargo test"
-    if any(n.endswith(".py") for n in names):
-        return "python -m unittest discover -s tests"
-    return None
 
 
 def _tests_ran_after_act(ev):
@@ -5983,20 +5837,6 @@ _STOP = set(
     "giup defined define defines used uses work works function class method".split())
 
 
-def _base_keywords(text, limit=6):
-    out = []
-    for m in re.finditer(r"`([^`\n]+)`", text or ""):
-        if not (2 <= len(m.group(1)) <= 60):
-            continue
-        k = re.sub(r"[()\s]", "", m.group(1))
-        if k and k.lower() not in out:
-            out.append(k.lower())
-    folded = T._fold_diacritics(text or "")
-    for w in re.findall(r"[A-Za-z_][A-Za-z0-9_]{3,}", folded):
-        lw = w.lower()
-        if lw not in _STOP and lw not in out:
-            out.append(lw)
-    return out[:limit]
 
 
 def _rank(files, kws, hits=None):
@@ -6032,7 +5872,7 @@ _NEW_KEYS = ("newString", "new_string", "newText", "new_text", "new_str")
 _LINENO_RE = re.compile(r"^\s*\d+(?:: ?|\s*\| ?|\t|\u2192)")
 
 
-def _act_ok(e):
+def _act_ok_s1(e):
     # An edit/write whose result reports a failure must not count as done.
     return not _ACT_FAIL_RE.search((e.get("result") or "")[:400])
 
@@ -6106,54 +5946,6 @@ def _clean_file_text(text):
     return "\n".join(lines)
 
 
-def _base_gate_act_calls(calls, messages):
-    # Check edit calls against the file text the model actually read.
-    # Returns (calls, problems). Line-number prefixes copied into
-    # oldString/newString are stripped silently; a genuine mismatch is
-    # reported (with the closest real line) so the caller can retry.
-    texts = {}
-    for e in _answered_calls(messages):
-        if e["kind"] == "read" and _read_ok(e):
-            p = _call_path(e["args"])
-            if p:
-                texts[p] = _clean_file_text(e["result"])
-    problems, out = [], []
-    for tc in calls:
-        fn = tc.get("function") or {}
-        if tool_kind(fn.get("name")) != "act":
-            out.append(tc)
-            continue
-        args = T._tool_arguments_dict(fn)
-        path = _call_path(args)
-        okey = next((k for k in _OLD_KEYS
-                     if isinstance(args.get(k), str) and args[k]), None)
-        src_text = next((t for p, t in texts.items()
-                         if path and T._path_seen(path, [p])), None)
-        if not (okey and src_text is not None):
-            out.append(tc)           # write/new file/unread file: nothing to check
-            continue
-        old = args[okey].replace("\r\n", "\n")
-        hay = src_text.replace("\r\n", "\n")
-        if old in hay or old.strip("\n") in hay:
-            out.append(tc)
-            continue
-        stripped = _strip_linenos(old)
-        if stripped != old and (stripped in hay or stripped.strip("\n") in hay):
-            args[okey] = stripped
-            for nk in _NEW_KEYS:
-                if isinstance(args.get(nk), str):
-                    args[nk] = _strip_linenos(args[nk])
-            log(f"[flow] edit gate: stripped line-number prefixes in {path}")
-            out.append({**tc, "function": {
-                **fn, "arguments": json.dumps(args, ensure_ascii=False)}})
-            continue
-        first = next((ln.strip() for ln in old.split("\n") if ln.strip()), "")
-        cands = [ln.strip() for ln in hay.split("\n") if ln.strip()]
-        near = difflib.get_close_matches(first, cands, n=1, cutoff=0.6)
-        problems.append(f"{path}: oldString does not appear in the file as read"
-                        + (f" (closest real line: {near[0]!r})" if near else ""))
-        out.append(tc)
-    return out, problems
 
 
 class Step:
@@ -6206,15 +5998,6 @@ _VAGUE_RE = re.compile(
     r"lam|do)\b")
 
 
-def _base_is_code_question(text):
-    scannable = T._strip_code_spans(text)
-    folded = re.sub(r"\s+", " ", T._fold_diacritics(scannable.lower())).strip()
-    if not _QUESTION_RE.search(folded):
-        return False
-    has_ident = bool(re.search(r"`[^`\n]{2,}`", text or ""))
-    has_file = any(f for f in T._files_in(scannable)
-                   if f.lower() not in T._NON_FILE_NAMES)
-    return has_ident or has_file or bool(_PROJECT_RE.search(folded))
 
 
 class _Ctx:
@@ -6275,7 +6058,7 @@ def _clarified(messages, idx):
     return pattern, original
 
 
-def clarification_text(messages):
+def clarification_text_s1(messages):
     """Câu hỏi chọn pattern nếu yêu cầu mơ hồ, else None (opt-in)."""
     if not _cfg("flow_ask_when_unclear") or not messages:
         return None
@@ -6518,21 +6301,9 @@ def _base_plan_for(messages, tm, ctx=None):
 # Map-reduce review: model yếu chỉ nhìn 1-4 file mỗi lượt
 # --------------------------------------------------------------------------
 
-def _review_materials(messages):
-    ev = _answered_calls(messages)
-    files, seen = [], set()
-    for e in ev:
-        if e["kind"] == "read" and _read_ok(e):
-            p = _call_path(e["args"])
-            if p and p not in seen:
-                seen.add(p)
-                files.append((p, e["result"]))
-    tests = [e for e in ev if e["kind"] == "exec"
-             and _is_test_cmd(_call_command(e["args"]))]
-    return files, tests
 
 
-def _make_chunks(files, max_bytes, max_files):
+def _make_chunks_s1(files, max_bytes, max_files):
     """Nhóm file theo thư mục; file quá lớn được cắt theo dòng."""
     out, cur, size = [], [], 0
     for p, body in sorted(files, key=lambda x: x[0]):
@@ -6592,19 +6363,6 @@ def _split_findings(text):
     return items
 
 
-def _verify_findings(text, chunk):
-    """(kept, dropped): chỉ giữ finding có trích dẫn nằm thật trong chunk."""
-    corpus = T._norm_code("\n".join(b for _p, b in chunk))
-    kept, dropped = [], 0
-    if re.fullmatch(r"\W*NONE\W*", (text or "").strip(), re.IGNORECASE):
-        return kept, dropped
-    for item in _split_findings(text):
-        snippets = [s for s in re.findall(r"`([^`\n]+)`", item) if len(s) >= 8]
-        if snippets and all(T._norm_code(x) in corpus for x in snippets):
-            kept.append(item)
-        else:
-            dropped += 1
-    return kept, dropped
 
 
 def _test_summary(tests):
@@ -6623,7 +6381,7 @@ def _test_summary(tests):
     return keep[:6] or [body.strip()[-200:]]
 
 
-def _map_reduce(messages, step, ctx, gen, client_gone=None):
+def _map_reduce_s1(messages, step, ctx, gen, client_gone=None):
     files, tests = _review_materials(messages)
     total = sum(len(b.encode("utf-8", "ignore")) for _p, b in files)
     if not files or total < int(_cfg("flow_mapreduce_min_bytes")):
@@ -6741,17 +6499,7 @@ def _map_model(model_id, think_mode, extra, ticket):
     return m_id, m_think, m_extra, ticket_for(n)
 
 
-def install():
-    """Monkeypatch server.GeminiHandler. Idempotent."""
-    from gemini_web2api import server
-    for k, v in _DEFAULTS.items():
-        CONFIG.setdefault(k, v)
-    cls = server.GeminiHandler
-    _fx_install(server)
-    orig = cls._generate_with_tool_retry
-    if getattr(orig, "_flow_patched", False):
-        return
-
+def _wrap_flow(orig):
     @functools.wraps(orig)
     def wrapper(self, prompt, model_id, think_mode, file_refs, extra,
                 tools_active, allowed_names, tool_schemas, required_tool,
@@ -6899,8 +6647,7 @@ def install():
         return last if last else call(prompt)
 
     wrapper._flow_patched = True
-    cls._generate_with_tool_retry = wrapper
-    log("[flow] flow_patch installed")
+    return wrapper
 
 
 # ==== fix_patch:begin (do fix_patch.py sinh ra; chạy lại script để cập nhật) ====
@@ -7118,7 +6865,7 @@ def _test_runs(ev):
     return out
 
 
-def pick_test_command(names, ev):
+def pick_test_command_s1(names, ev):
     """Lệnh test cần chạy tiếp, hoặc None khi không còn gì để chạy."""
     cands = test_candidates(names)
     if not cands:
@@ -7147,7 +6894,7 @@ def pick_test_command(names, ev):
     return None
 
 
-def _excerpt(text, limit=1800):
+def _excerpt_s1(text, limit=1800):
     lines = (text or "").splitlines()
     for i, ln in enumerate(lines):
         if re.search(r"Traceback|^FAIL|^ERROR|AssertionError|Error:|\bfailed\b|not ok", ln):
@@ -7211,7 +6958,7 @@ def _resolve_locations(locs, listing):
     return out
 
 
-def local_imports(path, text, listing, scored=False):
+def local_imports_s1(path, text, listing, scored=False):
     """File của project mà `text` (nội dung `path`) import.
 
     scored=True trả [(file, số lần dùng)] giảm dần: module được dùng nhiều là
@@ -7271,25 +7018,6 @@ def local_imports(path, text, listing, scored=False):
     return out
 
 
-def _read_texts(ev):
-    out = {}
-    trunc = globals().get("_FF4_TRUNC_RE")
-    off_fn = globals().get("_ff4_off")
-    for e in ev:
-        if e["kind"] != "read" or not _read_ok(e):
-            continue
-        p = _call_path(e["args"])
-        if not p:
-            continue
-        body = _strip_read_envelope(e.get("result") or "")
-        if trunc is not None:
-            body = trunc.sub("", body).rstrip()
-        off = off_fn(e["args"]) if callable(off_fn) else 0
-        if off > 0 and p in out:
-            out[p] += "\n" + body
-        else:
-            out[p] = body
-    return out
 
 
 # --------------------------------------------------------------------------
@@ -7329,7 +7057,6 @@ _CHG_V_RE = re.compile(
     r"|remove|delete|drop|double|halve|increase|decrease|migrate|rename|sua|them"
     r"|cap nhat|bo sung|cai dat|chinh sua|xay dung|trien khai|viet them|lam them"
     r"|nang cap|va loi)\b")
-_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_./-]*$")
 
 # "tạo file / viết script / gộp file": tools._CHANGE_VERB_RE không biết các động từ này.
 _CREATE_V_RE = re.compile(
@@ -7401,7 +7128,7 @@ def _named_files(ctx):
     return sorted(files, key=lambda f: ctx.scannable.find(f))
 
 
-def _existing(known, listing):
+def _existing_s1(known, listing):
     """Bỏ file mã nguồn không có trong listing (file sắp tạo): khỏi đọc file không tồn tại."""
     if not listing:
         return known
@@ -7441,7 +7168,7 @@ _STOP2 = set(_STOP) | set(
 _STOP2 -= {"flow"}
 
 
-def _keywords(text, limit=6):
+def _keywords_s1(text, limit=6):
     """Từ khoá: identifier/backtick trước, từ thường (>=4 ký tự) sau."""
     strong, weak = [], []
     for m in re.finditer(r"`([^`\n]+)`", text or ""):
@@ -7485,7 +7212,7 @@ def _is_code_question(text):
     return has_ident or has_file or bool(_FX_PROJECT_RE.search(folded))
 
 
-def _analyze(messages):
+def _analyze_s1(messages):
     ctx = _base_analyze(messages)
     if ctx is None or not _c("fix_enabled"):
         return ctx
@@ -7601,7 +7328,7 @@ _CREATE_NOTE = ("\nThe file(s) to create do not exist yet: create each one with 
                 "the write tool and the COMPLETE file content.")
 
 
-def _change_tail(pat, ctx, ev, tm, names_all, total, extra=""):
+def _change_tail_s1(pat, ctx, ev, tm, names_all, total, extra=""):
     acts = [e for e in ev if e["kind"] == "act"]
     max_acts = int(_cfg("flow_max_acts"))
     if len(acts) >= max_acts and (not _act_ok(acts[-1])
@@ -7648,7 +7375,7 @@ def _change_tail(pat, ctx, ev, tm, names_all, total, extra=""):
     return st
 
 
-def _plan_change(ctx, ev, tm, pat="CHANGE", total=5):
+def _plan_change_s1(ctx, ev, tm, pat="CHANGE", total=5):
     listing = _listing_files(ev)
     read_set = _read_set(ev)
     batch = max(1, int(_cfg("flow_read_batch")))
@@ -7788,40 +7515,8 @@ _SLASH_COMMENT_EXT = (".js", ".ts", ".tsx", ".jsx", ".mjs", ".cjs", ".go", ".rs"
 _MERGE_SCRIPT = "_merge_tmp.py"
 
 
-def merge_script(srcs, out_path, ext):
-    comment = "//" if ext in _SLASH_COMMENT_EXT else "#"
-    return (_MERGE_TMPL.replace("@@SRC@@", json.dumps(list(srcs)))
-            .replace("@@OUT@@", json.dumps(out_path))
-            .replace("@@C@@", json.dumps(comment))
-            .replace("@@PY@@", "True" if ext == ".py" else "False"))
 
 
-def _merge_sources(ctx, listing):
-    """(files, prefix): file cùng đuôi với target nằm trong thư mục user nêu."""
-    target = _norm(getattr(ctx, "target", "") or "")
-    ext = (posixpath.splitext(target)[1] or ".py").lower()
-    live = [f for f in _live(listing) if f.lower().endswith(ext)]
-    tbase = posixpath.basename(target).lower()
-    for cand in getattr(ctx, "dir_cands", []) or []:
-        dl = _norm(cand).strip("/").split("/")[-1].lower()
-        if not dl:
-            continue
-        groups = {}
-        for f in live:
-            segs = f.split("/")
-            for i, s in enumerate(segs[:-1]):
-                if s.lower() == dl:
-                    groups.setdefault("/".join(segs[:i + 1]), []).append(f)
-        if not groups:
-            continue
-        prefix = max(groups, key=lambda k: (
-            sum(1 for f in groups[k] if posixpath.dirname(f) == k), len(k)))
-        files = sorted({f for f in groups[prefix]
-                        if not _is_test_path(f) and _base(f) != tbase
-                        and _base(f) != _MERGE_SCRIPT})
-        if len(files) >= 2:
-            return files, prefix
-    return [], ""
 
 
 def _write_tool(tm):
@@ -7850,7 +7545,7 @@ def _write_call(tm, path, content):
                          "arguments": json.dumps(args, ensure_ascii=False)}}
 
 
-def _plan_create(ctx, ev, tm):
+def _plan_create_s1(ctx, ev, tm):
     pat, total = "CREATE", 5
     fallback = lambda: _plan_change(ctx, ev, tm, pat="CREATE")  # noqa: E731
     if not getattr(ctx, "create_merge", False) or not ctx.target:
@@ -7975,7 +7670,7 @@ def _hop_targets(ev, listing, read_set, excerpt):
     return ranked[:2]
 
 
-def _plan_debug(ctx, ev, tm):
+def _plan_debug_s1(ctx, ev, tm):
     pat, total = "DEBUG", 6
     listing = _listing_files(ev)
     read_set = _read_set(ev)
@@ -8132,7 +7827,7 @@ def _explain_text(read_files):
             "read'. This is an explanation, NOT a bug report.")
 
 
-def _plan_explain(ctx, ev, tm):
+def _plan_explain_s1(ctx, ev, tm):
     pat, total = "EXPLAIN", 4
     listing = _listing_files(ev)
     read_set = _read_set(ev)
@@ -8190,7 +7885,7 @@ def _plan_explain(ctx, ev, tm):
 # Dispatcher + gate + install
 # --------------------------------------------------------------------------
 
-def _plan(messages, tm, ctx):
+def _plan_s1(messages, tm, ctx):
     ctx = ctx or _analyze(messages)
     if ctx is None or not ctx.pattern:
         return None
@@ -8209,7 +7904,7 @@ def _plan(messages, tm, ctx):
     return _base_plan_for(messages, tm, ctx)
 
 
-def plan_for(messages, tm, ctx=None):
+def plan_for_s1(messages, tm, ctx=None):
     if not _c("fix_enabled"):
         return _base_plan_for(messages, tm, ctx)
     try:
@@ -8222,7 +7917,7 @@ def plan_for(messages, tm, ctx=None):
 _CONTENT_KEYS = ("content", "contents", "text", "fileText", "file_text")
 
 
-def _gate_act_calls(calls, messages):
+def _gate_act_calls_s1(calls, messages):
     out, problems = _base_gate_act_calls(calls, messages)
     try:
         ratio = float(_c("fix_write_shrink_ratio"))
@@ -8267,7 +7962,7 @@ def _test_command(listing):
 _FX_ORIG_CD = None
 
 
-def _fx_install(server):
+def _fx_install_s1(server):
     """Gọi từ install(): mở rộng tools.change_demanded (và bản import trong server)."""
     global _FX_ORIG_CD
     for k, v in _FX_DEFAULTS.items():
@@ -8287,8 +7982,6 @@ def _fx_install(server):
 
 # ==== flowfix2:begin (generated by flow_fix2_patch.py -- re-run to refresh, --revert to remove) ====
 # Overrides (later definitions win: every caller resolves these names at call time).
-_ff2_orig_gate_act_calls = _gate_act_calls
-_ff2_orig_plan_create = _plan_create
 
 
 # --------------------------------------------------------------------------
@@ -8372,71 +8065,6 @@ def _search_hits(ev):
 # 1. Which files does "merge everything in X" mean?
 # --------------------------------------------------------------------------
 
-def _merge_sources(ctx, listing):
-    """``(files, prefix)`` to merge, or ``([], "")``.
-
-    Candidate directories, in order: words the request marks as folders, EVERY
-    word of the request that equals a directory in the listing, the target
-    file's own stem, and finally the biggest Python package (a directory with
-    ``__init__.py``). The old version needed the word "folder"/"thu muc".
-    """
-    target = _norm(getattr(ctx, "target", "") or "")
-    ext = (posixpath.splitext(target)[1] or ".py").lower()
-    live = [f for f in _live(listing) if f.lower().endswith(ext)]
-    tbase = posixpath.basename(target).lower()
-
-    def usable(f):
-        return (not _is_test_path(f) and _base(f) != tbase
-                and _base(f) != _MERGE_SCRIPT)
-
-    def group(dl):
-        groups = {}
-        for f in live:
-            segs = f.split("/")
-            for i, s in enumerate(segs[:-1]):
-                if s.lower() == dl:
-                    groups.setdefault("/".join(segs[:i + 1]), []).append(f)
-        return groups
-
-    def pick(groups):
-        if not groups:
-            return None
-        prefix = max(groups, key=lambda k: (
-            sum(1 for f in groups[k] if posixpath.dirname(f) == k), len(k)))
-        files = sorted({f for f in groups[prefix] if usable(f)})
-        return (files, prefix) if len(files) >= 2 else None
-
-    cands = list(getattr(ctx, "dir_cands", []) or [])
-    raw = getattr(ctx, "last", "") or ""
-    for tok in re.findall(r"[A-Za-z0-9_.\-]+", raw):
-        tok = tok.strip(".-")
-        if len(tok) >= 3:
-            cands.append(tok)
-    stem_t = posixpath.splitext(posixpath.basename(target))[0]
-    if stem_t:
-        cands.append(stem_t)
-    seen = set()
-    for cand in cands:
-        dl = _norm(cand).strip("/").split("/")[-1].lower()
-        if not dl or dl in seen:
-            continue
-        seen.add(dl)
-        hit = pick(group(dl))
-        if hit:
-            return hit
-    if ext == ".py":
-        best = None
-        pkgs = sorted({posixpath.dirname(f) for f in live
-                       if _base(f) == "__init__.py" and not _is_test_path(f)},
-                      key=len)
-        for d in pkgs:
-            files = sorted(f for f in live
-                           if f.startswith(d + "/") and usable(f))
-            if len(files) >= 2 and (best is None or len(files) > len(best[0])):
-                best = (files, d)
-        if best:
-            return best
-    return [], ""
 
 
 # --------------------------------------------------------------------------
@@ -8701,8 +8329,8 @@ def _ff2_bundle_answer(res):
             "hand; the temporary helper already deleted itself.")
 
 
-def _plan_create(ctx, ev, tm):
-    step = _ff2_orig_plan_create(ctx, ev, tm)
+def _plan_create_s2(ctx, ev, tm):
+    step = _plan_create_s1(ctx, ev, tm)
     try:
         if (step is not None and step.name == "answer"
                 and (step.instruction or "").startswith(
@@ -8760,8 +8388,8 @@ def _ff2_stub_problems(calls, messages):
     return problems
 
 
-def _gate_act_calls(calls, messages):
-    out, problems = _ff2_orig_gate_act_calls(calls, messages)
+def _gate_act_calls_s2(calls, messages):
+    out, problems = _gate_act_calls_s1(calls, messages)
     try:
         problems = list(problems) + _ff2_stub_problems(out, messages)
     except Exception as e:
@@ -8772,8 +8400,6 @@ def _gate_act_calls(calls, messages):
 
 # ==== flowfix3:begin (generated by flow_fix3_patch.py -- re-run to refresh, --revert to remove) ====
 # Overrides (later definitions win: every caller resolves these names at call time).
-_ff3_prev_plan_create = _plan_create
-_ff3_prev_install = install
 
 
 def _ff3_key(s):
@@ -8899,8 +8525,8 @@ def _ff3_honest(ctx, ev):
             "what is missing and offer to retry the merge.")
 
 
-def _plan_create(ctx, ev, tm):
-    step = _ff3_prev_plan_create(ctx, ev, tm)
+def _plan_create_s3(ctx, ev, tm):
+    step = _plan_create_s2(ctx, ev, tm)
     try:
         if step is None or not getattr(ctx, "create_merge", False):
             return step
@@ -8992,14 +8618,7 @@ def _ff3_postfilter(result, messages, allowed_names, tool_schemas,
     return msg, None
 
 
-def install():
-    _ff3_prev_install()
-    from gemini_web2api import server
-    cls = server.GeminiHandler
-    cur = cls._generate_with_tool_retry
-    if getattr(cur, "_flow3_patched", False):
-        return
-
+def _wrap_ff3(cur):
     @functools.wraps(cur)
     def wrapper3(self, prompt, model_id, think_mode, file_refs, extra,
                  tools_active, allowed_names, tool_schemas, required_tool,
@@ -9017,17 +8636,12 @@ def install():
             return result
 
     wrapper3._flow3_patched = True
-    cls._generate_with_tool_retry = wrapper3
-    log("[fix3] flow_fix3 installed")
+    return wrapper3
 # ==== flowfix3:end ====
 
 
 # ==== flowfix4:begin (generated by flow_fix4_patch.py -- re-run to refresh, --revert to remove) ====
 # Overrides (later definitions win: every caller resolves these names at call time).
-_ff4_prev_analyze = _analyze
-_ff4_prev_plan_for = plan_for
-_ff4_prev_map_reduce = _map_reduce
-_ff4_prev_install = install
 
 
 # --------------------------------------------------------------------------
@@ -9068,8 +8682,8 @@ def _ff4_wrap_classifiers():
     server._is_source_review = is_source_review
 
 
-def _analyze(messages):
-    ctx = _ff4_prev_analyze(messages)
+def _analyze_s2(messages):
+    ctx = _analyze_s1(messages)
     try:
         if (ctx is not None and _c("fix_enabled") and _c("fix_create_flow")
                 and getattr(ctx, "pattern", None) in ("FILE_REVIEW", "GENERIC_REVIEW")
@@ -9182,7 +8796,6 @@ class _Ff9Trunc:
 
 
 _FF4_TRUNC_RE = _Ff9Trunc()
-_ff9_trunc_orig = _FF4_TRUNC_BASE
 _FF4_MAX_CONT = 32
 
 
@@ -9318,8 +8931,8 @@ def _ff4_continuations(ev, okey):
     return out[:6]
 
 
-def plan_for(messages, tm, ctx=None):
-    step = _ff4_prev_plan_for(messages, tm, ctx)
+def plan_for_s2(messages, tm, ctx=None):
+    step = plan_for_s1(messages, tm, ctx)
     try:
         if (step is not None and step.name == "answer"
                 and step.pattern in ("GENERIC_REVIEW", "FILE_REVIEW", "EXPLAIN",
@@ -9358,8 +8971,8 @@ def _review_materials(messages):
     return [(p, bodies[p]) for p in order], tests
 
 
-def _map_reduce(messages, step, ctx, gen, client_gone=None):
-    report = _ff4_prev_map_reduce(messages, step, ctx, gen, client_gone)
+def _map_reduce_s2(messages, step, ctx, gen, client_gone=None):
+    report = _map_reduce_s1(messages, step, ctx, gen, client_gone)
     if not report:
         return report
     try:
@@ -9441,16 +9054,7 @@ def _ff4_local_answer(exc, messages, tools_active):
     return "\n\n".join(lines)
 
 
-def install():
-    _ff4_prev_install()
-    _ff4_wrap_classifiers()
-    _ff4_extend_canned()
-    from gemini_web2api import server
-    cls = server.GeminiHandler
-    cur = cls._generate_with_tool_retry
-    if getattr(cur, "_flow4_patched", False):
-        return
-
+def _wrap_ff4(cur):
     @functools.wraps(cur)
     def wrapper4(self, prompt, model_id, think_mode, file_refs, extra,
                  tools_active, allowed_names, tool_schemas, required_tool,
@@ -9473,8 +9077,7 @@ def install():
             return text, None
 
     wrapper4._flow4_patched = True
-    cls._generate_with_tool_retry = wrapper4
-    log("[fix4] flow_fix4 installed")
+    return wrapper4
 # ==== flowfix4:end ====
 
 # ==== flowfix5:begin (generated by flow_fix5_patch.py -- re-run to refresh, --revert to remove) ====
@@ -9483,12 +9086,6 @@ import threading as _ff5_threading
 import time as _ff5_time
 import ast as _ff5_ast
 
-_ff5_prev_analyze = _analyze
-_ff5_prev_install = install
-_ff5_prev_plan_for = plan_for
-_ff5_prev_map_reduce = _map_reduce
-_ff5_prev_banner = getattr(T, "_task_pattern_banner_legacy",
-                           T.task_pattern_banner)
 
 _FF5_DEFAULTS = {
     "flow5_enabled": True,
@@ -9610,11 +9207,6 @@ def _ff5_spec_run(pattern):
 _FF5_GRANT_RE = re.compile(
     r"\b(?:go\s+ahead|apply\s+(?:it|the\s+(?:fix|changes?))|you\s+(?:may|can)\s+(?:edit|modify|change)"
     r"|feel\s+free\s+to\s+(?:edit|change|modify)|sua\s+luon|cu\s+sua|ap\s+dung(?:\s+luon)?|cho\s+phep\s+sua)\b")
-_FF5_HOWTO_RE = re.compile(
-    r"\bhow\s+(?:can|could|do|should|would|to)\b|\bshould\s+(?:i|we)\b"
-    r"|\bwhat(?:'s|\s+is)\s+the\s+(?:best\s+)?way\s+to\b"
-    r"|\b(?:lam\s+sao|lam\s+the\s+nao|cach\s+nao|huong\s+dan|chi\s+(?:cach|minh\s+cach))\b"
-    r"|\bnen\s+(?:sua|lam)\s+(?:nhu\s+the\s+nao|ra\s+sao)\b")
 _FF5_NORUN_RE = re.compile(
     r"\b(?:do\s+not|don'?t|dont|never)\s+(?:run|execute)\s+(?:any\s+)?(?:commands?|shell|scripts?|anything)\b"
     r"|\b(?:khong|dung)\s+(?:duoc\s+)?chay\s+(?:bat\s+ky\s+)?(?:lenh|command|script|shell)\b")
@@ -9734,10 +9326,9 @@ def _ff5_permissions(messages, pattern=None, fix=False):
                     scope=None)
 
 
-_ff6c_prev_permissions = _ff8_prev_permissions = _ff9_prev_permissions = _ff5_permissions
 
 
-def _ff5_scope(ctx, messages):
+def _ff5_scope_s1(ctx, messages):
     """Files this request may write. ``None`` = undecided, do not tighten;
     ``[]`` = an empty but known scope, i.e. NO write is allowed (fail closed).
     Unified scope resolution handling unnamed requests, create targets, and read test files.
@@ -9780,40 +9371,12 @@ def _ff5_scope(ctx, messages):
     return []          # this pattern must not write at all
 
 
-_ff6c_prev_scope = _ff14_prev_scope = _ff5_scope
 
 
-def _ff5_in_scope(path, scope):
-    # The merge helper is proxy-managed: allowed before the empty-scope check.
-    if _base(path) == _MERGE_SCRIPT:
-        return True
-    if not scope:
-        return False
-    return any(T._path_seen(path, [x]) for x in scope)
 
 
-def _ff5_scope_problems(calls, messages, perm):
-    scope = getattr(perm, "scope", None) if perm is not None else None
-    # None = the scope could not be determined: do not tighten. An explicit
-    # [] IS a restriction: every act call is out of scope (merge helper aside).
-    if scope is None:
-        return []
-    problems = []
-    shown = ", ".join(scope[:6]) or "(no write target)"
-    for tc in calls or []:
-        fn = (tc or {}).get("function") or {}
-        if tool_kind(fn.get("name")) != "act":
-            continue
-        path = _call_path(T._tool_arguments_dict(fn))
-        if path and not _ff5_in_scope(path, scope):
-            problems.append(
-                f"{path}: outside this request's write scope ({shown}). "
-                "Only edit the files the user named or the files read in this turn.")
-    return problems
 
 
-def _ff5_edit_forbidden(messages):
-    return not _ff5_permissions(messages).edit
 
 
 _FF5_RO_SEG_RE = re.compile(
@@ -10045,8 +9608,6 @@ def _ff5_adapt_calls(calls, tm):
 # truncated read is continued by the proxy before anything else happens.
 # --------------------------------------------------------------------------
 
-def _ff5_read_events(messages):
-    return [e for e in _answered_calls(messages) if e["kind"] == "read"]
 
 
 def _ff5_same_path(a, b):
@@ -10069,7 +9630,7 @@ def _ff5_local_step(ctx, text):
     return st
 
 
-def _ff5_evidence_gate(ctx, messages, tm):
+def _ff5_evidence_gate_s1(ctx, messages, tm):
     """``(step, stop_text)``. A read/continuation step wins; ``stop_text`` is a
     deterministic refusal that must not fall through to an edit or an answer."""
     if ctx is None or not getattr(ctx, "pattern", None):
@@ -10491,7 +10052,7 @@ def _ff5_step_driven(step):
     return bool(getattr(step, "drive", False) and _cfg("flow_drive"))
 
 
-def _build_step_prompt_core(ctx, step, messages, tm):
+def _build_step_prompt_core_s1(ctx, step, messages, tm):
     """Dựng lean step prompt; trả None nếu step nằm ngoài phạm vi lean path."""
     if step is None or tm is None:
         return None
@@ -10549,7 +10110,7 @@ def build_step_prompt(ctx, step, messages, tm):
         return None
 
 
-def _ff5_after_plan(step, messages, tm, ctx=None):
+def _ff5_after_plan_s1(step, messages, tm, ctx=None):
     """Final transition guard shared by every pattern (proposal 5 + 2 + 6)."""
     if ctx is None:
         try:
@@ -10609,9 +10170,9 @@ def _ff5_plan_after(step, messages, tm, ctx=None):
         return step
 
 
-def plan_for(messages, tm, ctx=None):
+def plan_for_s3(messages, tm, ctx=None):
     """Final planner: every pattern passes the universal transition guard."""
-    step = _ff5_prev_plan_for(messages, tm, ctx)
+    step = plan_for_s2(messages, tm, ctx)
     return _ff5_plan_after(step, messages, tm, ctx)
 
 
@@ -10645,26 +10206,9 @@ def _ff5_trunc_re():
     return globals().get("_FF4_TRUNC_RE") or _FF5_TRUNC_RE
 
 
-def _ff5_py_defs(tree):
-    """Top-level definitions of one module: name -> facts used by the pass."""
-    out = {}
-    for node in getattr(tree, "body", ()):
-        if isinstance(node, (_ff5_ast.FunctionDef, _ff5_ast.AsyncFunctionDef)):
-            args = node.args
-            total = len(getattr(args, "posonlyargs", ())) + len(args.args)
-            required = max(0, total - len(args.defaults))
-            out[node.name] = {
-                "kind": "function", "required": required, "total": total,
-                "vararg": args.vararg is not None,
-                "line": getattr(node, "lineno", 0),
-            }
-        elif isinstance(node, _ff5_ast.ClassDef):
-            out[node.name] = {"kind": "class", "required": 0, "total": 0,
-                              "vararg": True, "line": getattr(node, "lineno", 0)}
-    return out
 
 
-def _ff5_py_modules(messages):
+def _ff5_py_modules_s1(messages):
     """{stem: [module]} for every Python file read successfully this turn."""
     mods = {}
     for e in _answered_calls(messages):
@@ -10697,20 +10241,6 @@ def _ff5_py_target(mods, dotted):
     return cands[0]
 
 
-def _ff5_arg_problem(node, info):
-    if info.get("kind") != "function":
-        return ""
-    given = len(node.args)
-    if any(isinstance(a, _ff5_ast.Starred) for a in node.args):
-        return ""
-    required, total = info.get("required", 0), info.get("total", 0)
-    if given < required:
-        return ("expects at least %d positional argument(s) but got %d"
-                % (required, given))
-    if given > total and not info.get("vararg"):
-        return ("expects at most %d positional argument(s) but got %d"
-                % (total, given))
-    return ""
 
 
 def _ff5_cross_module(messages):
@@ -10796,7 +10326,7 @@ def _ff5_cross_module(messages):
 
 def _map_reduce(messages, step, ctx, gen, client_gone=None):
     """Final map-reduce: append the cross-module pass to every review report."""
-    report = _ff5_prev_map_reduce(messages, step, ctx, gen, client_gone)
+    report = _map_reduce_s2(messages, step, ctx, gen, client_gone)
     if not report or not _c5("flow6_cross_module"):
         return report
     try:
@@ -10810,7 +10340,7 @@ def _map_reduce(messages, step, ctx, gen, client_gone=None):
     return report
 
 
-def _ff5_own_result(step, ctx, messages, tm, perm):
+def _ff5_own_result_s1(step, ctx, messages, tm, perm):
     if step is None:
         return None
     if step.text is not None:
@@ -10870,20 +10400,20 @@ def _ff5_install_banner():
 # Proposal 6: one banner generated from the same SPEC as the planner.
 # --------------------------------------------------------------------------
 
-def _ff5_spec_banner(messages):
+def _ff5_spec_banner_s1(messages):
     try:
         # Banner, planner and validator share ONE source of truth: the full
         # analysis (sticky context, permissions, create/merge, debug-fix),
         # not a bare detect_task_pattern + ad-hoc _Ctx fallback.
         ctx = _analyze(messages)
         if ctx is None or not getattr(ctx, "pattern", None):
-            return _ff5_prev_banner(messages)
+            return _task_pattern_banner_orig(messages)
         pattern = _ff5_pat(ctx.pattern)
         fix = bool(getattr(ctx, "fix", False))
         perm = getattr(ctx, "perm", None) or \
             _ff5_permissions(messages, pattern, fix)
         if pattern not in _FF5_SPEC:
-            return _ff5_prev_banner(messages)
+            return _task_pattern_banner_orig(messages)
         # Same downgrade the planner performs: a CHANGE/CREATE request without
         # write permission is guidance only, so the banner must not announce an
         # edit stage the validator will reject.
@@ -10908,7 +10438,7 @@ def _ff5_spec_banner(messages):
                 % (pattern, " -> ".join(steps), tail))
     except Exception as e:
         log(f"[fix6] banner error, using the previous banner: {e}")
-        return _ff5_prev_banner(messages)
+        return _task_pattern_banner_orig(messages)
 
 
 _FF5_REVERT_RE = re.compile(
@@ -11012,15 +10542,6 @@ def _ff5_noedit_text(text):
     return bool(_FF5_NOEDIT_RE.search(folded))
 
 
-def _ff5_is_windows(messages):
-    pat = re.compile(r"ParserError|PowerShell|not a valid statement separator|\bwin32\b|"
-                     r"Platform:\s*windows|\b[A-Za-z]:[\\/]", re.I)
-    for msg in messages or []:
-        if isinstance(msg, dict):
-            body = T._stringify_content(msg.get("content", ""))[:20000]
-            if pat.search(body):
-                return True
-    return False
 
 
 def _ff5_split_and(cmd):
@@ -11099,18 +10620,6 @@ def _ff5_command_from(raw):
     return ""
 
 
-def _ff5_git_cmd(m):
-    sub = m.group(1).lower()
-    flags = []
-    for tok in (m.group(2) or "").split():
-        if tok.startswith("-"):
-            flags.append(tok)
-        else:
-            break
-    if not flags:
-        flags = {"status": ["--short", "--branch"],
-                 "log": ["--oneline", "-n", "20"]}.get(sub, [])
-    return " ".join(["git", "--no-pager", sub] + flags)
 
 
 _FF5_PLAN_RE = re.compile(
@@ -11118,7 +10627,7 @@ _FF5_PLAN_RE = re.compile(
     r"(?:implementation\s+|detailed\s+)?(?:plan|ke\s+hoach)\b|\bplan\s+(?:for|how|to)\b|\blap\s+ke\s+hoach\b")
 
 
-def _ff5_detect(ctx):
+def _ff5_detect_s1(ctx):
     """Pattern for the new request shapes, else None."""
     folded = (ctx.folded or "").lower()
     raw = ctx.last or ""
@@ -11158,38 +10667,9 @@ def _ff5_classify_prompt(text):
     return T.defuse_extension_words("\n".join(lines))
 
 
-def _ff5_classify(text):
-    """Label from the catalog, or None (NONE / unknown / error -> model runs freely)."""
-    text = (text or "").strip()
-    if len(text) < 8:
-        return None
-    key = _ff5_hashlib.sha1(text.encode("utf-8", "ignore")).hexdigest()
-    if key in _ff5_cache:
-        return _ff5_cache[key]
-    model = getattr(_ff5_tls, "model", None)
-    if not model:
-        return None
-    label = None
-    try:
-        m_id, m_think, m_extra, m_ticket = model
-        raw = generate(_ff5_classify_prompt(text), m_id, m_think, None, m_extra, m_ticket)
-        if raw and not T.looks_like_canned_failure(raw):
-            for w in re.findall(r"[A-Z][A-Z_]{3,}", raw.upper()):
-                if w in _FF5_CATALOG:
-                    label = w
-                    break
-                if w == "NONE":
-                    break
-        log(f"[fix5] model classified the request as {label or 'NONE'}")
-    except Exception as e:
-        log(f"[fix5] classify failed, model runs freely: {e}")
-    if len(_ff5_cache) > 300:
-        _ff5_cache.clear()
-    _ff5_cache[key] = label
-    return label
 
 
-def _ff5_apply_label(ctx, label):
+def _ff5_apply_label_s1(ctx, label):
     if not label or label not in _FF5_CATALOG:
         return
     raw = ctx.last or ""
@@ -11231,7 +10711,7 @@ def _ff5_supplement(ctx):
 def _ff5_inherit(messages):
     idxs = [i for i, m in enumerate(messages) if isinstance(m, dict) and m.get("role") == "user"]
     for j in reversed(idxs[:-1]):
-        prev = _ff5_prev_analyze(messages[:j + 1])
+        prev = _analyze_s2(messages[:j + 1])
         if prev is None:
             continue
         for k, v in (("git_cmd", ""), ("cmd", ""), ("fix", False), ("target", ""),
@@ -11250,8 +10730,8 @@ def _ff5_inherit(messages):
     return None
 
 
-def _analyze(messages):
-    ctx = _ff5_prev_analyze(messages)
+def _analyze_s3(messages):
+    ctx = _analyze_s2(messages)
     if ctx is None or not _c5("flow5_enabled"):
         return ctx
     try:
@@ -11582,7 +11062,7 @@ def _ff5_block(out, limit=4000):
     return "```\n" + (out or "(no output)") + "\n```"
 
 
-def _ff5_plan_tests(ctx, messages, tm):
+def _ff5_plan_tests_s1(ctx, messages, tm):
     ev = _answered_calls(messages)
     if not tm.first("exec"):
         return _ff5_say(ctx, "Không có công cụ shell để chạy test.", "No shell tool to run tests.")
@@ -11614,7 +11094,7 @@ def _ff5_plan_tests(ctx, messages, tm):
                                                     _ff5_block(body, 1600)))
 
 
-def _ff5_plan_command(ctx, messages, tm, cmd, label):
+def _ff5_plan_command_s1(ctx, messages, tm, cmd, label):
     ev = _answered_calls(messages)
     cmd = _ff5_fix_for(cmd, messages)
     runs = [e for e in ev if e["kind"] == "exec" and _call_command(e["args"]).strip() == cmd.strip()]
@@ -11626,7 +11106,7 @@ def _ff5_plan_command(ctx, messages, tm, cmd, label):
     return _Ff5Step("say", text="`%s`\n%s" % (cmd, _ff5_block(runs[-1]["result"])))
 
 
-def _ff5_plan(ctx, messages, tm):
+def _ff5_plan_s1(ctx, messages, tm):
     p = ctx.pattern
     if p == "REVERT":
         return _ff5_plan_revert(ctx, messages, tm)
@@ -11643,7 +11123,7 @@ def _ff5_plan(ctx, messages, tm):
 # Findings 3 + 4: fail-closed act gate, read guard, per-file quote verifier
 # --------------------------------------------------------------------------
 
-def _ff5_read_guard(ctx, messages):
+def _ff5_read_guard_s1(ctx, messages):
     """Text when a failed read would otherwise lead on to an edit step, else None."""
     if getattr(ctx, "pattern", None) not in ("CHANGE", "DEBUG"):
         return None
@@ -11692,7 +11172,7 @@ def _ff5_quote_ok(snip, cand, line):
     return False
 
 
-def _verify_findings(text, chunk):
+def _verify_findings_s1(text, chunk):
     """(kept, dropped). A quote counts only inside the file the finding names,
     and (when the file shows line numbers) within 5 lines of the claimed one."""
     kept, dropped = [], 0
@@ -11748,46 +11228,6 @@ def _ff5_successful_read_paths(messages):
     return out
 
 
-def _ff5_act_needs_read_problems(calls, messages, ctx):
-    """Read-before-edit: an act on an existing file needs a successful read.
-
-    Only enforced for real code-change intent (CHANGE, or DEBUG with fix=True)
-    -- exactly the scope of :func:`_ff5_read_guard`, which however only fires
-    when a read *failed*; this closes the fail-open hole where the model emits
-    an edit without ever reading the file.
-    """
-    pattern = getattr(ctx, "pattern", None)
-    fix = bool(getattr(ctx, "fix", False))
-
-    # Chỉ ép read-before-edit với intent sửa code thật sự
-    if pattern not in ("CHANGE", "DEBUG"):
-        return []
-    if pattern == "DEBUG" and not fix:
-        return []
-
-    good_reads = _ff5_successful_read_paths(messages)
-    problems = []
-
-    for tc in calls or []:
-        fn = (tc or {}).get("function") or {}
-        if tool_kind(fn.get("name")) != "act":
-            continue
-
-        args = T._tool_arguments_dict(fn)
-        path = _call_path(args)
-        if not path:
-            continue
-
-        # Helper merge script là ngoại lệ do proxy tự quản lý
-        if _base(path) == _MERGE_SCRIPT:
-            continue
-
-        if not any(T._path_seen(path, [p]) for p in good_reads):
-            problems.append(
-                f"{path}: cannot edit/write before a successful read of this file"
-            )
-
-    return problems
 
 
 def _ff5_has_fresh_evidence_after_last_act(messages, path):
@@ -11843,7 +11283,7 @@ def _ff5_has_fresh_evidence_after_last_act(messages, path):
     return False
 
 
-def _ff5_postfilter(result, messages, perm=None, last=True, tm=None, ctx=None):
+def _ff5_postfilter_s1(result, messages, perm=None, last=True, tm=None, ctx=None):
     """Returns (result, nudge). ``nudge`` is a corrective instruction naming the
     SPECIFIC problem when a guard rejected the output and a retry is still
     allowed (last=False); on the last attempt the guard blocks instead
@@ -12055,18 +11495,7 @@ def _ff5_wrap_change(server):
             server.change_demanded = change_demanded
 
 
-def install():
-    _ff5_prev_install()
-    for k, v in _FF5_DEFAULTS.items():
-        CONFIG.setdefault(k, v)
-    from gemini_web2api import server
-    _ff5_wrap_change(server)
-    _ff5_install_banner()
-    cls = server.GeminiHandler
-    cur = cls._generate_with_tool_retry
-    if getattr(cur, "_flow5_patched", False):
-        return
-
+def _wrap_ff5(cur):
     @functools.wraps(cur)
     def wrapper5(self, prompt, model_id, think_mode, file_refs, extra,
                  tools_active, allowed_names, tool_schemas, required_tool,
@@ -12135,16 +11564,12 @@ def install():
             return result
 
     wrapper5._flow5_patched = True
-    cls._generate_with_tool_retry = wrapper5
-    log("[fix5] flow_fix5 installed")
+    return wrapper5
 # ==== flowfix5:end ====
 
 # ==== flowfix6b:begin (generated by patch_flow_critical.py) ====
 # 4. default perm TOOL_DEMAND (unified into _ff5_postfilter)
 # Overrides (later definitions win: callers resolve these names at call time).
-_ff6b_prev_postfilter = _ff5_postfilter
-_ff6b_prev_cmd_readonly = _ff5_cmd_readonly
-_ff6b_prev_plan = _ff5_plan
 
 
 # 3. tighter read-only check (unified into _ff5_cmd_readonly)
@@ -12172,11 +11597,11 @@ def _ff5_plan(ctx, messages, tm):
                 "I did not revert anything: reverting edits or deletes files and "
                 "that is not allowed here (%s). If you really want it, say so "
                 "explicitly, e.g. 'go ahead and revert the changes'." % perm.reason)
-    return _ff6b_prev_plan(ctx, messages, tm)
+    return _ff5_plan_s1(ctx, messages, tm)
 
 
 # 6a. classifier: never cache an upstream failure as "NONE"
-def _ff5_classify(text):
+def _ff5_classify_s1(text):
     text = (text or "").strip()
     if len(text) < 8:
         return None
@@ -12210,7 +11635,7 @@ def _ff5_classify(text):
 
 
 # 6b. cross-module: keyword args, **kwargs and decorators are not arity errors
-def _ff5_py_defs(tree):
+def _ff5_py_defs_s1(tree):
     out = {}
     for node in getattr(tree, "body", ()):
         if isinstance(node, (_ff5_ast.FunctionDef, _ff5_ast.AsyncFunctionDef)):
@@ -12233,7 +11658,7 @@ def _ff5_py_defs(tree):
     return out
 
 
-def _ff5_arg_problem(node, info):
+def _ff5_arg_problem_s1(node, info):
     if info.get("kind") != "function" or info.get("decorated"):
         return ""
     if any(isinstance(a, _ff5_ast.Starred) for a in node.args):
@@ -12255,10 +11680,6 @@ def _ff5_arg_problem(node, info):
 # ==== flowfix6b:end ====
 
 # ==== flowfix6c:begin (generated by patch_flow_design.py) ====
-_ff6c_prev_permissions = _ff5_permissions
-_ff6c_prev_scope = _ff5_scope
-_ff6c_prev_guard = _ff5_read_guard
-_ff6c_prev_gate = _ff5_evidence_gate
 
 _FF6C_NOTFOUND_RE = re.compile(
     r"(?i)no such file|not found|does not exist|enoent|cannot find|"
@@ -12281,68 +11702,8 @@ def _ff6c_survey_listing(ev):
     return _listing_files(sub) if sub else []
 
 
-def _ff6c_proven_new(path, messages):
-    """True only with evidence that ``path`` does not exist yet."""
-    ev = _answered_calls(messages)
-    for e in ev:
-        p = _call_path(e["args"])
-        if (e["kind"] == "read" and p and T._path_seen(path, [p])
-                and _ff5_status(e) in ("success", "partial")):
-            return False
-    for e in ev:
-        p = _call_path(e["args"])
-        if (e["kind"] == "read" and p and T._path_seen(path, [p])
-                and _ff5_status(e) == "failed"
-                and _FF6C_NOTFOUND_RE.search((e["result"] or "")[:300])):
-            return True
-    listing = _ff6c_survey_listing(ev)
-    if (listing and path.lower().endswith(_SRC_EXT)
-            and not any(T._path_seen(path, [f]) for f in listing)):
-        return True
-    return False
 
 
-def _ff5_act_needs_read_problems(calls, messages, ctx):
-    pattern = getattr(ctx, "pattern", None)
-    fix = bool(getattr(ctx, "fix", False))
-    if pattern not in ("CHANGE", "DEBUG", "CREATE"):
-        return []
-    if pattern == "DEBUG" and not fix:
-        return []
-    tracked = _ff9_read_texts(messages) if "_ff9_read_texts" in globals() else {}
-    good = list(set(_ff5_successful_read_paths(messages)).union(tracked.keys()))
-    listing = _ff6c_survey_listing(_answered_calls(messages))
-    problems = []
-    for tc in calls or []:
-        fn = (tc or {}).get("function") or {}
-        if tool_kind(fn.get("name")) != "act":
-            continue
-        args = T._tool_arguments_dict(fn)
-        path = _call_path(args)
-        if not path or _base(path) == _MERGE_SCRIPT:
-            continue
-        if any(T._path_seen(path, [p]) for p in good):
-            continue
-        is_write = _ff6c_is_write(args)
-        if pattern == "CREATE":
-            exists = bool(listing) and any(T._path_seen(path, [f]) for f in listing)
-            if is_write and exists:
-                problems.append(
-                    f"{path}: this file already exists -- read it first, or "
-                    "choose a different file name")
-            elif not is_write:
-                problems.append(
-                    f"{path}: cannot edit this file before a successful read of it")
-            continue
-        if is_write and _ff6c_proven_new(path, messages):
-            continue
-        hint = (" If this is a NEW file, first prove it does not exist (a glob/ls "
-                "listing, or a read that returns 'not found'); if it exists, read "
-                "it first." if is_write else "")
-        problems.append(
-            f"{path}: cannot edit/write before a successful read of this file"
-            + hint)
-    return problems
 
 
 def _ff5_scope_problems(calls, messages, perm):
@@ -12416,12 +11777,12 @@ def _ff6c_filter(ctx, messages):
         return messages
 
 
-def _ff5_read_guard(ctx, messages):
-    return _ff6c_prev_guard(ctx, _ff6c_filter(ctx, messages))
+def _ff5_read_guard_s2(ctx, messages):
+    return _ff5_read_guard_s1(ctx, _ff6c_filter(ctx, messages))
 
 
-def _ff5_evidence_gate(ctx, messages, tm):
-    return _ff6c_prev_gate(ctx, _ff6c_filter(ctx, messages), tm)
+def _ff5_evidence_gate_s2(ctx, messages, tm):
+    return _ff5_evidence_gate_s1(ctx, _ff6c_filter(ctx, messages), tm)
 # ==== flowfix6c:end ====
 
 # ==== flowfix8:begin (generated by flow_fix8_patch.py -- re-run to refresh, --revert to remove) ====
@@ -12453,13 +11814,11 @@ _ff8_tls = _ff8_threading.local()
 #    reason about (newline, background &, backticks, $(), redirects, writing flags)
 # --------------------------------------------------------------------------
 
-_ff8_prev_cmd_readonly = _ff5_cmd_readonly
 
 # (Shell safety check unified into _ff5_cmd_readonly above)
 
 
 # 4. Edit grant and run grant are independent (unified into _ff5_permissions above)
-_ff8_prev_permissions = _ff5_permissions
 
 
 # --------------------------------------------------------------------------
@@ -12536,12 +11895,11 @@ def _ff8_proven_absent(path, ev):
     return _ff8_failed_notfound(path, ev) or _ff8_listing_absent(path, ev)
 
 
-_ff8_prev_existing = _existing
 
 
 def _existing(known, listing):
     if not _c8("flow8_absence_proof"):
-        return _ff8_prev_existing(known, listing)
+        return _existing_s1(known, listing)
     msgs = getattr(_ff8_tls, "messages", None)
     if not msgs:
         return list(known)
@@ -12550,18 +11908,17 @@ def _existing(known, listing):
             if not f.lower().endswith(_SRC_EXT) or not _ff8_listing_absent(f, ev)]
 
 
-_ff8_prev_plan = _plan
 
 
 def _plan(messages, tm, ctx):
     _ff8_tls.messages = messages
     try:
-        return _ff8_prev_plan(messages, tm, ctx)
+        return _plan_s1(messages, tm, ctx)
     finally:
         _ff8_tls.messages = None
 
 
-_ff8_prev_plan_create = _plan_create
+_ff8_prev_plan_create = _plan_create_s3
 
 
 def _plan_create(ctx, ev, tm):
@@ -12650,11 +12007,10 @@ def _ff8_write_check(result, messages, ctx):
     return (text, new), probs
 
 
-_ff8_prev_postfilter = _ff5_postfilter
 
 
-def _ff5_postfilter(result, messages, perm=None, last=True, tm=None, ctx=None):
-    result, nudge = _ff8_prev_postfilter(result, messages, perm, last, tm, ctx)
+def _ff5_postfilter_s2(result, messages, perm=None, last=True, tm=None, ctx=None):
+    result, nudge = _ff5_postfilter_s1(result, messages, perm, last, tm, ctx)
     if nudge is not None or not _c8("flow8_write_regate"):
         return result, nudge
     if not (isinstance(result, tuple) and len(result) == 2 and result[1]):
@@ -12719,7 +12075,7 @@ def _ff8_file_views(ev):
     return out
 
 
-def _ff8_render_view(v, kws, locs, budget):
+def _ff8_render_view_s1(v, kws, locs, budget):
     lines = v["text"].split("\n")
     n = len(lines)
     non_empty_lns = [ln for ln in lines if ln.strip() and not _READ_HEADER_RE.match(ln) and not _READ_FOOTER_RE.match(ln)]
@@ -12773,7 +12129,7 @@ def _ff8_render_view(v, kws, locs, budget):
     return "\n".join(out)
 
 
-def _ff8_source_block(ctx, stage, messages):
+def _ff8_source_block_s1(ctx, stage, messages):
     ev = _answered_calls(messages)
     views = _ff8_file_views(ev)
     if not views:
@@ -12830,11 +12186,10 @@ def _ff8_source_block(ctx, stage, messages):
     return "\n".join(out)
 
 
-_ff8_prev_core = _build_step_prompt_core
 
 
 def _build_step_prompt_core(ctx, step, messages, tm):
-    base = _ff8_prev_core(ctx, step, messages, tm)
+    base = _build_step_prompt_core_s1(ctx, step, messages, tm)
     if base is None or not _c8("flow8_lean_source"):
         return base
     stage = getattr(step, "stage", None) or _ff5_stage(step)
@@ -12897,15 +12252,10 @@ def _ff8_patch_gemini():
     log("[fix8] gemini.bard_error_code: answer text no longer counts as a rejection")
 
 
-_ff8_prev_install = install
-
-
-def install():
-    _ff8_prev_install()
-    try:
-        _ff8_patch_gemini()
-    except Exception as e:
-        log("[fix8] gemini patch failed: %s" % e)
+def _setup_ff8():
+    for k, v in _FF8_DEFAULTS.items():
+        CONFIG.setdefault(k, v)
+    _ff8_patch_gemini()
 
 
 # --------------------------------------------------------------------------
@@ -12944,11 +12294,10 @@ if _c8("flow8_destructive_wide") and not getattr(_FF5_DESTRUCTIVE_RE, "_ff8", Fa
 #    the user said "do not edit" or only asked HOW to undo something.
 # --------------------------------------------------------------------------
 
-_ff8_prev_analyze = _analyze
 
 
-def _analyze(messages):
-    ctx = _ff8_prev_analyze(messages)
+def _analyze_s4(messages):
+    ctx = _analyze_s3(messages)
     try:
         if (ctx is not None and _c8("flow8_revert_needs_edit")
                 and getattr(ctx, "pattern", None) == "REVERT"
@@ -12967,10 +12316,9 @@ def _analyze(messages):
     return ctx
 
 
-_ff8_prev_own_result = _ff5_own_result
 
 
-def _ff5_own_result(step, ctx, messages, tm, perm):
+def _ff5_own_result_s2(step, ctx, messages, tm, perm):
     """Second line of defence: a REVERT step without edit rights may only run
     read-only commands (the git status probes)."""
     try:
@@ -12988,14 +12336,11 @@ def _ff5_own_result(step, ctx, messages, tm, perm):
                         "Edits are not allowed here, so I reverted and deleted nothing.").text, None
     except Exception as e:
         log("[fix8] own-result guard error: %s" % e)
-    return _ff8_prev_own_result(step, ctx, messages, tm, perm)
+    return _ff5_own_result_s1(step, ctx, messages, tm, perm)
 # ==== flowfix8:end ====
 
 # ==== flowfix9:begin (generated by flow_fix9_patch.py -- re-run to refresh, --revert to remove) ====
 # Overrides (later definitions win: callers resolve these names at call time).
-_ff9_prev_permissions = _ff5_permissions
-_ff9_prev_detect = _ff5_detect
-_ff9_prev_apply_label = _ff5_apply_label
 
 
 # 1. flowfix8 permissions rule (unified into _ff5_permissions above)
@@ -13017,8 +12362,8 @@ def _ff9_run_negated(ctx):
     return bool(_FF9_NEG_RUN_RE.search(folded))
 
 
-def _ff5_detect(ctx):
-    det = _ff9_prev_detect(ctx)
+def _ff5_detect_s2(ctx):
+    det = _ff5_detect_s1(ctx)
     if det in _FF9_RUN_PATTERNS and _ff9_run_negated(ctx):
         log("[fix9] run request is negated by the user -> not a %s request" % det)
         ctx.cmd = ""
@@ -13027,51 +12372,16 @@ def _ff5_detect(ctx):
     return det
 
 
-def _ff5_apply_label(ctx, label):
+def _ff5_apply_label_s2(ctx, label):
     if label in _FF9_RUN_PATTERNS and _ff9_run_negated(ctx):
         log("[fix9] classifier label %s ignored: the user negated running" % label)
         return
-    return _ff9_prev_apply_label(ctx, label)
+    return _ff5_apply_label_s1(ctx, label)
 
 # 3. Edit gate: join continued reads, forget text that an edit made stale.
-def _ff9_read_texts(messages):
-    texts = {}
-    for e in _answered_calls(messages):
-        p = _call_path(e["args"])
-        if not p:
-            continue
-        if e["kind"] == "act":
-            if _act_ok(e):
-                args_a = e.get("args") or {}
-                okey_a = next((k for k in _OLD_KEYS
-                               if isinstance(args_a.get(k), str) and args_a[k]), None)
-                nkey_a = next((k for k in _NEW_KEYS
-                               if isinstance(args_a.get(k), str)), None)
-                for k in [k for k in texts if T._path_seen(p, [k])]:
-                    if okey_a and nkey_a is not None:
-                        old_s = _strip_linenos(args_a[okey_a].replace("\r\n", "\n"))
-                        new_s = _strip_linenos(args_a[nkey_a].replace("\r\n", "\n"))
-                        cur_t = texts[k].replace("\r\n", "\n")
-                        if old_s in cur_t:
-                            texts[k] = cur_t.replace(old_s, new_s, 1)
-                            continue
-                        if old_s.strip("\n") and old_s.strip("\n") in cur_t:
-                            texts[k] = cur_t.replace(old_s.strip("\n"), new_s.strip("\n"), 1)
-                            continue
-                    del texts[k]
-            continue
-        if e["kind"] != "read" or not _read_ok(e):
-            continue
-        body = _clean_file_text(
-            _ff5_trunc_re().sub("", e["result"] or "").rstrip())
-        if _ff4_off(e["args"]) > 0 and p in texts:
-            texts[p] += "\n" + body
-        else:
-            texts[p] = body
-    return texts
 
 
-def _base_gate_act_calls(calls, messages):
+def _base_gate_act_calls_s1(calls, messages):
     texts = _ff9_read_texts(messages)
     problems, out = [], []
     for tc in calls:
@@ -13147,20 +12457,17 @@ def _ff9_drop_superseded(messages):
         return messages
 
 
-_ff9_prev_read_guard = _ff5_read_guard
-_ff9_prev_evidence_gate = _ff5_evidence_gate
 
 
 def _ff5_read_guard(ctx, messages):
-    return _ff9_prev_read_guard(ctx, _ff9_drop_superseded(messages))
+    return _ff5_read_guard_s2(ctx, _ff9_drop_superseded(messages))
 
 
-def _ff5_evidence_gate(ctx, messages, tm):
-    return _ff9_prev_evidence_gate(ctx, _ff9_drop_superseded(messages), tm)
+def _ff5_evidence_gate_s3(ctx, messages, tm):
+    return _ff5_evidence_gate_s2(ctx, _ff9_drop_superseded(messages), tm)
 
 
 # 5. A bare file name may live in a sub-folder: list the project before reading.
-_ff9_prev_plan_change = _plan_change
 
 
 def _ff9_bare_unread(ctx, ev):
@@ -13177,7 +12484,7 @@ def _ff9_bare_unread(ctx, ev):
     return out
 
 
-def _plan_change(ctx, ev, tm, pat="CHANGE", total=5):
+def _plan_change_s2(ctx, ev, tm, pat="CHANGE", total=5):
     try:
         if pat != "CREATE" and not _surveyed(ev) and _ff9_bare_unread(ctx, ev):
             step = _survey_step(pat, tm, ev, 1, total)
@@ -13185,11 +12492,11 @@ def _plan_change(ctx, ev, tm, pat="CHANGE", total=5):
                 return step
     except Exception as e:
         log(f"[fix9] bare-name survey error: {e}")
-    return _ff9_prev_plan_change(ctx, ev, tm, pat=pat, total=total)
+    return _plan_change_s1(ctx, ev, tm, pat=pat, total=total)
 
 
 # 6. After an edit the read copy is stale: re-read before the next edit.
-def _ff9_stale_edits(ev):
+def _ff9_stale_edits_s1(ev):
     last = {}
     for i, e in enumerate(ev):
         if e["kind"] == "act" and _act_ok(e):
@@ -13208,11 +12515,10 @@ def _ff9_stale_edits(ev):
     return stale
 
 
-_ff9_prev_change_tail = _change_tail
 
 
-def _change_tail(pat, ctx, ev, tm, names_all, total, extra=""):
-    step = _ff9_prev_change_tail(pat, ctx, ev, tm, names_all, total, extra)
+def _change_tail_s2(pat, ctx, ev, tm, names_all, total, extra=""):
+    step = _change_tail_s1(pat, ctx, ev, tm, names_all, total, extra)
     try:
         if step is not None and step.name == "act" and tm.first("read"):
             stale = [p for p in _ff9_stale_edits(ev)
@@ -13255,12 +12561,6 @@ _c10 = _flow_c
 # Previous definitions, captured before this section overrides them. The file
 # is a stack of patch layers: later definitions win, so every wrapper keeps a
 # handle on the layer below it.
-_ff10_orig_source_review = _is_source_review
-_ff10_orig_file_review = _is_file_review
-_ff10_prev_analyze = _analyze
-_ff10_prev_clarification = clarification_text
-_ff10_prev_spec_banner = _ff5_spec_banner
-_ff10_prev_install = install
 
 
 _FF10_EXPLAIN_RE = re.compile(
@@ -13283,9 +12583,9 @@ _FF10_OTHER_LABELS = ("EXPLAIN", "CHANGE", "TOOL_DEMAND")
 _ff10_scrub = _ff4_scrub
 
 
-def _ff10_is_source_review(folded):
+def _is_source_review(folded):
     f = _ff10_scrub(folded)
-    if not _ff10_orig_source_review(f):
+    if not _is_source_review_s1(f):
         return False
     if _SOURCE_STRONG_VERB_RE.search(f):
         return True
@@ -13296,9 +12596,9 @@ def _ff10_is_source_review(folded):
     return True
 
 
-def _ff10_is_file_review(folded, scannable):
+def _is_file_review(folded, scannable):
     f = _ff10_scrub(folded)
-    if not _ff10_orig_file_review(f, scannable):
+    if not _is_file_review_s1(f, scannable):
         return False
     if _SOURCE_STRONG_VERB_RE.search(f):
         return True
@@ -13310,8 +12610,10 @@ def _ff10_is_file_review(folded, scannable):
 # detect_task_pattern()/review_demanded()/pending_tool_request() resolve these
 # names from this module, so assigning them here changes the deterministic gate
 # too. T is this same module (the flat bundle aliases every submodule).
-_is_source_review = _ff10_is_source_review
-_is_file_review = _ff10_is_file_review
+_ff10_is_source_review = _is_source_review
+_ff10_is_file_review = _is_file_review
+_ff10_orig_source_review = _is_source_review_s1
+_ff10_orig_file_review = _is_file_review_s1
 T._is_source_review = _is_source_review
 T._is_file_review = _is_file_review
 
@@ -13341,8 +12643,8 @@ def _ff10_candidates(messages):
     if not last:
         return []
     scrubbed = _ff10_scrub(folded)
-    raw_file = _ff10_orig_file_review(scrubbed, scannable)
-    raw_source = not raw_file and _ff10_orig_source_review(scrubbed)
+    raw_file = _is_file_review_s1(scrubbed, scannable)
+    raw_source = not raw_file and _is_source_review_s1(scrubbed)
     strong = bool(_SOURCE_STRONG_VERB_RE.search(folded))
     explain = bool(_FF10_EXPLAIN_RE.search(folded)) or bool(
         _is_code_question(last))
@@ -13402,7 +12704,7 @@ def _ff10_classify_prompt(text, labels):
     return T.defuse_extension_words("\n".join(lines))
 
 
-def _ff10_classify(text, labels):
+def _ff10_classify_s1(text, labels):
     text = (text or "").strip()
     labels = [x for x in labels if x]
     if len(text) < 8 or not labels:
@@ -13514,8 +12816,8 @@ def _ff10_tiebreak(ctx, messages, cands):
     return ctx
 
 
-def _analyze(messages):
-    ctx = _ff10_prev_analyze(messages)
+def _analyze_s5(messages):
+    ctx = _analyze_s4(messages)
     if ctx is None:
         return ctx
     try:
@@ -13573,7 +12875,7 @@ def clarification_text(messages):
                 return _ff10_clarify_text(getattr(ctx, "last", ""))
         except Exception as e:
             log("[flow10] clarification error: %s" % e)
-    return _ff10_prev_clarification(messages)
+    return clarification_text_s1(messages)
 
 
 def _ff5_spec_banner(messages):
@@ -13583,13 +12885,19 @@ def _ff5_spec_banner(messages):
             return ""
     except Exception as e:
         log("[flow10] banner guard error: %s" % e)
-    return _ff10_prev_spec_banner(messages)
+    return _ff5_spec_banner_s1(messages)
 
 
-def install():
-    _ff10_prev_install()
+def _setup_ff10():
     for k, v in _FF10_DEFAULTS.items():
         CONFIG.setdefault(k, v)
+    try:
+        from gemini_web2api import gemini, multimodal, server
+        for target in (gemini, multimodal, server):
+            if hasattr(target, "MODELS"):
+                target.MODELS = MODELS
+    except Exception as ex:
+        log("[fix10] models sync warning: %s" % ex)
 
 
 # ==== flowfix10:end ====
@@ -13616,7 +12924,7 @@ from gemini_web2api.models import MODELS, resolve_model, ticket_for
 from gemini_web2api.gemini import (
     generate,
     generate_stream,
-    log,
+    log_s1 as log,
     GeminiError,
     trace,
     update_cookie_payload,
@@ -13641,7 +12949,6 @@ from gemini_web2api.tools import (
     is_required_tool_choice,
     looks_like_missed_tool_call,
     looks_like_upstream_error,
-    looks_like_extension_refusal,
     looks_like_canned_failure,
     pending_tool_request,
     SOURCE_REVIEW_OWED,
@@ -13651,7 +12958,7 @@ from gemini_web2api.tools import (
     listed_turn_files,
     unread_listed_core_files,
     fresh_declared_unread,
-    review_demanded,
+    review_demanded_s1 as review_demanded,
     change_demanded,
     looks_like_described_edit,
     _conversation_called_files,
@@ -13697,7 +13004,6 @@ def _is_loopback(host) -> bool:
     return bool(addr.is_loopback or (mapped is not None and mapped.is_loopback))
 
 
-_rf_prev_is_loopback = _ff15_prev_is_loopback = _base_is_loopback
 
 # Gap between SSE keep-alive comments while a buffered turn still works
 # upstream. Must stay well under every client's idle/chunk timeout (OpenCode
@@ -15973,6 +15279,12 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self._google_hb = None
         else:
             self.send_json(response_obj)
+_GeminiHandler_gwtr_orig = GeminiHandler._generate_with_tool_retry
+_GeminiHandler_read_request_body_orig = GeminiHandler._read_request_body
+_GeminiHandler_authorized_orig = GeminiHandler._authorized
+_GeminiHandler_start_sse_with_keepalive_orig = GeminiHandler._start_sse_with_keepalive
+_GeminiHandler_stream_chat_orig = GeminiHandler._stream_chat
+_GeminiHandler_handle_responses_orig = GeminiHandler._handle_responses
 
 
 class ThreadedServer(ThreadingMixIn, HTTPServer):
@@ -15991,7 +15303,7 @@ import uuid
 
 from gemini_web2api.config import CONFIG, load_config, find_config, _config_lock_ctx
 from gemini_web2api.models import MODELS, ticket_warnings
-from gemini_web2api.gemini import HAS_HTTPX, fetch_latest_bl, log
+from gemini_web2api.gemini import HAS_HTTPX, fetch_latest_bl, log_s1 as log
 from gemini_web2api.server import GeminiHandler, ThreadedServer
 from gemini_web2api import __version__
 
@@ -16120,9 +15432,6 @@ def main():
 
 
 # ==== flowfix11:begin (401 cookie/auth fix; patch.py) ====
-_ff11_prev_status_error = _status_error
-_ff11_prev_classify5 = _ff5_classify
-_ff11_prev_classify10 = _ff10_classify
 
 
 def _ff11_auth_recent():
@@ -16130,7 +15439,7 @@ def _ff11_auth_recent():
 
 
 def _status_error(status):
-    err = _ff11_prev_status_error(status)
+    err = _status_error_s1(status)
     if status in (401, 403):
         _FF11_AUTH["ts"] = time.time()
         _FF11_AUTH["logged"] = False      # re-log cookie names on the next request
@@ -16147,13 +15456,13 @@ def _status_error(status):
 def _ff5_classify(text):
     if _ff11_auth_recent():
         return None            # auth is broken: do not burn 3 calls per request
-    return _ff11_prev_classify5(text)
+    return _ff5_classify_s1(text)
 
 
 def _ff10_classify(text, labels):
     if _ff11_auth_recent():
         return None
-    return _ff11_prev_classify10(text, labels)
+    return _ff10_classify_s1(text, labels)
 # ==== flowfix11:end ====
 
 # ==== flowfix12:begin (generated by flow_fix12_patch.py -- re-run to refresh, --revert to remove) ====
@@ -16162,7 +15471,6 @@ def _ff10_classify(text, labels):
 # --------------------------------------------------------------------------
 # 1. ToolMap.adapt must not drop declared parameters it did not handle
 # --------------------------------------------------------------------------
-_ff12_prev_adapt = ToolMap.adapt
 _FF12_GROUPS = (_PATH_KEYS, _CMD_KEYS, _PATTERN_KEYS, _OLD_KEYS, _NEW_KEYS,
                 _CONTENT_KEYS, _OFFSET_KEYS, _LIMIT_KEYS)
 
@@ -16176,7 +15484,7 @@ def _ff12_group_of(key):
 
 
 def _ff12_adapt(self, call):
-    fixed, problems = _ff12_prev_adapt(self, call)
+    fixed, problems = _ToolMap_adapt_orig(self, call)
     try:
         fn = (call or {}).get("function") or {}
         name = fn.get("name") or ""
@@ -16230,13 +15538,11 @@ if not getattr(ToolMap.adapt, "_ff12", False):
 # --------------------------------------------------------------------------
 # 2. Never ask the client a clarification question in the middle of a flow
 # --------------------------------------------------------------------------
-_ff12_prev_clarification = clarification_text
 
 # --------------------------------------------------------------------------
 # 3. The operator's own flow_test_command is read-only by definition
 #    (Unified into _ff5_cmd_readonly above)
 # --------------------------------------------------------------------------
-_ff12_prev_cmd_readonly = _ff5_cmd_readonly
 
 
 # --------------------------------------------------------------------------
@@ -16255,7 +15561,7 @@ _FF12_PS_ERR_RE = re.compile(
 _FF12_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]")
 
 
-def _ff5_is_windows(messages):
+def _ff5_is_windows_s1(messages):
     for msg in messages or []:
         if not isinstance(msg, dict):
             continue
@@ -16297,7 +15603,7 @@ _FF12_COND_RE = re.compile(
     r"|sau\s+khi|truoc\s+khi|moi\s+khi)\b")
 
 
-def _ff12_explain_only(ctx):
+def _ff12_explain_only_s1(ctx):
     """True when the message asks to understand something and every run verb
     in it sits in a conditional clause (when/if/khi/neu ...)."""
     folded = " ".join(str(getattr(ctx, "folded", "") or "").lower().split())
@@ -16310,12 +15616,10 @@ def _ff12_explain_only(ctx):
     return True
 
 
-_ff12_prev_detect = _ff5_detect
-_ff12_prev_apply_label = _ff5_apply_label
 
 
 def _ff5_detect(ctx):
-    det = _ff12_prev_detect(ctx)
+    det = _ff5_detect_s2(ctx)
     if det in _FF12_RUN_PATTERNS and _ff12_explain_only(ctx):
         log("[fix12] explanation question -> not a %s request" % det)
         ctx.cmd = ""
@@ -16328,7 +15632,7 @@ def _ff5_apply_label(ctx, label):
     if label in _FF12_RUN_PATTERNS and _ff12_explain_only(ctx):
         log("[fix12] classifier label %s ignored: explanation question" % label)
         return
-    return _ff12_prev_apply_label(ctx, label)
+    return _ff5_apply_label_s2(ctx, label)
 
 
 # --------------------------------------------------------------------------
@@ -16337,19 +15641,7 @@ def _ff5_apply_label(ctx, label):
 #    proposed during "review a.py" went through unchecked. This outer wrapper
 #    runs the same analysis + read guard + post-filter for required calls.
 # --------------------------------------------------------------------------
-_ff12_prev_install = install
-
-
-def install():
-    _ff12_prev_install()
-    for k, v in (("flow12_poll_max", 12),):
-        CONFIG.setdefault(k, v)
-    from gemini_web2api import server
-    cls = server.GeminiHandler
-    cur = cls._generate_with_tool_retry
-    if getattr(cur, "_ff12_required", False):
-        return
-
+def _wrap_ff12(cur):
     @functools.wraps(cur)
     def wrapper12(self, prompt, model_id, think_mode, file_refs, extra,
                   tools_active, allowed_names, tool_schemas, required_tool,
@@ -16395,8 +15687,7 @@ def install():
             return result
 
     wrapper12._ff12_required = True
-    cls._generate_with_tool_retry = wrapper12
-    log("[fix12] required-tool guard installed")
+    return wrapper12
 
 
 # --------------------------------------------------------------------------
@@ -16553,11 +15844,10 @@ def _ff5_act_needs_read_problems(calls, messages, ctx):
 # 9. A successful read of one file must not hide a failed read of another file
 #    the user named (review a.py and b.py; b.py -> permission denied).
 # --------------------------------------------------------------------------
-_ff12_prev_gate = _ff5_evidence_gate
 
 
 def _ff5_evidence_gate(ctx, messages, tm):
-    step, stop = _ff12_prev_gate(ctx, messages, tm)
+    step, stop = _ff5_evidence_gate_s3(ctx, messages, tm)
     if step is not None or stop is not None:
         return step, stop
     try:
@@ -16602,7 +15892,6 @@ def _ff5_evidence_gate(ctx, messages, tm):
         return step, stop
 
 
-_ff12_raw_answered_calls = _answered_calls      # original, polls NOT merged
 
 
 # --------------------------------------------------------------------------
@@ -16739,7 +16028,7 @@ def _ff12_pending_step(ctx, raw, merged, tm, pending_text):
     sid = _ff12_pending_sid(pending_text)
     if sid is None:
         return None
-    done = sum(1 for e in _ff12_raw_answered_calls(raw)
+    done = sum(1 for e in _answered_calls_s1(raw)
                if _FF12_POLL_NAME_RE.search(e["name"] or "")
                and _ff12_poll_sid_arg(e["args"]) == sid)
     names = [n for lst in tm.by_kind.values() for n in lst
@@ -16766,9 +16055,6 @@ def _ff12_last_pending(ev, pred):
     return last
 
 
-_ff12_prev_plan_command = _ff5_plan_command
-_ff12_prev_plan_tests = _ff5_plan_tests
-_ff12_prev_own_result = _ff5_own_result
 
 
 def _ff5_plan_command(ctx, messages, tm, cmd, label):
@@ -16784,7 +16070,7 @@ def _ff5_plan_command(ctx, messages, tm, cmd, label):
         messages = merged
     except Exception as ex:
         log("[fix12] poll planner error: %s" % ex)
-    return _ff12_prev_plan_command(ctx, messages, tm, cmd, label)
+    return _ff5_plan_command_s1(ctx, messages, tm, cmd, label)
 
 
 def _ff5_plan_tests(ctx, messages, tm):
@@ -16798,7 +16084,7 @@ def _ff5_plan_tests(ctx, messages, tm):
         messages = merged
     except Exception as ex:
         log("[fix12] poll planner error: %s" % ex)
-    return _ff12_prev_plan_tests(ctx, messages, tm)
+    return _ff5_plan_tests_s1(ctx, messages, tm)
 
 
 def _ff5_own_result(step, ctx, messages, tm, perm):
@@ -16815,7 +16101,7 @@ def _ff5_own_result(step, ctx, messages, tm, perm):
             return "", calls
     except Exception as ex:
         log("[fix12] poll own-result error: %s" % ex)
-    return _ff12_prev_own_result(step, ctx, messages, tm, perm)
+    return _ff5_own_result_s2(step, ctx, messages, tm, perm)
 
 
 # --------------------------------------------------------------------------
@@ -16832,13 +16118,12 @@ _FF12_SESSION_TOOL_RE = re.compile(
     r"(?i)write_?stdin|send_?stdin|bash_?output|kill_?shell|kill_?bash|stop_?shell"
     r"|read_?output|process_?output|get_?output|check_?output|shell_?output|\bpoll")
 _FF12_STDIN_TOOL_RE = re.compile(r"(?i)write_?stdin|send_?stdin")
-_ff12_prev_tool_kind = tool_kind
 
 
-def tool_kind(name):
+def tool_kind_s2(name):
     if _FF12_SESSION_TOOL_RE.search(str(name or "")):
         return "other"
-    return _ff12_prev_tool_kind(name)
+    return tool_kind_s1(name)
 
 
 def _ff12_stdin_payload(args):
@@ -16873,10 +16158,9 @@ def _ff12_stdin_problem(calls, perm):
     return ""
 
 
-_ff12_prev_postfilter = _ff5_postfilter
 
 
-def _ff5_postfilter(result, messages, perm=None, last=True, tm=None, ctx=None):
+def _ff5_postfilter_s3(result, messages, perm=None, last=True, tm=None, ctx=None):
     # returns (final, nudge); final = (text, calls)
     try:
         calls = result[1] if isinstance(result, tuple) and len(result) == 2 else None
@@ -16892,7 +16176,7 @@ def _ff5_postfilter(result, messages, perm=None, last=True, tm=None, ctx=None):
             ).text, None), None
     except Exception as ex:
         log("[fix12] stdin guard error: %s" % ex)
-    return _ff12_prev_postfilter(result, messages, perm, last, tm, ctx)
+    return _ff5_postfilter_s2(result, messages, perm, last, tm, ctx)
 
 
 # --------------------------------------------------------------------------
@@ -16904,10 +16188,10 @@ def _ff5_postfilter(result, messages, perm=None, last=True, tm=None, ctx=None):
 # --------------------------------------------------------------------------
 def _answered_calls(messages):
     try:
-        return _ff12_raw_answered_calls(_ff12_merge_polls(messages))
+        return _answered_calls_s1(_ff12_merge_polls(messages))
     except Exception as ex:
         log("[fix12] poll merge error: %s" % ex)
-        return _ff12_raw_answered_calls(messages)
+        return _answered_calls_s1(messages)
 
 
 # --------------------------------------------------------------------------
@@ -16945,22 +16229,20 @@ def _ff12_read_failed_text(res):
     return len(t) < 1500 and bool(_FF12_READFAIL_RE.match(t))
 
 
-_ff12_prev_read_ok = _read_ok
 
 
 def _read_ok(e):
-    if not _ff12_prev_read_ok(e):
+    if not _read_ok_s1(e):
         return False
     return not _ff12_read_failed_text(e.get("result"))
 
 
-_ff12_prev_act_ok = _act_ok
 
 
 def _act_ok(e):
     if _FF12_ACTFAIL_RE.search((e.get("result") or "")[:400]):
         return False
-    return _ff12_prev_act_ok(e)
+    return _act_ok_s1(e)
 
 
 # --------------------------------------------------------------------------
@@ -16976,7 +16258,7 @@ def _act_ok(e):
 def _ff12_flow_pending(messages):
     merged = _ff12_merge_polls(messages)
     last = None
-    for e in _ff12_raw_answered_calls(merged):
+    for e in _answered_calls_s1(merged):
         if e["kind"] == "exec" and not _FF12_POLL_NAME_RE.search(e["name"] or ""):
             last = e
     if last is None:
@@ -16988,11 +16270,10 @@ def _ff12_flow_pending(messages):
     return (sid, last["result"]) if sid is not None else (None, None)
 
 
-_ff12_prev_plan_for = plan_for
 
 
 def plan_for(messages, tm, ctx=None):
-    step = _ff12_prev_plan_for(messages, tm, ctx)
+    step = plan_for_s3(messages, tm, ctx)
     try:
         if (step is None or getattr(step, "local_text", None) is not None
                 or not messages or not isinstance(messages[-1], dict)
@@ -17004,7 +16285,7 @@ def plan_for(messages, tm, ctx=None):
         sid, _text = _ff12_flow_pending(messages)
         if sid is None:
             return step
-        done = sum(1 for e in _ff12_raw_answered_calls(messages)
+        done = sum(1 for e in _answered_calls_s1(messages)
                    if _FF12_POLL_NAME_RE.search(e["name"] or "")
                    and _ff12_poll_sid_arg(e["args"]) == sid)
         if done < int(CONFIG.get("flow12_poll_max", 12)):
@@ -17080,11 +16361,10 @@ def _ff12_has_ps_error(messages):
     return False
 
 
-_ff12_is_windows_env = _ff5_is_windows
 
 
 def _ff5_is_windows(messages):
-    if not _ff12_is_windows_env(messages):
+    if not _ff5_is_windows_s1(messages):
         return False
     if _ff12_has_ps_error(messages):
         return True
@@ -17190,7 +16470,6 @@ def _ff_first_clause(text: str) -> str:
     return ""
 
 
-_rf_prev_is_change_request = _is_change_request
 
 
 def _is_change_request(folded, scannable, raw=""):
@@ -17212,7 +16491,7 @@ def _is_change_request(folded, scannable, raw=""):
     if c0 and _EXPLAIN_LEAD_RE.match(c0) and not (_CHANGE_ACT_RE.search(c0) or _FF5_GRANT_RE.search(f_low)):
         return False
 
-    if _rf_prev_is_change_request(folded, scannable, raw):
+    if _is_change_request_s1(folded, scannable, raw):
         return True
     try:
         if _RF_ASK_RE.search(folded or ""):
@@ -17229,7 +16508,6 @@ T._is_change_request = _is_change_request
 # --------------------------------------------------------------------------
 # 4. _is_loopback nhận ::ffff:127.0.0.1 (unified into canonical _is_loopback)
 # --------------------------------------------------------------------------
-_rf_prev_is_loopback = _is_loopback
 
 # --------------------------------------------------------------------------
 # 3. Kiểm tra proxy bằng trạng thái đang chạy
@@ -17238,7 +16516,6 @@ _RF_LOCK = _rf_threading.Lock()
 _RF_LOGS = _rf_collections.deque(maxlen=400)
 _RF_ECHOES = _rf_collections.deque(maxlen=20)
 
-_rf_prev_log = log
 
 
 def log(msg):
@@ -17246,10 +16523,9 @@ def log(msg):
         _RF_LOGS.append("[%s] %s" % (_rf_time.strftime("%H:%M:%S"), msg))
     except Exception:
         pass
-    return _rf_prev_log(msg)
+    return log_s1(msg)
 
 
-_rf_prev_check_routing = check_routing
 
 
 def check_routing(raw, model_id, extra_fields=None, ticket=None):
@@ -17272,7 +16548,7 @@ def check_routing(raw, model_id, extra_fields=None, ticket=None):
                       and (want[1] is None or e[2] == want[1])})
     except Exception:
         pass
-    return _rf_prev_check_routing(raw, model_id, extra_fields, ticket)
+    return check_routing_s1(raw, model_id, extra_fields, ticket)
 
 
 _RF_SUBJECT_RE = re.compile(r"\b(?:routing|route|fallback|model|proxy|server|log|logs)\b")
@@ -17286,7 +16562,7 @@ _RF_NOT_RE = re.compile(
     r"refactor|patch|hoat\s+dong\s+the\s+nao)\b")
 
 
-def _rf_runtime_question(messages):
+def _rf_runtime_question_s1(messages):
     last = None
     for m in reversed(messages or []):
         if not isinstance(m, dict):
@@ -17366,7 +16642,6 @@ def _rf_runtime_report(model_id, think_mode, extra, ticket):
     return "\n".join(out)
 
 
-_rf_prev_gwtr = GeminiHandler._generate_with_tool_retry
 
 
 def _rf_gwtr(self, prompt, model_id, think_mode, file_refs, extra, tools_active,
@@ -17379,7 +16654,7 @@ def _rf_gwtr(self, prompt, model_id, think_mode, file_refs, extra, tools_active,
             return _rf_runtime_report(model_id, think_mode, extra, ticket), []
     except Exception as e:  # noqa: BLE001
         log("[flowfix13] runtime check failed, falling back: %s" % e)
-    return _rf_prev_gwtr(self, prompt, model_id, think_mode, file_refs, extra,
+    return _GeminiHandler_gwtr_orig(self, prompt, model_id, think_mode, file_refs, extra,
                          tools_active, allowed_names, tool_schemas, required_tool,
                          messages, ticket, tool_required, client_gone)
 
@@ -17437,7 +16712,6 @@ def _ff5_git_cmd(m):
 
 
 # 2. write scope: test files read this turn (unified into _ff5_scope above)
-_ff14_prev_scope = _ff5_scope
 
 
 # --------------------------------------------------------------------------
@@ -17463,20 +16737,18 @@ def _ff14_restore_case(step, ev):
     return step
 
 
-_ff14_prev_plan_debug = _plan_debug
 
 
 def _plan_debug(ctx, ev, tm):
-    return _ff14_restore_case(_ff14_prev_plan_debug(ctx, ev, tm), ev)
+    return _ff14_restore_case(_plan_debug_s1(ctx, ev, tm), ev)
 
 
 # --------------------------------------------------------------------------
 # 6. EXPLAIN follows the imports of what it already read
 # --------------------------------------------------------------------------
-_ff14_prev_plan_explain = _plan_explain
 
 
-def _ff14_explain_hop(ctx, ev, tm, step):
+def _ff14_explain_hop_s1(ctx, ev, tm, step):
     if (not _ff14_c("flow14_explain_hops") or step is None
             or getattr(step, "name", None) != "answer"
             or getattr(step, "local_text", None) is not None
@@ -17499,8 +16771,8 @@ def _ff14_explain_hop(ctx, ev, tm, step):
                     "the explanation covers the real flow: " + ", ".join(targets) + ".")
 
 
-def _plan_explain(ctx, ev, tm):
-    step = _ff14_prev_plan_explain(ctx, ev, tm)
+def _plan_explain_s2(ctx, ev, tm):
+    step = _plan_explain_s1(ctx, ev, tm)
     try:
         step = _ff14_explain_hop(ctx, ev, tm, step)
     except Exception as ex:
@@ -17511,7 +16783,6 @@ def _plan_explain(ctx, ev, tm):
 # --------------------------------------------------------------------------
 # 4. edit gate: unique whitespace-insensitive repair + ambiguity check
 # --------------------------------------------------------------------------
-_ff14_prev_base_gate = _base_gate_act_calls
 _FF14_REPLACE_ALL_KEYS = ("replaceAll", "replace_all", "replace_all_occurrences")
 
 
@@ -17633,20 +16904,19 @@ def _ff14_gate_prepass(calls, messages):
     return out, problems
 
 
-def _base_gate_act_calls(calls, messages):
+def _base_gate_act_calls_s2(calls, messages):
     extra = []
     try:
         calls, extra = _ff14_gate_prepass(calls, messages)
     except Exception as ex:
         log("[fix14] edit gate pre-pass error: %s" % ex)
-    out, problems = _ff14_prev_base_gate(calls, messages)
+    out, problems = _base_gate_act_calls_s1(calls, messages)
     return out, list(problems) + extra
 
 
 # --------------------------------------------------------------------------
 # 5. IMPLEMENT: syntax-check the edited python files before the real tests
 # --------------------------------------------------------------------------
-_ff14_prev_change_tail = _change_tail
 _FF14_MARK = "import ast,sys;[ast.parse"
 _FF14_SYNTAX_RE = re.compile(r"\b(?:SyntaxError|IndentationError|TabError)\b")
 _FF14_NOPY_RE = re.compile(
@@ -17702,8 +16972,8 @@ def _ff14_compile_step(pat, ctx, ev, tm, total, nxt):
     return None
 
 
-def _change_tail(pat, ctx, ev, tm, names_all, total, extra=""):
-    st = _ff14_prev_change_tail(pat, ctx, ev, tm, names_all, total, extra)
+def _change_tail_s3(pat, ctx, ev, tm, names_all, total, extra=""):
+    st = _change_tail_s2(pat, ctx, ev, tm, names_all, total, extra)
     try:
         cs = _ff14_compile_step(pat, ctx, ev, tm, total, st)
         if cs is not None:
@@ -17716,7 +16986,6 @@ def _change_tail(pat, ctx, ev, tm, names_all, total, extra=""):
 # --------------------------------------------------------------------------
 # 7. quotes in explanations are verified too
 # --------------------------------------------------------------------------
-_ff14_prev_review_demanded = review_demanded
 
 
 _FF14_REFACTOR_Q_RE = re.compile(
@@ -17728,7 +16997,7 @@ _FF14_REFACTOR_Q_RE = re.compile(
 
 
 def review_demanded(messages) -> bool:
-    if _ff14_prev_review_demanded(messages):
+    if review_demanded_s1(messages):
         return True
     try:
         last_user = None
@@ -17752,11 +17021,10 @@ _FF14_HOWTO_RE = re.compile(
     r"\b(?:how\s+(?:to|do|can|should|would)|lam\s+(?:sao|the\s+nao)|cach\s+(?:nao|de)"
     r"|huong\s+dan)\b")
 _FF14_CONJ_RE = re.compile(r"\b(?:and|then|also|va|roi|sau\s+do)\b")
-_ff14_prev_explain_only = _ff12_explain_only
 
 
 def _ff12_explain_only(ctx):
-    if _ff14_prev_explain_only(ctx):
+    if _ff12_explain_only_s1(ctx):
         return True
     folded = " ".join(str(getattr(ctx, "folded", "") or "").lower().split())
     if not folded or not _FF14_HOWTO_RE.search(folded):
@@ -17777,11 +17045,7 @@ def _ff12_explain_only(ctx):
 # --------------------------------------------------------------------------
 # install
 # --------------------------------------------------------------------------
-_ff14_prev_install = install
-
-
-def install():
-    _ff14_prev_install()
+def _setup_ff14():
     for k, v in _FF14_DEFAULTS.items():
         CONFIG.setdefault(k, v)
     try:
@@ -17841,7 +17105,6 @@ rieng chung ban dau cuoi cung giua noi dung chi tiet tung toan bo ca het gom dua
 gia tri ket qua yeu cau cau hinh loai kieu danh sach so luong huong xu ly lap trinh
 """.split())
 
-_ff15_prev_keywords = _keywords
 
 
 def _keywords(text, limit=6):
@@ -17850,7 +17113,7 @@ def _keywords(text, limit=6):
     Unlike the original this tokenizes the ORIGINAL text: any word with an accented
     (Vietnamese) letter is a natural-language word, never a code identifier."""
     if not _ff15_c("flow15_keywords"):
-        return _ff15_prev_keywords(text, limit)
+        return _keywords_s1(text, limit)
     strong, weak = [], []
     text = text or ""
     for m in re.finditer(r"`([^`\n]+)`", text):
@@ -17876,8 +17139,6 @@ def _keywords(text, limit=6):
 # --------------------------------------------------------------------------
 # 2. legacy opencode truncation marker (unified into _Ff9Trunc)
 # --------------------------------------------------------------------------
-def _ff15_patch_trunc():
-    return True
 
 
 # --------------------------------------------------------------------------
@@ -18013,11 +17274,10 @@ def _ff15_label(ctx, pat):
     return None
 
 
-_ff15_prev_analyze = _analyze
 
 
-def _analyze(messages):
-    ctx = _ff15_prev_analyze(messages)
+def _analyze_s6(messages):
+    ctx = _analyze_s5(messages)
     if ctx is None or not _ff15_c("flow15_route"):
         return ctx
     try:
@@ -18041,11 +17301,10 @@ def _analyze(messages):
 _FF15_PROXY_RE = re.compile(
     r"\b(?:proxy|routing|routed|route|routes|fallback|fall(?:ing)?\s+back|ticket|upstream|"
     r"gemini|flash|lite)\b")
-_ff15_prev_rf_question = _rf_runtime_question
 
 
 def _rf_runtime_question(messages):
-    if not _ff15_prev_rf_question(messages):
+    if not _rf_runtime_question_s1(messages):
         return False
     if not _ff15_c("flow15_runtime_strict"):
         return True
@@ -18064,20 +17323,17 @@ def _rf_runtime_question(messages):
 # --------------------------------------------------------------------------
 # 5. _is_loopback: one definition (unified into canonical _is_loopback)
 # --------------------------------------------------------------------------
-_ff15_prev_is_loopback = _is_loopback
 
 
 # --------------------------------------------------------------------------
 # 6. request body reader + Bearer parsing
 # --------------------------------------------------------------------------
 _FF15_LINE_MAX = 65536
-_ff15_prev_read_body = GeminiHandler._read_request_body
-_ff15_prev_authorized = GeminiHandler._authorized
 
 
 def _ff15_read_request_body(self):
     if not _ff15_c("flow15_server_hardening"):
-        return _ff15_prev_read_body(self)
+        return _GeminiHandler_read_request_body_orig(self)
     limit = CONFIG.get("max_body_bytes", 32 * 1024 * 1024)
     if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
         chunks, total = [], 0
@@ -18131,7 +17387,7 @@ def _ff15_read_request_body(self):
 
 def _ff15_authorized(self):
     if not _ff15_c("flow15_server_hardening"):
-        return _ff15_prev_authorized(self)
+        return _GeminiHandler_authorized_orig(self)
     keys = CONFIG.get("api_keys") or []
     if not keys:
         return True
@@ -18161,7 +17417,6 @@ GeminiHandler._authorized = _ff15_authorized
 # 7. SSRF: NAT64 / 6to4 addresses embedding a non-public IPv4
 # --------------------------------------------------------------------------
 _FF15_NAT64 = ipaddress.ip_network("64:ff9b::/96")
-_ff15_prev_resolve_public_ip = _resolve_public_ip
 
 
 def _ff15_public(addr):
@@ -18178,7 +17433,7 @@ def _ff15_public(addr):
 def _resolve_public_ip(hostname):
     """First public IP of ``hostname``, or None if ANY address is non-public."""
     if not _ff15_c("flow15_server_hardening"):
-        return _ff15_prev_resolve_public_ip(hostname)
+        return _resolve_public_ip_s1(hostname)
     if not hostname:
         return None
     host = hostname.strip().rstrip(".").strip("[]").split("%")[0]
@@ -18207,11 +17462,7 @@ def _resolve_public_ip(hostname):
 # --------------------------------------------------------------------------
 # install
 # --------------------------------------------------------------------------
-_ff15_prev_install = install
-
-
-def install():
-    _ff15_prev_install()
+def _setup_ff15():
     for k, v in _FF15_DEFAULTS.items():
         CONFIG.setdefault(k, v)
 # ==== flowfix15:end ====
@@ -18283,7 +17534,7 @@ def _ff16_is_plan_doc(path) -> bool:
     return bool(_FF16_PLAN_DOC_RE.search(_norm(path or "")))
 
 
-def _ff16_prev_assistant_plan(messages) -> str:
+def _ff16_last_assistant_plan(messages) -> str:
     """Return the most recent assistant message before the last user turn if it
     looks like an implementation plan or checklist."""
     idx = T._last_user_index(messages)
@@ -18302,7 +17553,7 @@ def _ff16_prev_assistant_plan(messages) -> str:
     return ""
 
 
-def _ff16_read_plan_bodies(messages) -> list:
+def _ff16_read_plan_bodies_s1(messages) -> list:
     """[(path, text)] for any plan/doc/todo file read in the conversation."""
     out = []
     last_user = _ff5_last_user_text(messages) if messages else ""
@@ -18338,7 +17589,7 @@ def _ff16_plan_files(ctx, messages, listing=()) -> list:
         sources.append(body)
     folded = str(getattr(ctx, "folded", "") or "")
     if _FF16_PLAN_REF_RE.search(folded):
-        prev_plan = _ff16_prev_assistant_plan(messages)
+        prev_plan = _ff16_last_assistant_plan(messages)
         if prev_plan:
             sources.append(prev_plan)
     if not sources:
@@ -18382,7 +17633,7 @@ def _ff16_extract_todo_blocks(ctx, messages) -> list:
         blobs.append(body)
     folded = str(getattr(ctx, "folded", "") or "")
     if _FF16_PLAN_REF_RE.search(folded):
-        prev = _ff16_prev_assistant_plan(messages)
+        prev = _ff16_last_assistant_plan(messages)
         if prev:
             blobs.append(prev)
     items, seen = [], set()
@@ -18463,7 +17714,7 @@ def _ff16_planned_code_targets(ctx, ev, messages=None) -> list:
     return out
 
 
-def _ff16_todo_ledger(ctx, messages) -> str:
+def _ff16_todo_ledger_s1(ctx, messages) -> str:
     """Build a compact `[Plan & TODO Progress]` tracker for small models."""
     if not _ff16_c("flow16_plan_todo") or ctx is None:
         return ""
@@ -18514,11 +17765,10 @@ def _ff16_todo_ledger(ctx, messages) -> str:
     return "\n".join(lines)
 
 
-_ff16_prev_scope = _ff5_scope
 
 
 def _ff5_scope(ctx, messages):
-    scope = _ff16_prev_scope(ctx, messages)
+    scope = _ff5_scope_s1(ctx, messages)
     if not _ff16_c("flow16_plan_todo") or ctx is None:
         return scope
     try:
@@ -18546,14 +17796,13 @@ def _ff5_scope(ctx, messages):
     return scope
 
 
-_ff16_prev_plan_change = _plan_change
 
 
-def _plan_change(ctx, ev, tm, pat="CHANGE", total=5):
+def _plan_change_s3(ctx, ev, tm, pat="CHANGE", total=5):
     """Ensure plan documents (`PLAN.md`/`TODO.md`) and multi-turn plans have their
     referenced source files surveyed and read before entering `act`."""
     if not _ff16_c("flow16_plan_todo"):
-        return _ff16_prev_plan_change(ctx, ev, tm, pat=pat, total=total)
+        return _plan_change_s2(ctx, ev, tm, pat=pat, total=total)
     try:
         msgs = getattr(_ff8_tls, "messages", None)
         listing = _listing_files(ev)
@@ -18626,13 +17875,12 @@ def _plan_change(ctx, ev, tm, pat="CHANGE", total=5):
                 return _read_step(pat, tm, ranked, 2, total)
     except Exception as ex:
         log("[fix16] plan_change error: %s" % ex)
-    return _ff16_prev_plan_change(ctx, ev, tm, pat=pat, total=total)
+    return _plan_change_s2(ctx, ev, tm, pat=pat, total=total)
 
 
-_ff16_prev_change_tail = _change_tail
 
 
-def _change_tail(pat, ctx, ev, tm, names_all, total, extra=""):
+def _change_tail_s4(pat, ctx, ev, tm, names_all, total, extra=""):
     """Keep multi-file plan implementations in `act` until every planned, read
     source file has been edited (up to flow_max_acts)."""
     if _ff16_c("flow16_multifile_act") and tm.first("act"):
@@ -18660,14 +17908,13 @@ def _change_tail(pat, ctx, ev, tm, names_all, total, extra=""):
                         None, False, tm.names({"act"}))
         except Exception as ex:
             log("[fix16] multifile act check error: %s" % ex)
-    return _ff16_prev_change_tail(pat, ctx, ev, tm, names_all, total, extra=extra)
+    return _change_tail_s3(pat, ctx, ev, tm, names_all, total, extra=extra)
 
 
-_ff16_prev_after_plan = _ff5_after_plan
 
 
-def _ff5_after_plan(step, messages, tm, ctx=None):
-    step = _ff16_prev_after_plan(step, messages, tm, ctx)
+def _ff5_after_plan_s2(step, messages, tm, ctx=None):
+    step = _ff5_after_plan_s1(step, messages, tm, ctx)
     if step is None or not _ff16_c("flow16_plan_todo"):
         return step
     try:
@@ -18698,11 +17945,10 @@ def _ff5_after_plan(step, messages, tm, ctx=None):
     return step
 
 
-_ff16_prev_tool_kind = tool_kind
 
 
 def tool_kind(name):
-    res = _ff16_prev_tool_kind(name)
+    res = tool_kind_s2(name)
     if _ff16_c("flow16_plan_todo") and res == "other" and _ff16_is_todo_tool(name):
         return _Ff16KindStr("other", is_todo=True)
     return res
@@ -18711,8 +17957,6 @@ def tool_kind(name):
 # --------------------------------------------------------------------------
 # 4. Map-reduce review: number lines before chunking & fix _verify_findings
 # --------------------------------------------------------------------------
-_ff16_prev_make_chunks = _make_chunks
-_ff16_prev_verify_findings = _verify_findings
 
 
 def _ff16_number_body(body: str) -> str:
@@ -18725,9 +17969,9 @@ def _ff16_number_body(body: str) -> str:
 
 def _make_chunks(files, max_bytes, max_files):
     if not _ff16_c("flow16_review_quotes"):
-        return _ff16_prev_make_chunks(files, max_bytes, max_files)
+        return _make_chunks_s1(files, max_bytes, max_files)
     numbered_files = [(p, _ff16_number_body(body)) for p, body in files]
-    return _ff16_prev_make_chunks(numbered_files, max_bytes, max_files)
+    return _make_chunks_s1(numbered_files, max_bytes, max_files)
 
 
 _FF16_LOC_SPAN_RE = re.compile(
@@ -18738,7 +17982,7 @@ def _verify_findings(text, chunk):
     """Verify map-reduce findings without dropping items that wrap `path:line`
     in backticks or mention symbols/fixes in backticks in the explanation."""
     if not _ff16_c("flow16_review_quotes"):
-        return _ff16_prev_verify_findings(text, chunk)
+        return _verify_findings_s1(text, chunk)
     kept, dropped = [], 0
     if re.fullmatch(r"\W*NONE\W*", (text or "").strip(), re.IGNORECASE):
         return kept, dropped
@@ -18785,9 +18029,6 @@ def _verify_findings(text, chunk):
 # 5. Cross-module static checker: join continued reads, record constants/vars/
 #    re-exports/nested defs, and validate required kwonlyargs
 # --------------------------------------------------------------------------
-_ff16_prev_py_defs = _ff5_py_defs
-_ff16_prev_py_modules = _ff5_py_modules
-_ff16_prev_arg_problem = _ff5_arg_problem
 
 
 def _ff16_collect_defs(stmts, out):
@@ -18838,7 +18079,7 @@ def _ff16_collect_defs(stmts, out):
 
 def _ff5_py_defs(tree):
     if not _ff16_c("flow16_cross_module_constants"):
-        return _ff16_prev_py_defs(tree)
+        return _ff5_py_defs_s1(tree)
     out = {}
     _ff16_collect_defs(getattr(tree, "body", ()), out)
     out.setdefault("__all__", {"kind": "value", "line": 0})
@@ -18848,7 +18089,7 @@ def _ff5_py_defs(tree):
 
 def _ff5_py_modules(messages):
     if not _ff16_c("flow16_cross_module_constants"):
-        return _ff16_prev_py_modules(messages)
+        return _ff5_py_modules_s1(messages)
     mods = {}
     for path, body in _ff9_read_texts(messages).items():
         if not path or not path.lower().endswith(".py"):
@@ -18864,7 +18105,7 @@ def _ff5_py_modules(messages):
 
 
 def _ff5_arg_problem(node, info):
-    prob = _ff16_prev_arg_problem(node, info)
+    prob = _ff5_arg_problem_s1(node, info)
     if prob or not _ff16_c("flow16_cross_module_constants"):
         return prob
     if info.get("kind") != "function" or info.get("decorated"):
@@ -18882,13 +18123,11 @@ def _ff5_arg_problem(node, info):
 # 6. EXPLAIN: no pointless grep after reading a named code file; read code after
 #    a named doc file; infer local import paths even when started from grep
 # --------------------------------------------------------------------------
-T._SKIP_FENCE_LANGS = set(T._SKIP_FENCE_LANGS) | {
+_SKIP_FENCE_LANGS.update({
     "text", "plaintext", "txt", "mermaid", "markdown", "md", "ascii", "diagram"
-}
-_SKIP_FENCE_LANGS = T._SKIP_FENCE_LANGS
+})
+T._SKIP_FENCE_LANGS = _SKIP_FENCE_LANGS
 
-_ff16_prev_local_imports = local_imports
-_ff16_prev_plan_explain = _plan_explain
 
 
 _STDLIB_MODS = getattr(sys, "stdlib_module_names", frozenset()) | {
@@ -18914,7 +18153,7 @@ _STDLIB_MODS = getattr(sys, "stdlib_module_names", frozenset()) | {
 def local_imports(path, text, listing, scored=False):
     """Also infer sibling/package paths when `listing` came from `grep` (partial)
     rather than a full-repo `glob`."""
-    res = _ff16_prev_local_imports(path, text, listing, scored=scored)
+    res = local_imports_s1(path, text, listing, scored=scored)
     if res or not _ff16_c("flow16_explain_imports"):
         return res
     if len(listing or ()) >= 4:
@@ -18962,12 +18201,12 @@ def local_imports(path, text, listing, scored=False):
             augmented.append(rel + ".py")
     if len(augmented) == len(listing or ()):
         return res
-    return _ff16_prev_local_imports(path, text, augmented, scored=scored)
+    return local_imports_s1(path, text, augmented, scored=scored)
 
 
 def _plan_explain(ctx, ev, tm):
     if not _ff16_c("flow16_explain_imports"):
-        return _ff16_prev_plan_explain(ctx, ev, tm)
+        return _plan_explain_s2(ctx, ev, tm)
     pat, total = "EXPLAIN", 4
     listing = _listing_files(ev)
     read_set = _read_set(ev)
@@ -19038,7 +18277,6 @@ def _plan_explain(ctx, ev, tm):
 # 7. flowfix13 runtime check (`_rf_gwtr`): keep it on the outside of install()
 #    and prevent `_analyze` from firing upstream classify on runtime checks
 # --------------------------------------------------------------------------
-_ff16_prev_analyze = _analyze
 
 
 def _analyze(messages):
@@ -19058,16 +18296,13 @@ def _analyze(messages):
                 return ctx
         except Exception:
             pass
-    return _ff16_prev_analyze(messages)
+    return _analyze_s6(messages)
 
 
 # --------------------------------------------------------------------------
 # 8. SSE heartbeat cleanup when stream is empty, non-blocking MSG_PEEK disconnect
 #    detection, & `/v1/responses` delta heartbeat wiring
 # --------------------------------------------------------------------------
-_ff16_prev_start_sse_ka = GeminiHandler._start_sse_with_keepalive
-_ff16_prev_stream_chat = GeminiHandler._stream_chat
-_ff16_prev_handle_responses = GeminiHandler._handle_responses
 
 
 class _Ff16ClientGone:
@@ -19114,7 +18349,7 @@ class _Ff16ClientGone:
 
 
 def _ff16_start_sse_with_keepalive(self):
-    stop_ping, client_gone, hb = _ff16_prev_start_sse_ka(self)
+    stop_ping, client_gone, hb = _GeminiHandler_start_sse_with_keepalive_orig(self)
     if not _ff16_c("flow16_sse_cleanup"):
         return stop_ping, client_gone, hb
     wrapped_gone = _Ff16ClientGone(client_gone, getattr(self, "connection", None))
@@ -19124,7 +18359,7 @@ def _ff16_start_sse_with_keepalive(self):
 def _ff16_stream_chat(self, cid, model, prompt, model_id, think_mode, file_refs,
                       extra, stop_strings, max_tokens, include_usage, ticket=None):
     if not _ff16_c("flow16_sse_cleanup"):
-        return _ff16_prev_stream_chat(
+        return _GeminiHandler_stream_chat_orig(
             self, cid, model, prompt, model_id, think_mode, file_refs,
             extra, stop_strings, max_tokens, include_usage, ticket=ticket)
     orig_start = self._start_sse_with_keepalive
@@ -19137,7 +18372,7 @@ def _ff16_stream_chat(self, cid, model, prompt, model_id, think_mode, file_refs,
 
     self._start_sse_with_keepalive = tracked_start
     try:
-        return _ff16_prev_stream_chat(
+        return _GeminiHandler_stream_chat_orig(
             self, cid, model, prompt, model_id, think_mode, file_refs,
             extra, stop_strings, max_tokens, include_usage, ticket=ticket)
     finally:
@@ -19151,7 +18386,7 @@ def _ff16_stream_chat(self, cid, model, prompt, model_id, think_mode, file_refs,
 
 def _ff16_handle_responses(self, body: bytes):
     if not _ff16_c("flow16_sse_cleanup"):
-        return _ff16_prev_handle_responses(self, body)
+        return _GeminiHandler_handle_responses_orig(self, body)
     orig_start = self._start_sse_with_keepalive
     stops = []
 
@@ -19163,7 +18398,7 @@ def _ff16_handle_responses(self, body: bytes):
 
     self._start_sse_with_keepalive = tracked_start
     try:
-        return _ff16_prev_handle_responses(self, body)
+        return _GeminiHandler_handle_responses_orig(self, body)
     finally:
         self._start_sse_with_keepalive = orig_start
         self._chat_hb = None
@@ -19179,7 +18414,6 @@ GeminiHandler._stream_chat = _ff16_stream_chat
 GeminiHandler._handle_responses = _ff16_handle_responses
 
 
-_ff16_prev_fx_install = _fx_install
 
 
 def _fx_install(server):
@@ -19191,22 +18425,10 @@ def _fx_install(server):
         for k, v in _FX_DEFAULTS.items():
             CONFIG.setdefault(k, v)
         return
-    return _ff16_prev_fx_install(server)
+    return _fx_install_s1(server)
 
 
-_ff16_prev_install = install
-
-
-def install():
-    _ff16_prev_install()
-    for k, v in _FF16_DEFAULTS.items():
-        CONFIG.setdefault(k, v)
-    from gemini_web2api import server
-    cls = server.GeminiHandler
-    cur = cls._generate_with_tool_retry
-    if getattr(cur, "_ff16_patched", False):
-        return
-
+def _wrap_ff16(cur):
     @functools.wraps(cur)
     def wrapper16(self, prompt, model_id, think_mode, file_refs, extra,
                   tools_active, allowed_names, tool_schemas, required_tool,
@@ -19227,8 +18449,7 @@ def install():
                    tool_required=tool_required, client_gone=client_gone)
 
     wrapper16._ff16_patched = True
-    cls._generate_with_tool_retry = wrapper16
-    log("[fix16] flow_fix16 installed")
+    return wrapper16
 # ==== flowfix16:end ====
 
 
@@ -19405,13 +18626,12 @@ def _ff17_imported_symbols_by_file(ev, listing=()):
     return sym_map
 
 
-_ff17_prev_render_view = _ff8_render_view
 _ff17_tls = threading.local()
 
 
 def _ff8_render_view(v, kws, locs, budget):
     if not _ff17_c("flow17_symbol_graph"):
-        return _ff17_prev_render_view(v, kws, locs, budget)
+        return _ff8_render_view_s1(v, kws, locs, budget)
     extra_syms = set(kws or ())
     sym_map = getattr(_ff17_tls, "sym_map", None) or {}
     vpath = _norm(v.get("path") or "")
@@ -19426,31 +18646,29 @@ def _ff8_render_view(v, kws, locs, budget):
             if ln not in existing:
                 merged_locs.append(ln)
                 existing.add(ln)
-    return _ff17_prev_render_view(v, kws, merged_locs, budget)
+    return _ff8_render_view_s1(v, kws, merged_locs, budget)
 
 
-_ff17_prev_source_block = _ff8_source_block
 
 
 def _ff8_source_block(ctx, stage, messages):
     if not _ff17_c("flow17_symbol_graph"):
-        return _ff17_prev_source_block(ctx, stage, messages)
+        return _ff8_source_block_s1(ctx, stage, messages)
     try:
         ev = _answered_calls(messages)
         _ff17_tls.sym_map = _ff17_imported_symbols_by_file(ev, _listing_files(ev))
     except Exception:
         _ff17_tls.sym_map = {}
     try:
-        return _ff17_prev_source_block(ctx, stage, messages)
+        return _ff8_source_block_s1(ctx, stage, messages)
     finally:
         _ff17_tls.sym_map = {}
 
 
-_ff17_prev_explain_hop = _ff14_explain_hop
 
 
 def _ff14_explain_hop(ctx, ev, tm, step):
-    res = _ff17_prev_explain_hop(ctx, ev, tm, step)
+    res = _ff14_explain_hop_s1(ctx, ev, tm, step)
     if (not _ff17_c("flow17_symbol_graph") or res is None
             or res is step or getattr(res, "name", None) != "read"):
         return res
@@ -19474,7 +18692,6 @@ def _ff14_explain_hop(ctx, ev, tm, step):
 # --------------------------------------------------------------------------
 # 2. Targeted Test Selection (`flow17_targeted_tests`)
 # --------------------------------------------------------------------------
-_ff17_prev_pick_test_command = pick_test_command
 
 
 def _ff17_targeted_test_commands(names, ev):
@@ -19607,10 +18824,10 @@ def _ff17_extract_verification_commands(messages, names=None, ev=None, require_e
 
 def pick_test_command(names, ev):
     if not _ff17_c("flow17_targeted_tests"):
-        return _ff17_prev_pick_test_command(names, ev)
+        return pick_test_command_s1(names, ev)
     configured = (_cfg("flow_test_command") or "").strip()
     if configured:
-        return _ff17_prev_pick_test_command(names, ev)
+        return pick_test_command_s1(names, ev)
     targeted = _ff17_targeted_test_commands(names, ev)
     msgs = getattr(_ff8_tls, "messages", None)
     v_cmds = _ff17_extract_verification_commands(msgs, names, ev)
@@ -19630,7 +18847,7 @@ def pick_test_command(names, ev):
             cands.append(c_s)
 
     if not cands:
-        return _ff17_prev_pick_test_command(names, ev)
+        return pick_test_command_s1(names, ev)
 
     last_act = max((i for i, e in enumerate(ev) if e["kind"] == "act"), default=-1)
     runs = _test_runs(ev)
@@ -19659,7 +18876,7 @@ def pick_test_command(names, ev):
             c_s = c.strip()
             if c_s not in broken_cmds and _cmd_target_exists(c_s):
                 return c_s
-        return _ff17_prev_pick_test_command(names, ev)
+        return pick_test_command_s1(names, ev)
     if test_outcome(after[-1][2]) != "broken":
         return None
     if len(after) >= int(_c("fix_max_test_attempts")):
@@ -19675,8 +18892,6 @@ def pick_test_command(names, ev):
 # --------------------------------------------------------------------------
 # 3. Blank-Line-Tolerant Fuzzy Edit Anchor & Delta Re-Indentation (`flow17_fuzzy_edit`)
 # --------------------------------------------------------------------------
-_ff17_prev_find_unique = _ff14_find_unique
-_ff17_prev_reindent = _ff14_reindent
 
 
 def _ff17_find_unique(old, hay):
@@ -19684,7 +18899,7 @@ def _ff17_find_unique(old, hay):
     If that misses and `flow17_fuzzy_edit` is enabled, try matching the sequence of
     non-empty normalized lines across `hay` (tolerating added/omitted blank lines
     inside the block) when it matches a single unique span in `hay`."""
-    actual, n = _ff17_prev_find_unique(old, hay)
+    actual, n = _ff14_find_unique_s1(old, hay)
     if actual is not None or n > 1 or not _ff17_c("flow17_fuzzy_edit"):
         return actual, n
 
@@ -19723,12 +18938,12 @@ def _ff17_reindent(new, old, actual):
     counts differ) and fall back to a uniform base-indentation delta for newly
     added indentation levels in `new`."""
     if not _ff17_c("flow17_fuzzy_edit"):
-        return _ff17_prev_reindent(new, old, actual)
+        return _ff14_reindent_s1(new, old, actual)
 
     ol_nonempty = [x for x in old.split("\n") if x.strip()]
     al_nonempty = [x for x in actual.split("\n") if x.strip()]
     if len(ol_nonempty) != len(al_nonempty) or not ol_nonempty:
-        return _ff17_prev_reindent(new, old, actual)
+        return _ff14_reindent_s1(new, old, actual)
 
     mapping = {}
     deltas = []
@@ -19765,8 +18980,6 @@ def _ff17_reindent(new, old, actual):
     return "\n".join(out)
 
 
-_ff14_find_unique = _ff17_find_unique
-_ff14_reindent = _ff17_reindent
 
 
 # --------------------------------------------------------------------------
@@ -19814,11 +19027,10 @@ def clear_session_ledger_cache():
         _FF17_SESSION_CACHE.clear()
 
 
-_ff17_prev_read_plan_bodies = _ff16_read_plan_bodies
 
 
 def _ff16_read_plan_bodies(messages):
-    bodies = _ff17_prev_read_plan_bodies(messages)
+    bodies = _ff16_read_plan_bodies_s1(messages)
     if not _ff17_c("flow17_session_ledger"):
         return bodies
     sid = _ff17_session_id_from_messages(messages)
@@ -19876,35 +19088,16 @@ def _ff17_sync_session_ev(messages, ev=None):
         return list(entry["edited_files"]), list(entry["read_files"])
 
 
-def _ff16_extract_plan_state(messages, ev=None):
-    """Inspect current + session-persisted plan files, todo items, and edited/read files."""
-    if ev is None:
-        ev = _answered_calls(messages or [])
-    ctx = _analyze(messages) if messages else _Ctx()
-    listing = _listing_files(ev)
-    # Trigger plan body sync first
-    _ff16_read_plan_bodies(messages or [])
-    plan_files = _ff16_plan_files(ctx, messages or [], listing)
-    plan_items = _ff16_extract_todo_items(ctx, messages or [])
-    edited_files, read_files = _ff17_sync_session_ev(messages or [], ev)
-    return {
-        "has_plan": bool(plan_files or len(plan_items) >= 2),
-        "plan_files": plan_files,
-        "plan_items": plan_items,
-        "edited_files": edited_files,
-        "read_files": read_files,
-    }
 
 
-_ff17_prev_todo_ledger = _ff16_todo_ledger
 
 
-def _ff16_todo_ledger(ctx, messages) -> str:
+def _ff16_todo_ledger_s2(ctx, messages) -> str:
     if not _ff17_c("flow17_session_ledger"):
-        return _ff17_prev_todo_ledger(ctx, messages)
+        return _ff16_todo_ledger_s1(ctx, messages)
     sid = _ff17_session_id_from_messages(messages)
     if not sid:
-        return _ff17_prev_todo_ledger(ctx, messages)
+        return _ff16_todo_ledger_s1(ctx, messages)
     if not _ff16_c("flow16_plan_todo") or ctx is None:
         return ""
     pat = getattr(ctx, "pattern", None)
@@ -19951,7 +19144,6 @@ def _ff16_todo_ledger(ctx, messages) -> str:
     return "\n".join(lines)
 
 
-_ff17_prev_plan_change = _plan_change
 
 
 def _plan_change(ctx, ev, tm, pat="CHANGE", total=5):
@@ -19973,7 +19165,7 @@ def _plan_change(ctx, ev, tm, pat="CHANGE", total=5):
                             "args": {"filePath": rf}, "result": "# cached from session\n"
                         })
             ev = synthetic_ev
-    return _ff17_prev_plan_change(ctx, ev, tm, pat=pat, total=total)
+    return _plan_change_s3(ctx, ev, tm, pat=pat, total=total)
 
 
 def _ff17_large_file_structure_index(messages):
@@ -20181,13 +19373,12 @@ def _read_texts(ev):
     return _ff9_read_texts(ev)
 
 
-_ff17_prev_stale_edits = _ff9_stale_edits
 
 
 def _ff9_stale_edits(ev):
     """Do not force a full re-read of a file during multi-step `act` (before tests run)
     or on large (>50 KB) files when `_ff9_read_texts` already tracks the post-edit text."""
-    raw_stale = _ff17_prev_stale_edits(ev)
+    raw_stale = _ff9_stale_edits_s1(ev)
     if not raw_stale:
         return raw_stale
     msgs = getattr(_ff8_tls, "messages", None)
@@ -20488,7 +19679,6 @@ def _ff17_static_python_lint(path: str, old_v: str, new_v: str, hay: str) -> lis
     return problems
 
 
-_ff17_prev_base_gate = _base_gate_act_calls
 
 
 def _base_gate_act_calls(calls, messages):
@@ -20605,7 +19795,7 @@ def _base_gate_act_calls(calls, messages):
     if early_problems and not repaired_calls:
         return [], early_problems
 
-    out, problems = _ff17_prev_base_gate(repaired_calls, messages)
+    out, problems = _base_gate_act_calls_s2(repaired_calls, messages)
     problems = early_problems + list(problems)
     if static_lint_problems:
         bad_lint_paths = {p.split(":")[0].strip() for p in static_lint_problems}
@@ -21195,7 +20385,6 @@ def _ff17_remaining_plan_or_todo_work(ctx, ev, messages) -> dict:
     }
 
 
-_ff17_prev_change_tail = _change_tail
 
 
 def _ff17_attach_audit_note_to_answer(step_ans, msgs, ev, tested_after=False):
@@ -21215,7 +20404,7 @@ def _ff17_attach_audit_note_to_answer(step_ans, msgs, ev, tested_after=False):
     return step_ans
 
 
-def _change_tail(pat, ctx, ev, tm, names_all, total, extra=""):
+def _change_tail_s5(pat, ctx, ev, tm, names_all, total, extra=""):
     if _ff17_c("flow17_plan_todo_act") and tm.first("act"):
         try:
             msgs = getattr(_ff8_tls, "messages", None)
@@ -21394,17 +20583,16 @@ def _change_tail(pat, ctx, ev, tm, names_all, total, extra=""):
                         return _tests_step(pat, tm, cmd, 4, total)
         except Exception as ex:
             log("[fix17] plan/todo act continuation error: %s" % ex)
-    res = _ff17_prev_change_tail(pat, ctx, ev, tm, names_all, total, extra=extra)
+    res = _change_tail_s4(pat, ctx, ev, tm, names_all, total, extra=extra)
     if res and getattr(res, "name", None) == "answer":
         res = _ff17_attach_audit_note_to_answer(res, msgs, ev, tested_after=bool(after if "after" in locals() else False))
     return res
 
 
-_ff17_prev_todo_ledger_outer = _ff16_todo_ledger
 
 
 def _ff16_todo_ledger(ctx, messages) -> str:
-    base_ledger = _ff17_prev_todo_ledger_outer(ctx, messages)
+    base_ledger = _ff16_todo_ledger_s2(ctx, messages)
     if not _ff16_c("flow16_plan_todo") or ctx is None:
         return base_ledger
     try:
@@ -21776,11 +20964,10 @@ def _ff17_act_context_pack(ctx, messages) -> str:
     return "\n\n".join(out_blocks)
 
 
-_ff17_prev_after_plan = _ff5_after_plan
 
 
-def _ff5_after_plan(step, messages, tm, ctx=None):
-    step = _ff17_prev_after_plan(step, messages, tm, ctx)
+def _ff5_after_plan_s3(step, messages, tm, ctx=None):
+    step = _ff5_after_plan_s2(step, messages, tm, ctx)
     try:
         if step is not None and getattr(step, "local_text", None) is None:
             if getattr(step, "name", None) == "answer":
@@ -21800,11 +20987,7 @@ def _ff5_after_plan(step, messages, tm, ctx=None):
     return step
 
 
-_ff17_prev_install = install
-
-
-def install():
-    _ff17_prev_install()
+def _setup_ff17():
     for k, v in _FF17_DEFAULTS.items():
         CONFIG.setdefault(k, v)
     log("[fix17] flow_fix17 installed")
@@ -21849,7 +21032,7 @@ def _ff18_failed_test_names(res: str) -> list:
     return sorted(names)
 
 
-def _ff18_fail_fingerprint(res: str) -> str:
+def _ff18_fail_fingerprint_s1(res: str) -> str:
     """Normalize test traceback and compute a stable hash for regression/progress detection."""
     if not res:
         return ""
@@ -21903,7 +21086,7 @@ def _ff18_repair_rounds(ev) -> int:
     return rounds
 
 
-def _ff18_analyze_failure_progression(ev) -> dict:
+def _ff18_analyze_failure_progression_s1(ev) -> dict:
     """Analyze the history of test failures to determine progress, bonus rounds, and identical failure loops."""
     runs = _test_runs(ev)
     failed_runs = [
@@ -22127,12 +21310,11 @@ def _ff18_diagnostic_context(called_symbols: set, messages: list, ev: list) -> s
     return "\n\n".join(out_blocks)
 
 
-_ff18_prev_change_tail = _change_tail
 
 
-def _change_tail(pat, ctx, ev, tm, names_all, total, extra=""):
+def _change_tail_s6(pat, ctx, ev, tm, names_all, total, extra=""):
     if not _ff18_c("flow18_enabled", True):
-        return _ff18_prev_change_tail(pat, ctx, ev, tm, names_all, total, extra=extra)
+        return _change_tail_s5(pat, ctx, ev, tm, names_all, total, extra=extra)
 
     try:
         msgs = getattr(_ff8_tls, "messages", None)
@@ -22214,14 +21396,13 @@ def _change_tail(pat, ctx, ev, tm, names_all, total, extra=""):
     except Exception as ex:
         log(f"[fix18] change_tail repair loop error: {ex}")
 
-    return _ff18_prev_change_tail(pat, ctx, ev, tm, names_all, total, extra=extra)
+    return _change_tail_s5(pat, ctx, ev, tm, names_all, total, extra=extra)
 
 
-_ff18_prev_after_plan = _ff5_after_plan
 
 
-def _ff5_after_plan(step, messages, tm, ctx=None):
-    step = _ff18_prev_after_plan(step, messages, tm, ctx)
+def _ff5_after_plan_s4(step, messages, tm, ctx=None):
+    step = _ff5_after_plan_s3(step, messages, tm, ctx)
     if not _ff18_c("flow18_enabled", True):
         return step
     try:
@@ -22245,7 +21426,6 @@ def _ff5_after_plan(step, messages, tm, ctx=None):
     return step
 
 
-_ff18_prev_postfilter = _ff5_postfilter
 
 _VI_FALSE_COMPLETION = re.compile(
     r"(?i)\b(?:đã\s+(?:được\s+)?hoàn\s+(?:tất|thành)|hoàn\s+thành\s+(?:100%|toàn\s+bộ|mọi\s+bước)"
@@ -22262,7 +21442,7 @@ _HONEST_KEYWORDS = re.compile(
 
 
 def _ff5_postfilter(result, messages, perm=None, last=True, tm=None, ctx=None):
-    res, nudge = _ff18_prev_postfilter(result, messages, perm, last, tm, ctx)
+    res, nudge = _ff5_postfilter_s3(result, messages, perm, last, tm, ctx)
     if nudge is not None or not _ff18_c("flow18_honest_final", True):
         return res, nudge
     if not (isinstance(res, tuple) and len(res) == 2):
@@ -22310,11 +21490,7 @@ def _ff5_postfilter(result, messages, perm=None, last=True, tm=None, ctx=None):
     return res, nudge
 
 
-_ff18_prev_install = install
-
-
-def install():
-    _ff18_prev_install()
+def _setup_ff18():
     for k, v in _FF18_DEFAULTS.items():
         CONFIG.setdefault(k, v)
     log("[fix18] flow_fix18 installed")
@@ -22357,7 +21533,6 @@ def _ff19_c(key, default=None):
 # --------------------------------------------------------------------------
 # 1a. _excerpt: keep swallowed handler-error lines (case-insensitive)
 # --------------------------------------------------------------------------
-_ff19_prev_excerpt = _excerpt
 _FF19_EXC_BASE = re.compile(
     r"Traceback|^FAIL|^ERROR|AssertionError|Error:|\bfailed\b|not ok")
 _FF19_EXC_EXTRA = re.compile(
@@ -22367,7 +21542,7 @@ _FF19_EXC_EXTRA = re.compile(
 
 def _excerpt(text, limit=1800):
     if not _ff19_c("flow19_enabled"):
-        return _ff19_prev_excerpt(text, limit)
+        return _excerpt_s1(text, limit)
     lines = (text or "").splitlines()
     for i, ln in enumerate(lines):
         if _FF19_EXC_BASE.search(ln) or _FF19_EXC_EXTRA.search(ln):
@@ -22379,12 +21554,11 @@ def _excerpt(text, limit=1800):
 # --------------------------------------------------------------------------
 # 1b. fail fingerprint: include the swallowed-error lines too
 # --------------------------------------------------------------------------
-_ff19_prev_fp = _ff18_fail_fingerprint
 
 
 def _ff18_fail_fingerprint(res):
     if not _ff19_c("flow19_enabled"):
-        return _ff19_prev_fp(res)
+        return _ff18_fail_fingerprint_s1(res)
     if not res:
         return ""
     failed_names = _ff18_failed_test_names(res)
@@ -22407,11 +21581,10 @@ def _ff18_fail_fingerprint(res):
 # --------------------------------------------------------------------------
 # 2. anti-oscillation: recompute progress with a seen-fingerprint set
 # --------------------------------------------------------------------------
-_ff19_prev_prog = _ff18_analyze_failure_progression
 
 
 def _ff18_analyze_failure_progression(ev):
-    res = _ff19_prev_prog(ev)
+    res = _ff18_analyze_failure_progression_s1(ev)
     if not _ff19_c("flow19_enabled") or not _ff19_c("flow19_anti_oscillation"):
         return res
     try:
@@ -22608,12 +21781,11 @@ def _ff19_signature_windows(symbols, messages, limit=30):
 # --------------------------------------------------------------------------
 # 3. _change_tail: force-read (with exit) + late stop
 # --------------------------------------------------------------------------
-_ff19_prev_change_tail = _change_tail
 
 
 def _change_tail(pat, ctx, ev, tm, names_all, total, extra=""):
     if not _ff19_c("flow19_enabled"):
-        return _ff19_prev_change_tail(pat, ctx, ev, tm, names_all, total, extra=extra)
+        return _change_tail_s6(pat, ctx, ev, tm, names_all, total, extra=extra)
     try:
         msgs = getattr(_ff8_tls, "messages", None)
         runs = _test_runs(ev)
@@ -22665,7 +21837,7 @@ def _change_tail(pat, ctx, ev, tm, names_all, total, extra=""):
                                 % (names_streak, ", ".join(targets[:4]))))
     except Exception as ex:
         log("[fix19] change_tail pre-pass error: %s" % ex)
-    return _ff19_prev_change_tail(pat, ctx, ev, tm, names_all, total, extra=extra)
+    return _change_tail_s6(pat, ctx, ev, tm, names_all, total, extra=extra)
 
 
 # --------------------------------------------------------------------------
@@ -22757,11 +21929,10 @@ def _ff19_check_self_calls(path, post_src):
     return problems
 
 
-_ff19_prev_gate = _gate_act_calls
 
 
 def _gate_act_calls(calls, messages):
-    out, problems = _ff19_prev_gate(calls, messages)
+    out, problems = _gate_act_calls_s2(calls, messages)
     if not _ff19_c("flow19_enabled") or not _ff19_c("flow19_call_sig_check"):
         return out, problems
     try:
@@ -22795,11 +21966,10 @@ def _gate_act_calls(calls, messages):
 # --------------------------------------------------------------------------
 # enrich guided act step with ast override signatures while a test fails
 # --------------------------------------------------------------------------
-_ff19_prev_after_plan = _ff5_after_plan
 
 
 def _ff5_after_plan(step, messages, tm, ctx=None):
-    step = _ff19_prev_after_plan(step, messages, tm, ctx)
+    step = _ff5_after_plan_s4(step, messages, tm, ctx)
     if not _ff19_c("flow19_enabled") or not _ff19_c("flow19_override_sigs"):
         return step
     try:
@@ -22827,15 +21997,72 @@ def _ff5_after_plan(step, messages, tm, ctx=None):
 # --------------------------------------------------------------------------
 # install
 # --------------------------------------------------------------------------
-_ff19_prev_install = install
-
-
-def install():
-    _ff19_prev_install()
+def _setup_ff19():
     for k, v in _FF19_DEFAULTS.items():
         CONFIG.setdefault(k, v)
     log("[fix19] flow_fix19 installed (excerpt/fingerprint fix + "
         "anti-oscillation + force-read + AST call-sig gate)")
+
+def install():
+    """Install flow engine middleware and sync defaults. Idempotent."""
+    from gemini_web2api import server
+    cls = server.GeminiHandler
+    cur = cls._generate_with_tool_retry
+    if getattr(cur, "_flow_installed", False):
+        return
+
+    # Setup defaults and submodules in original sequential order
+    for k, v in _DEFAULTS.items():
+        CONFIG.setdefault(k, v)
+    _fx_install(server)
+
+    for k, v in _FLOW_DEFAULTS.items():
+        CONFIG.setdefault(k, v)
+
+    for k, v in _FX_DEFAULTS.items():
+        CONFIG.setdefault(k, v)
+
+    for k, v in _FF5_DEFAULTS.items():
+        CONFIG.setdefault(k, v)
+    _ff5_wrap_change(server)
+    _ff5_install_banner()
+    _ff4_wrap_classifiers()
+    _ff4_extend_canned()
+
+    _setup_ff8()
+    _setup_ff10()
+
+    _setup_ff14()
+    _setup_ff15()
+
+    for k, v in _FF16_DEFAULTS.items():
+        CONFIG.setdefault(k, v)
+
+    _setup_ff17()
+    _setup_ff18()
+    _setup_ff19()
+
+    # Middleware chain (inside-out)
+    cur = _wrap_flow(cur)
+    log("[flow] flow_patch installed")
+
+    cur = _wrap_ff3(cur)
+    log("[fix3] flow_fix3 installed")
+
+    cur = _wrap_ff4(cur)
+    log("[fix4] flow_fix4 installed")
+
+    cur = _wrap_ff5(cur)
+    log("[fix5] flow_fix5 installed")
+
+    cur = _wrap_ff12(cur)
+    log("[fix12] required-tool guard installed")
+
+    cur = _wrap_ff16(cur)
+    log("[fix16] flow_fix16 installed")
+
+    cur._flow_installed = True
+    cls._generate_with_tool_retry = cur
 # ==== flowfix19:end ====
 if __name__ == "__main__":
     main()

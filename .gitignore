@@ -12,5 +12,9 @@ gemini-auth.json
 # never publishes the operator's Google session material.
 config.json
 
-# Local working plan -- documentation for the fix, not part of the source.
-KE_HOACH_SUA_TOOL_CALLING.md
+# Local working plan -- documentation for the fix or test, not part of the source.
+*_plan.md
+conversation.txt
+log.txt
+refactor/*
+tools/*
