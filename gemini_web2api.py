@@ -2797,14 +2797,7 @@ def _looks_like_identifier(text: str) -> bool:
 
 
 def _is_change_request_s1(folded: str, scannable: str, raw: str = "") -> bool:
-    """True when folded text asks for a code change (fix/implement/update).
-
-    ``folded``/``scannable`` come from :func:`_strip_code_spans`, which erases
-    inline code, so ``raw`` (the untouched user text) is scanned separately:
-    "fix the ``retry_delay`` handling" names its target in backticks and is
-    a change request even though no prose noun or file token survives the
-    strip.
-    """
+    """Core change-request heuristics from initial classification stage."""
     if _CHANGE_ACT_RE.search(folded):
         return True
     if not _CHANGE_VERB_RE.search(folded):
@@ -17016,6 +17009,7 @@ _FF14_REFACTOR_Q_RE = re.compile(
 
 
 def review_demanded(messages) -> bool:
+    """True when the newest user turn asks for a source/code review or code question."""
     if review_demanded_s1(messages):
         return True
     try:
