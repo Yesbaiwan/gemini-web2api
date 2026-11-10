@@ -22022,5 +22022,101 @@ def install():
     cur._flow_installed = True
     cls._generate_with_tool_retry = cur
 # ==== flowfix19:end ====
+
+# ==============================================================================
+# Semantic Names & Legacy Aliases (Phase 7)
+# ==============================================================================
+postfilter_output = _ff5_postfilter
+get_flow_permissions = _ff5_permissions
+get_flow_scope = _ff5_scope
+detect_flow_pattern = _ff5_detect
+filter_after_plan = _ff5_after_plan
+check_evidence_gate = _ff5_evidence_gate
+find_text_key = _ff17_find_key
+extract_read_texts = _ff9_read_texts
+build_todo_ledger = _ff16_todo_ledger
+pack_act_context = _ff17_act_context_pack
+attach_todowrite = _ff17_attach_todowrite
+audit_plan_compliance = _ff17_audit_plan_compliance
+evaluate_plan_steps = _ff17_evaluate_plan_steps
+extract_req_tokens = _ff17_extract_req_tokens
+remaining_plan_or_todo_work = _ff17_remaining_plan_or_todo_work
+strip_numbered_lines = _ff17_strip_numbered_lines
+analyze_failure_progression = _ff18_analyze_failure_progression
+check_self_calls = _ff19_check_self_calls
+collect_continuations = _ff4_continuations
+is_unfinished_thought = _ff4_unfinished
+is_ambiguous_intent = _ff10_ambiguous
+rank_intent_candidates = _ff10_candidates
+extract_todo_items = _ff16_extract_todo_items
+extract_plan_files = _ff16_plan_files
+format_own_result = _ff5_own_result
+format_spec_banner = _ff5_spec_banner
+format_flow_status = _ff5_status
+format_flow_status_detail = _ff5_status_detail
+check_read_guard = _ff5_read_guard
+create_diff_step = _ff5_diff_step
+is_file_in_scope = _ff5_in_scope
+validate_scope_problems = _ff5_scope_problems
+check_act_needs_read_problems = _ff5_act_needs_read_problems
+is_cross_module_action = _ff5_cross_module
+get_flow_cache = _ff5_cache
+patch_gemini_calls = _ff8_patch_gemini
+is_proven_absent = _ff8_proven_absent
+filter_survey_listing = _ff6c_filter
+orig_file_review = _ff10_orig_file_review
+get_intent_cache = _ff10_cache
+adapt_flow_calls = _ff5_adapt_calls
+install_task_pattern_banner = _ff5_install_banner
+filter_after_plan_step = _ff5_plan_after
+
+_LEGACY_ALIASES = {
+    "_ff5_postfilter": postfilter_output,
+    "_ff5_cmd_readonly": is_readonly_command,
+    "_ff5_permissions": get_flow_permissions,
+    "_ff5_scope": get_flow_scope,
+    "_ff5_detect": detect_flow_pattern,
+    "_ff5_after_plan": filter_after_plan,
+    "_ff5_evidence_gate": check_evidence_gate,
+    "_ff17_find_key": find_text_key,
+    "_ff9_read_texts": extract_read_texts,
+    "_ff16_todo_ledger": build_todo_ledger,
+    "_ff17_act_context_pack": pack_act_context,
+    "_ff17_attach_todowrite": attach_todowrite,
+    "_ff17_audit_plan_compliance": audit_plan_compliance,
+    "_ff17_evaluate_plan_steps": evaluate_plan_steps,
+    "_ff17_extract_req_tokens": extract_req_tokens,
+    "_ff17_extract_verification_commands": extract_verification_commands,
+    "_ff17_remaining_plan_or_todo_work": remaining_plan_or_todo_work,
+    "_ff17_strip_numbered_lines": strip_numbered_lines,
+    "_ff18_analyze_failure_progression": analyze_failure_progression,
+    "_ff19_check_self_calls": check_self_calls,
+    "_ff4_continuations": collect_continuations,
+    "_ff4_unfinished": is_unfinished_thought,
+    "_ff10_ambiguous": is_ambiguous_intent,
+    "_ff10_candidates": rank_intent_candidates,
+    "_ff16_extract_todo_items": extract_todo_items,
+    "_ff16_plan_files": extract_plan_files,
+    "_ff5_own_result": format_own_result,
+    "_ff5_spec_banner": format_spec_banner,
+    "_ff5_status": format_flow_status,
+    "_ff5_status_detail": format_flow_status_detail,
+    "_ff5_read_guard": check_read_guard,
+    "_ff5_diff_step": create_diff_step,
+    "_ff5_in_scope": is_file_in_scope,
+    "_ff5_scope_problems": validate_scope_problems,
+    "_ff5_act_needs_read_problems": check_act_needs_read_problems,
+    "_ff5_cross_module": is_cross_module_action,
+    "_ff5_cache": get_flow_cache,
+    "_ff8_patch_gemini": patch_gemini_calls,
+    "_ff8_proven_absent": is_proven_absent,
+    "_ff6c_filter": filter_survey_listing,
+    "_ff10_orig_file_review": orig_file_review,
+    "_ff10_cache": get_intent_cache,
+    "_ff5_adapt_calls": adapt_flow_calls,
+    "_ff5_install_banner": install_task_pattern_banner,
+    "_ff5_plan_after": filter_after_plan_step,
+}
+
 if __name__ == "__main__":
     main()
