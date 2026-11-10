@@ -660,7 +660,8 @@ class ReadonlyShell(unittest.TestCase):
         for c in ("git status --short", "ls && git diff", "git --no-pager log -n 5",
                   "python -m unittest discover -s tests", "cat a.py | head -20",
                   "git status 2>&1", "ls >/dev/null", "git branch -a",
-                  "git branch --list", "git remote -v", "find . -name x.py"):
+                  "git branch --list", "git remote -v", "find . -name x.py",
+                  "git diff HEAD", "npm test", "pytest"):
             self.assertTrue(F._ff5_cmd_readonly(c), c)
 
     def test_unsupported_syntax_is_rejected(self):
@@ -668,7 +669,11 @@ class ReadonlyShell(unittest.TestCase):
                   "find . -delete", "find . -exec rm {} ;", "git branch -D x",
                   "git branch newbranch", "git diff --output=x", "sort -o a b",
                   "git status > out.txt", "git -c core.pager=x log",
-                  "git remote add o url", "ls >/dev/null.txt", "rm a.py"):
+                  "git remote add o url", "ls >/dev/null.txt", "rm a.py",
+                  "git branch -D main", "git remote add x y", "cmd > file.txt",
+                  "cmd >> file.txt", "del /s /q *", "git reset --hard",
+                  "git clean -fdx", "a; rm x", "git status || rm a.py",
+                  "git status | rm a.py", "git remote set-url origin https://evil.com"):
             self.assertFalse(F._ff5_cmd_readonly(c), c)
 
     def test_postfilter_blocks_the_newline_trick(self):
