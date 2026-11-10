@@ -2831,10 +2831,11 @@ _RUN_TOOL_RE = re.compile(
     r"(?:^|[^a-z0-9])(?:bash|shell|exec|run|pytest|npm|make)(?:[^a-z0-9]|$)",
     re.IGNORECASE,
 )
+# Final value from before the refactor (a later re-assignment in the flow section used to
+# win at call time): also recognises `npm run test`, `yarn test` and `cargo test`.
 _TEST_CMD_RE = re.compile(
-    r"\b(?:unittest|pytest|npm\s+test|make\s+test|go\s+test)\b",
-    re.IGNORECASE,
-)
+    r"\b(unittest|pytest|npm\s+(?:run\s+)?test|yarn\s+test|make\s+test|"
+    r"go\s+test|cargo\s+test)\b")
 _SOURCE_EDIT_EXT_RE = re.compile(
     r"\.(?:py|js|jsx|ts|tsx|go|rs|java|rb|php|swift|kt|c|h|cpp)$",
     re.IGNORECASE,
@@ -3118,7 +3119,7 @@ _TASK_BANNER_HOOK = None
 
 def task_pattern_banner(messages) -> str:
     """Banner for the detected task pattern, or ``""`` when no flow applies."""
-    hook = globals().get("_TASK_BANNER_HOOK")
+    hook = _TASK_BANNER_HOOK
     if hook is not None:
         try:
             text = hook(messages)
@@ -5930,7 +5931,7 @@ def _strip_read_envelope(text):
 
 def _clean_file_text(text):
     text = _strip_read_envelope(text or "")
-    trunc = globals().get("_FF4_TRUNC_RE")
+    trunc = _FF4_TRUNC_RE
     if trunc is not None:
         text = trunc.sub("", text).rstrip()
     lines = text.replace("\r\n", "\n").split("\n")
@@ -6013,7 +6014,7 @@ def _base_analyze(messages):
         if not ctx.pattern and _cfg("flow_explain") and _is_code_question(ctx.last):
             ctx.pattern = "EXPLAIN"
     req_text = ctx.request or ""
-    strip_fn = globals().get("_strip_pasted_content")
+    strip_fn = _strip_pasted_content
     if callable(strip_fn):
         stripped = strip_fn(req_text)
         if stripped.strip():
@@ -6561,15 +6562,14 @@ def _wrap_flow(orig):
             return call(effective_prompt + "\n\n" + step.directive())
         if step.drive and _cfg("flow_drive"):
             d_calls = list(step.calls or [])
-            if "_ff17_attach_todowrite" in globals():
-                d_calls = _ff17_attach_todowrite(ctx, messages, tm, step, d_calls)
+            d_calls = _ff17_attach_todowrite(ctx, messages, tm, step, d_calls)
             return "", d_calls
 
         nudge, last = "", None
         saved_todo_calls = []
         max_retries = max(0, int(_cfg("flow_max_retries"))) + (1 if step.name == "act" else 0)
         step_allowed = (
-            {n for n in step.tool_names if not (step.name == "act" and "_ff16_is_todo_tool" in globals() and _ff16_is_todo_tool(n))}
+            {n for n in step.tool_names if not (step.name == "act" and _ff16_is_todo_tool(n))}
             or set(step.tool_names)
         ) if step.tool_names else None
         for attempt in range(1 + max_retries):
@@ -6593,8 +6593,7 @@ def _wrap_flow(orig):
                 if not any(tool_kind((tc.get("function") or {}).get("name")) == "act" for tc in ok):
                     saved_todo_calls = [
                         tc for tc in ok
-                        if "_ff16_is_todo_tool" in globals()
-                        and _ff16_is_todo_tool((tc.get("function") or {}).get("name"))
+                        if _ff16_is_todo_tool((tc.get("function") or {}).get("name"))
                     ]
                     last = (text, None)
                     ok = []
@@ -6621,12 +6620,11 @@ def _wrap_flow(orig):
                         continue
             if ok:
                 if saved_todo_calls and not any(
-                    "_ff16_is_todo_tool" in globals()
-                    and _ff16_is_todo_tool((tc.get("function") or {}).get("name"))
+                    _ff16_is_todo_tool((tc.get("function") or {}).get("name"))
                     for tc in ok
                 ):
                     ok = saved_todo_calls + list(ok)
-                elif "_ff17_attach_todowrite" in globals():
+                else:
                     ok = _ff17_attach_todowrite(ctx, messages, tm, step, ok)
                 return "", ok
             bad = ", ".join((tc.get("function") or {}).get("name", "?")
@@ -6761,6 +6759,7 @@ _DEFAULTS.update(_FLOW_DEFAULTS)
 for _sub in (_FF8_DEFAULTS, _FF16_DEFAULTS, _FF17_DEFAULTS, _FF18_DEFAULTS, _FF19_DEFAULTS):
     for _k, _v in _sub.items():
         CONFIG.setdefault(_k, _v)
+del _k, _v
 
 
 def _flow_c(key, default=None):
@@ -9220,7 +9219,7 @@ _FF5_NORUN_RE = re.compile(
 
 def _ff5_fold(text):
     raw = text or ""
-    strip_fn = globals().get("_strip_pasted_content")
+    strip_fn = _strip_pasted_content
     if callable(strip_fn):
         stripped = strip_fn(raw)
         if stripped.strip():
@@ -9527,7 +9526,7 @@ def _ff5_status(e):
             return "unknown"
         if not _read_ok(e) or _FF5_READFAIL_RE.match(res):
             return "failed"
-        trunc = globals().get("_FF4_TRUNC_RE") or _FF5_TRUNC_RE
+        trunc = _FF4_TRUNC_RE or _FF5_TRUNC_RE
         return "partial" if trunc.search(res[-400:]) else "success"
     if k == "act":
         if not res.strip():
@@ -9655,7 +9654,7 @@ def _ff5_evidence_gate_s1(ctx, messages, tm):
 
     # 1. truncated output: continue at the offset the tool asked for, before
     #    editing or answering. For a pattern that may edit this is mandatory.
-    okey = _ff4_offset_key(tm) if "_ff4_offset_key" in globals() else None
+    okey = _ff4_offset_key(tm)
     conts = _ff4_continuations(ev, okey) if okey else []
     if conts:
         names = ", ".join(sorted({p for p, _c in conts}))
@@ -10212,7 +10211,7 @@ _FF5_CROSS_NOTE = (
 
 
 def _ff5_trunc_re():
-    return globals().get("_FF4_TRUNC_RE") or _FF5_TRUNC_RE
+    return _FF4_TRUNC_RE or _FF5_TRUNC_RE
 
 
 
@@ -10784,8 +10783,8 @@ def _analyze_s3(messages):
         elif (ctx.pattern is None and not perm.edit and _c5("flow5_respect_no_edit")
               and ("user forbade edits" in (perm.reason or "") or "guidance question" in (perm.reason or ""))):
             f_low = (ctx.folded or "").lower()
-            first_cl = globals().get("_ff_first_clause")
-            exp_rx = globals().get("_EXPLAIN_LEAD_RE")
+            first_cl = _ff_first_clause
+            exp_rx = _EXPLAIN_LEAD_RE
             if (_is_change_request_s1(ctx.folded, ctx.scannable, ctx.last)
                     or _FF5_HOWTO_RE.search(f_low)
                     or (callable(first_cl) and exp_rx and exp_rx.match(first_cl(ctx.last or "")))):
@@ -11288,13 +11287,12 @@ def _ff5_has_fresh_evidence_after_last_act(messages, path):
     # If `_ff9_read_texts` still tracks the updated content of `path` in-place
     # (from earlier edits or full-file writes, with no failed test run since `last_act`),
     # allow subsequent phase edits without forcing a redundant re-read.
-    if "_ff9_read_texts" in globals():
-        tracked = _ff9_read_texts(messages)
-        tk = _ff17_find_key(tracked, path) if "_ff17_find_key" in globals() else None
-        if tk is not None or any(T._path_seen(path, [k]) for k in tracked):
-            tests_ran = _tests_ran_after_act(ev) if "_tests_ran_after_act" in globals() else False
-            if not tests_ran or len(tracked.get(tk or path) or "") > 50000:
-                return True
+    tracked = _ff9_read_texts(messages)
+    tk = _ff17_find_key(tracked, path)
+    if tk is not None or any(T._path_seen(path, [k]) for k in tracked):
+        tests_ran = _tests_ran_after_act(ev)
+        if not tests_ran or len(tracked.get(tk or path) or "") > 50000:
+            return True
 
     return False
 
@@ -11981,10 +11979,10 @@ def _ff8_write_check(result, messages, ctx):
         if any(T._path_seen(path, [x]) for x in touched):
             fixed, pr = _gate_act_calls([tc], messages)
             if pr:
-                tracked_now = _ff9_read_texts(messages) if "_ff9_read_texts" in globals() else {}
-                tk = _ff17_find_key(tracked_now, path) if "_ff17_find_key" in globals() else None
+                tracked_now = _ff9_read_texts(messages)
+                tk = _ff17_find_key(tracked_now, path)
                 is_tracked = (tk is not None) or any(T._path_seen(path, [k]) for k in tracked_now)
-                tests_ran = _tests_ran_after_act(ev) if "_tests_ran_after_act" in globals() else False
+                tests_ran = _tests_ran_after_act(ev)
                 stale_re_read = not is_tracked or (tests_ran and len(tracked_now.get(tk or path) or "") <= 50000)
                 if stale_re_read:
                     probs.extend(pr + ["%s: the file changed after your last read; "
@@ -12059,7 +12057,7 @@ def _ff8_file_views(ev):
             last_act[key] = i
         elif e["kind"] == "read" and _ff5_status(e) in ("success", "partial"):
             body = _strip_read_envelope(_ff5_trunc_re().sub("", e.get("result") or "").rstrip())
-            off = _ff4_off(e["args"]) if "_ff4_off" in globals() else 0
+            off = _ff4_off(e["args"])
             v = views.get(key)
             if v is None or off <= 0:
                 views[key] = {"path": _norm(p), "text": body, "off": max(off, 0), "idx": i}
@@ -12608,9 +12606,6 @@ def _is_file_review(folded, scannable):
 # detect_task_pattern()/review_demanded()/pending_tool_request() resolve these
 # names from this module, so assigning them here changes the deterministic gate
 # too. T is this same module (the flat bundle aliases every submodule).
-_ff10_is_source_review = _is_source_review
-_ff10_is_file_review = _is_file_review
-_ff10_orig_source_review = _is_source_review_s1
 _ff10_orig_file_review = _is_file_review_s1
 T._is_source_review = _is_source_review
 T._is_file_review = _is_file_review
@@ -15652,7 +15647,7 @@ def _ff12_user_creates(path, ctx, listing):
         if base in created or norm_p in created:
             return True
         msgs = getattr(_ff8_tls, "messages", None)
-        if msgs is not None and "_ff16_plan_files" in globals():
+        if msgs is not None:
             plan_files = _ff16_plan_files(ctx, msgs, listing)
             if any(_ff12_same_file(path, pf) for pf in plan_files):
                 return True
@@ -15670,7 +15665,7 @@ def _ff5_act_needs_read_problems(calls, messages, ctx):
         return []
     if pattern == "DEBUG" and not fix:
         return []
-    tracked = _ff9_read_texts(messages) if "_ff9_read_texts" in globals() else {}
+    tracked = _ff9_read_texts(messages)
     good = list(set(_ff5_successful_read_paths(messages)).union(tracked.keys()))
     listing = _ff6c_survey_listing(_answered_calls(messages))
     problems = []
@@ -16657,7 +16652,7 @@ def _ff14_nline(s):
     return " ".join(s.split())
 
 
-def _ff14_find_unique(old, hay):
+def _ff14_find_unique_s1(old, hay):
     """Line-based, whitespace-insensitive match -> (actual_text | None, n_matches)."""
     ol = [_ff14_nline(x) for x in old.split("\n")]
     while ol and not ol[0]:
@@ -16683,7 +16678,7 @@ def _ff14_ws(ln):
     return ln[:len(ln) - len(ln.lstrip())]
 
 
-def _ff14_reindent(new, old, actual):
+def _ff14_reindent_s1(new, old, actual):
     """Re-indent ``new`` from the model's indentation of ``old`` to the file's ``actual``."""
     ol = [x for x in old.split("\n")]
     while ol and not ol[0].strip():
@@ -17090,9 +17085,9 @@ def _ff15_label(ctx, pat):
     review_pat = pat in ("GENERIC_REVIEW", "FILE_REVIEW")
     if pat and not review_pat:
         return None
-    defect_rx = globals().get("_FF10_DEFECT_RE") or _FF15_DEFECT_FALLBACK
-    strong_rx = globals().get("_SOURCE_STRONG_VERB_RE") or _FF15_STRONG_FALLBACK
-    howto_rx = globals().get("_FF5_HOWTO_RE")
+    defect_rx = _FF10_DEFECT_RE or _FF15_DEFECT_FALLBACK
+    strong_rx = _SOURCE_STRONG_VERB_RE or _FF15_STRONG_FALLBACK
+    howto_rx = _FF5_HOWTO_RE
     howto = bool(howto_rx and howto_rx.search(f))
     try:
         has_file = bool(T._files_in(raw))
@@ -18323,7 +18318,7 @@ def _ff17_c(key, default=None):
 def _ff17_strip_numbered_lines(text):
     """Return unnumbered source text and a list mapping 0-based index -> file line number."""
     cleaned = _strip_read_envelope(text or "")
-    trunc = globals().get("_FF4_TRUNC_RE")
+    trunc = _FF4_TRUNC_RE
     if trunc is not None:
         cleaned = trunc.sub("", cleaned).rstrip()
     lines = cleaned.split("\n")
@@ -18821,6 +18816,10 @@ def _ff17_reindent(new, old, actual):
     return "\n".join(out)
 
 
+# Callers in the ff14/ff17 sections resolve these names at call time, so the
+# final binding must be the ff17 (fuzzy) implementation, as before the refactor.
+_ff14_find_unique = _ff17_find_unique
+_ff14_reindent = _ff17_reindent
 
 
 # --------------------------------------------------------------------------
@@ -19113,7 +19112,7 @@ def _ff17_merge_read_chunk(cur_text, raw_result, args, edited_since_read=False) 
 
     new_lines = clean_body.split("\n")
     cur_lines = cur_text.split("\n")
-    off = _ff4_off(args) if "_ff4_off" in globals() else 0
+    off = _ff4_off(args)
 
     # Determine 1-based start line of this chunk
     if has_explicit_nums:
@@ -20062,7 +20061,7 @@ def _ff17_evaluate_plan_steps(ctx, ev, messages, pending_calls=None, step_name=N
         })
 
     # D3: Append verification commands and compliance audit steps to eval_steps
-    v_cmds = _ff17_extract_verification_commands(messages, None, ev, require_existing=False) if "_ff17_extract_verification_commands" in globals() else []
+    v_cmds = _ff17_extract_verification_commands(messages, None, ev, require_existing=False)
     if v_cmds:
         n_steps = len(out)
         runs = _test_runs(ev_list)
@@ -20090,7 +20089,7 @@ def _ff17_evaluate_plan_steps(ctx, ev, messages, pending_calls=None, step_name=N
         all_prev_done = bool(tests_completed and all(s["done"] for s in out[:n_steps]))
         audit_res = (
             _ff17_audit_plan_compliance(messages, ev_list)
-            if (all_prev_done and "_ff17_audit_plan_compliance" in globals())
+            if all_prev_done
             else {"compliant": False, "violations": []}
         )
         audit_done = bool(all_prev_done and audit_res.get("compliant"))
@@ -21212,8 +21211,7 @@ def _change_tail_s6(pat, ctx, ev, tm, names_all, total, extra=""):
                     st = _answer_step("CHANGE", ev, total, total, final=True)
                     if st:
                         st.pattern = pat
-                        if "_ff17_attach_audit_note_to_answer" in globals():
-                            st = _ff17_attach_audit_note_to_answer(st, msgs, ev, tested_after=True)
+                        st = _ff17_attach_audit_note_to_answer(st, msgs, ev, tested_after=True)
                         if _ff18_c("flow18_honest_final", True) and progression["failed_names"]:
                             fn_str = ", ".join(progression["failed_names"][:6])
                             st.instruction = (st.instruction or "") + (
@@ -21625,9 +21623,8 @@ def _change_tail(pat, ctx, ev, tm, names_all, total, extra=""):
                     st = _answer_step("CHANGE", ev, total, total, final=True)
                     if st:
                         st.pattern = pat
-                        if "_ff17_attach_audit_note_to_answer" in globals():
-                            st = _ff17_attach_audit_note_to_answer(
-                                st, msgs, ev, tested_after=True)
+                        st = _ff17_attach_audit_note_to_answer(
+                            st, msgs, ev, tested_after=True)
                         fnames = _ff18_failed_test_names(failed_res)
                         fn_str = ", ".join(fnames[:6]) or "unit tests"
                         st.instruction = (st.instruction or "") + (
@@ -21770,7 +21767,7 @@ def _gate_act_calls(calls, messages):
             okey = next((k for k in _OLD_KEYS
                          if isinstance(args.get(k), str) and args[k]), None)
             old_code = args.get(okey) if okey else ""
-            tk = _ff17_find_key(texts, path) if "_ff17_find_key" in globals() else None
+            tk = _ff17_find_key(texts, path)
             full = texts.get(tk or path) or ""
             if not full:
                 continue
@@ -21895,7 +21892,7 @@ import uuid
 
 from gemini_web2api.config import CONFIG, load_config, find_config, _config_lock_ctx
 from gemini_web2api.models import MODELS, ticket_warnings
-from gemini_web2api.gemini import HAS_HTTPX, fetch_latest_bl, log_s1 as log
+from gemini_web2api.gemini import HAS_HTTPX, fetch_latest_bl, log
 from gemini_web2api.server import GeminiHandler, ThreadedServer
 from gemini_web2api import __version__
 
