@@ -904,6 +904,20 @@ class PermissionsWithoutPattern(unittest.TestCase):
     def test_no_pattern_still_honours_explicit_ban(self):
         self.assertFalse(F._ff5_permissions([_u("do not edit my files")], None).edit)
 
+    def test_fix_request_with_explicit_no_edit_demoted_to_explain(self):
+        cases = [
+            "fix the login bug but do not edit anything",
+            "fix bug, no edits",
+            "repair the parser bug, read only",
+        ]
+        for prompt in cases:
+            with self.subTest(prompt=prompt):
+                ctx = F._analyze([_u(prompt)])
+                self.assertEqual("EXPLAIN", ctx.pattern)
+                self.assertFalse(ctx.perm.edit)
+                self.assertEqual("readonly", ctx.perm.run)
+                self.assertIn("user forbade edits", ctx.perm.reason or "")
+
 class NegatedRun(unittest.TestCase):
     def test_vietnamese_negated_command_is_not_run(self):
         ctx = F._analyze([_u("Đừng chạy `git reset --hard`, chỉ giải thích thôi")])

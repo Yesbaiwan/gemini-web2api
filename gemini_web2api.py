@@ -10784,10 +10784,9 @@ def _analyze_s3(messages):
         elif (ctx.pattern is None and not perm.edit and _c5("flow5_respect_no_edit")
               and ("user forbade edits" in (perm.reason or "") or "guidance question" in (perm.reason or ""))):
             f_low = (ctx.folded or "").lower()
-            prev_chg = globals().get("_rf_prev_is_change_request")
             first_cl = globals().get("_ff_first_clause")
             exp_rx = globals().get("_EXPLAIN_LEAD_RE")
-            if ((callable(prev_chg) and prev_chg(ctx.folded, ctx.scannable, ctx.last))
+            if (_is_change_request_s1(ctx.folded, ctx.scannable, ctx.last)
                     or _FF5_HOWTO_RE.search(f_low)
                     or (callable(first_cl) and exp_rx and exp_rx.match(first_cl(ctx.last or "")))):
                 log(f"[fix5] NONE -> EXPLAIN ({perm.reason})")
