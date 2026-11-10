@@ -12607,8 +12607,6 @@ def _is_file_review(folded, scannable):
 # names from this module, so assigning them here changes the deterministic gate
 # too. T is this same module (the flat bundle aliases every submodule).
 _ff10_orig_file_review = _is_file_review_s1
-T._is_source_review = _is_source_review
-T._is_file_review = _is_file_review
 
 
 def _ff10_last_user(messages):
@@ -16369,9 +16367,6 @@ def _is_change_request(folded, scannable, raw=""):
         return False
 
 
-T._is_change_request = _is_change_request
-
-
 
 # --------------------------------------------------------------------------
 # 4. _is_loopback nhận ::ffff:127.0.0.1 (unified into canonical _is_loopback)
@@ -17968,7 +17963,6 @@ def _ff5_arg_problem(node, info):
 _SKIP_FENCE_LANGS.update({
     "text", "plaintext", "txt", "mermaid", "markdown", "md", "ascii", "diagram"
 })
-T._SKIP_FENCE_LANGS = _SKIP_FENCE_LANGS
 
 
 
